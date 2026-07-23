@@ -3,3 +3,4 @@
 /tmp/
 /env.sh
 /*.tar.gz
+.ssh/
