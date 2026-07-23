@@ -13,6 +13,8 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 # shellcheck disable=SC1091
 source "$ROOT/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/lib/bundle.sh"
 
 test_json_escape() {
   local got
@@ -211,6 +213,7 @@ test_redact_gz_file() {
   printf 'normal rotated line\n\tkey = AQBsecretkeymaterial0123456789abcdefghij==\nanother line\n' >"$plain"
   gzip -c "$plain" >"$gz"
   rm -f "$plain"
+  chmod 640 "$gz"
 
   redact_gz_file "$gz" "$redaction_log"
 
@@ -219,6 +222,133 @@ test_redact_gz_file() {
   [[ "$decoded" == *"normal rotated line"* ]] || fail "gz lost normal content"
   [[ "$decoded" == *"[REDACTED]"* ]] || fail "gz secret not redacted"
   [[ "$decoded" != *"AQBsecretkeymaterial"* ]] || fail "gz secret leaked"
+  local got_mode
+  got_mode="$(stat -c '%a' "$gz" 2>/dev/null || stat -f '%Lp' "$gz" 2>/dev/null)"
+  [[ "$got_mode" == "640" ]] || fail "gz redaction did not preserve mode"
+}
+
+test_redact_supported_compressed_files() {
+  local codec extension file decoded redaction_log="$tmpdir/compressed-redaction.log"
+  for codec in xz bz2 zst; do
+    extension=$codec
+    file="$tmpdir/secret.$extension"
+    case "$codec" in
+      xz) printf 'safe\ntoken: secret\n' | xz -c >"$file" ;;
+      bz2) printf 'safe\ntoken: secret\n' | bzip2 -c >"$file" ;;
+      zst) printf 'safe\ntoken: secret\n' | zstd -q -c >"$file" ;;
+    esac
+
+    redact_compressed_file "$file" "$redaction_log" "$codec"
+    case "$codec" in
+      xz) decoded="$(xz -dc "$file")" ;;
+      bz2) decoded="$(bzip2 -dc "$file")" ;;
+      zst) decoded="$(zstd -qdc "$file")" ;;
+    esac
+    [[ "$decoded" == *"safe"* && "$decoded" == *"[REDACTED]"* ]] \
+      || fail "$codec compressed redaction produced unexpected content"
+    [[ "$decoded" != *"token: secret"* ]] || fail "$codec compressed secret leaked"
+  done
+}
+
+test_compressed_redaction_failure_preserves_original() {
+  local work="$tmpdir/redaction-encode-failure"
+  local fakebin="$work/fakebin"
+  local file="$work/secret.log.gz"
+  local log="$work/redactions.log"
+  local real_gzip before after rc=0
+  mkdir -p "$fakebin"
+  real_gzip="$(command -v gzip)"
+  printf 'safe\ntoken: secret\n' | "$real_gzip" -c >"$file"
+  chmod 640 "$file"
+  before="$(shasum -a 256 "$file" | awk '{print $1}')"
+  cat >"$fakebin/gzip" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1-} == "-dc" ]]; then
+  exec "$REAL_GZIP" "$@"
+fi
+printf 'simulated encoder failure\n' >&2
+exit 9
+EOF
+  chmod +x "$fakebin/gzip"
+
+  PATH="$fakebin:$PATH" REAL_GZIP="$real_gzip" \
+    redact_compressed_file "$file" "$log" gz || rc=$?
+
+  [[ "$rc" != "0" ]] || fail "simulated compressor failure should return non-zero"
+  after="$(shasum -a 256 "$file" | awk '{print $1}')"
+  [[ "$before" == "$after" ]] || fail "compressor failure destroyed the original artifact"
+  "$real_gzip" -t "$file" || fail "original compressed artifact became invalid"
+  local got_mode
+  got_mode="$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file" 2>/dev/null)"
+  [[ "$got_mode" == "640" ]] || fail "compressor failure changed original mode"
+}
+
+test_bundle_redaction_propagates_early_failure() {
+  local work="$tmpdir/bundle-redaction-failure"
+  local fakebin="$work/fakebin"
+  local compressed="$work/cluster/a.gz"
+  local later="$work/nodes/node1/z.txt"
+  local real_gzip rc=0
+  mkdir -p "$fakebin" "$(dirname -- "$compressed")" "$(dirname -- "$later")"
+  real_gzip="$(command -v gzip)"
+  printf 'token: compressed-secret\n' | "$real_gzip" -c >"$compressed"
+  printf 'token: later-secret\n' >"$later"
+  cat >"$fakebin/gzip" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1-} == "-dc" ]]; then
+  exec "$REAL_GZIP" "$@"
+fi
+exit 9
+EOF
+  chmod +x "$fakebin/gzip"
+
+  PATH="$fakebin:$PATH" REAL_GZIP="$real_gzip" \
+    redact_bundle_text "$work" || rc=$?
+
+  [[ "$rc" == "2" ]] || fail "bundle redaction masked an early compressor failure (rc=$rc)"
+  grep -qF '[REDACTED]' "$later" || fail "bundle redaction stopped instead of continuing"
+  grep -qF 'NOT redacted' "$work/redactions.log" || fail "redaction failure warning missing"
+}
+
+test_bundle_redaction_redacts_merged_but_preserves_opaque_raw() {
+  local work="$tmpdir/bundle-redaction"
+  local raw_dir="$work/nodes/node1/logs/var-log/raw"
+  local merged_dir="$work/nodes/node1/logs/var-log/merged"
+  local tar_source="$tmpdir/tar-source"
+  local before_hash after_hash
+  mkdir -p "$work/cluster" "$raw_dir" "$merged_dir" "$tar_source"
+  printf 'archive member\n' >"$tar_source/member.log"
+  tar -czf "$raw_dir/support.tar.gz" -C "$tar_source" member.log
+  printf 'safe\ntoken: merged-secret\n' >"$merged_dir/syslog.merged"
+  before_hash="$(shasum -a 256 "$raw_dir/support.tar.gz" | awk '{print $1}')"
+
+  redact_bundle_text "$work"
+
+  after_hash="$(shasum -a 256 "$raw_dir/support.tar.gz" | awk '{print $1}')"
+  [[ "$before_hash" == "$after_hash" ]] || fail "opaque tar.gz was modified by redaction"
+  tar -tzf "$raw_dir/support.tar.gz" | grep -qF 'member.log' || fail "opaque tar.gz was corrupted"
+  grep -qF '[REDACTED]' "$merged_dir/syslog.merged" || fail "merged log was not redacted"
+  grep -qF 'merged-secret' "$merged_dir/syslog.merged" && fail "merged secret leaked" || true
+}
+
+test_post_redaction_cap_discards_payload() {
+  local work="$tmpdir/post-redaction-cap"
+  local var_dir="$work/nodes/node1/logs/var-log"
+  mkdir -p "$work/cluster" "$var_dir/merged/tree/files"
+  printf 'key=x\n' >"$var_dir/merged/tree/files/app.log.merged"
+  printf '6\n' >"$var_dir/PAYLOAD-BYTES.txt"
+  : >"$work/errors.log"
+
+  redact_bundle_text "$work"
+  local rc=0
+  enforce_node_log_caps "$work" 8 || rc=$?
+
+  [[ "$rc" == "2" ]] || fail "post-redaction cap should return 2, got $rc"
+  [[ ! -e "$var_dir/merged" ]] || fail "post-redaction cap retained merged payload"
+  [[ -f "$var_dir/OVER-LIMIT.txt" ]] || fail "post-redaction cap marker missing"
+  grep -qF 'post-redaction' "$var_dir/OVER-LIMIT.txt" || fail "post-redaction status missing"
 }
 
 test_progress_respects_quiet() {
@@ -362,6 +492,11 @@ test_redact_file_multiline_pem_body
 test_redact_file_ceph_key_material
 test_redact_file_preserves_mode
 test_redact_gz_file
+test_redact_supported_compressed_files
+test_compressed_redaction_failure_preserves_original
+test_bundle_redaction_propagates_early_failure
+test_bundle_redaction_redacts_merged_but_preserves_opaque_raw
+test_post_redaction_cap_discards_payload
 test_progress_respects_quiet
 test_progress_goes_to_stderr
 test_run_capture_success

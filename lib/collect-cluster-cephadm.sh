@@ -10,7 +10,7 @@ source "$CEPHADM_COLLECTOR_DIR/common.sh"
 # The remote prefix that actually runs ceph on the source node, by runner token:
 #   direct  -> ceph                          (fast: no container per command)
 #   sudo    -> sudo -n ceph
-#   cephadm -> sudo -n cephadm shell -- ceph (default; spins a container each call)
+#   cephadm -> sudo -n cephadm shell -- ceph (explicit opt-in; may spin a container)
 ceph_runner_argv() {
   case "$1" in
     direct) printf '%s\n' ceph ;;

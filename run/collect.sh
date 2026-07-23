@@ -46,7 +46,14 @@ Options:
   --prom-timeout SECONDS overall time budget for the metrics dump (default: 600)
   --timeout SECONDS      per-command / SSH-connect timeout (default: 20)
   --node-timeout SECONDS overall timeout for one node's full collection (default: 600)
-  --skip-logs            collect state but skip larger Ceph log copies
+  --skip-logs            collect state but skip /var/log file collection
+  --keep-original-logs   retain active/rotated source files in addition to merged logs
+  --var-log-max-bytes N  per-node /var/log output cap (default: 10737418240);
+                         use "unlimited" to disable the cap
+  --allow-cephadm-shell  permit cephadm shell fallback (may start/pull a container);
+                         disabled by default for operational read-only collection
+  --allow-kubectl-exec   permit toolbox kubectl exec (starts a Pod process);
+                         disabled by default for operational read-only collection
   --trust-ssh-host-key   accept new SSH host keys automatically (default)
   --no-trust-ssh-host-key
                          use OpenSSH's normal host-key checking behavior
@@ -94,21 +101,31 @@ detect_node_caps() {
 # defined as `ceph -s` succeeding, not merely the binary existing.
 ceph_runner_probe() {
   local target=$1 ssh_key=$2 timeout=$3 method=$4
-  local tbin w
+  local tbin w rc
   local -a pfx ssh_cmd sopts
   while IFS= read -r w; do pfx+=("$w"); done < <(ceph_runner_argv "$method")
   while IFS= read -r w; do sopts+=("$w"); done < <(ssh_base_opts "$ssh_key" "$timeout")
   ssh_cmd=(ssh "${sopts[@]}" "$target" "${pfx[@]}" --connect-timeout 5 -s)
   tbin="$(timeout_cmd)"
   [[ -n "$tbin" ]] && ssh_cmd=("$tbin" "$timeout" "${ssh_cmd[@]}")
-  "${ssh_cmd[@]}" >/dev/null 2>&1
+  if "${ssh_cmd[@]}" >/dev/null 2>&1; then
+    return 0
+  else
+    rc=$?
+  fi
+  if [[ $rc -eq 255 && -n "${ERROR_LOG:-}" ]]; then
+    write_ssh_debug_log "$(dirname -- "$ERROR_LOG")" "cluster-ceph-${method}" "$target" "$ssh_key" "$timeout"
+  fi
+  return "$rc"
 }
 
 # Pick the fastest runner that connects on $target: direct ceph, sudo ceph, then
 # cephadm shell. Echoes the runner token, or nothing if none connects.
 ceph_runner_for() {
   local target=$1 ssh_key=$2 timeout=$3 m
-  for m in direct sudo cephadm; do
+  local methods="direct sudo"
+  [[ "${CEPH_INCIDENT_ALLOW_CEPHADM_SHELL:-0}" == "1" ]] && methods="$methods cephadm"
+  for m in $methods; do
     if ceph_runner_probe "$target" "$ssh_key" "$timeout" "$m"; then
       printf '%s' "$m"
       return 0
@@ -191,9 +208,9 @@ collect_clusters() {
   fi
 
   # cluster-ceph layer
-  if [[ $want_ceph -eq 1 && -n "$ceph_source" ]]; then
-    progress "collecting ceph cluster from $ceph_source via ${ceph_runner:-cephadm}…"
-    collect_cluster_cephadm "$workdir" "$manifest" "$ceph_source" "$ssh_key" "$since" "$timeout" "${ceph_runner:-cephadm}" || rc=2
+  if [[ $want_ceph -eq 1 && -n "$ceph_source" && -n "$ceph_runner" ]]; then
+    progress "collecting ceph cluster from $ceph_source via ${ceph_runner}…"
+    collect_cluster_cephadm "$workdir" "$manifest" "$ceph_source" "$ssh_key" "$since" "$timeout" "$ceph_runner" || rc=2
     ceph_done=1
   fi
 
@@ -246,23 +263,28 @@ collect_clusters() {
 
 collect_remote_node() {
   local workdir=$1 alias=$2 target=$3 ssh_key=$4 since=$5 timeout=$6 skip_logs=$7 node_timeout=$8
+  local keep_original_logs=$9 var_log_max_bytes=${10}
   local node_dir="$workdir/nodes/$alias"
   local node_tar="$workdir/.node-$alias.tar.gz"
   local remote_cmd rc=0 tbin _w
-  local q_alias q_since q_timeout
+  local q_alias q_since q_timeout q_var_log_max_bytes
   local -a ssh_cmd sopts
 
   q_alias="$(shell_quote "$alias")" || return 1
   q_since="$(shell_quote "$since")" || return 1
   q_timeout="$(shell_quote "$timeout")" || return 1
+  q_var_log_max_bytes="$(shell_quote "$var_log_max_bytes")" || return 1
 
   # Remote side uses a gzip pipe (not `tar -z`) so minimal/BusyBox tar still works,
   # and traps its own temp dir so an interrupted/timed-out run leaves nothing behind.
-  remote_cmd="set -u; tmp=\"\${TMPDIR:-/tmp}/ceph-incident-node.\$\$\"; rm -rf \"\$tmp\"; mkdir -p \"\$tmp\" || { printf 'SKIPPED: remote tmp not writable\n' >&2; exit 75; }; trap 'rm -rf \"\$tmp\"' EXIT INT TERM; gzip -dc | tar -xf - -C \"\$tmp\"; out=\"\$tmp/out\"; set +e; bash \"\$tmp/lib/collect-node.sh\" --out \"\$out\" --host-alias $q_alias --since $q_since --timeout $q_timeout"
+  remote_cmd="set -u; tmp=\$(mktemp -d \"\${TMPDIR:-/tmp}/ceph-incident-node.XXXXXXXX\") || { printf 'SKIPPED: remote tmp not writable\n' >&2; exit 75; }; trap 'case \"\$tmp\" in \"\${TMPDIR:-/tmp}\"/ceph-incident-node.*) rm -rf -- \"\$tmp\" ;; esac' EXIT INT TERM; gzip -dc | tar -xf - -C \"\$tmp\"; out=\"\$tmp/out\"; set +e; bash \"\$tmp/lib/collect-node.sh\" --out \"\$out\" --host-alias $q_alias --since $q_since --timeout $q_timeout --var-log-max-bytes $q_var_log_max_bytes"
   if [[ "$skip_logs" == "1" ]]; then
     remote_cmd+=" --skip-logs"
   fi
-  remote_cmd+="; rc=\$?; set -e; if [ -d \"\$out\" ]; then tar -cf - -C \"\$out\" . | gzip -c; else mkdir -p \"\$out\"; printf 'SKIPPED: remote collect-node did not create output\n' >\"\$out/SKIPPED.txt\"; tar -cf - -C \"\$out\" . | gzip -c; fi; exit \"\$rc\""
+  if [[ "$keep_original_logs" == "1" ]]; then
+    remote_cmd+=" --keep-original-logs"
+  fi
+  remote_cmd+="; rc=\$?; set -e; if [ -d \"\$out\" ]; then set -o pipefail; tar -cf - -C \"\$out\" . | gzip -c || exit 74; else mkdir -p \"\$out\"; printf 'SKIPPED: remote collect-node did not create output\n' >\"\$out/SKIPPED.txt\"; set -o pipefail; tar -cf - -C \"\$out\" . | gzip -c || exit 74; fi; exit \"\$rc\""
 
   while IFS= read -r _w; do sopts+=("$_w"); done < <(ssh_base_opts "$ssh_key" "$timeout")
   ssh_cmd=(ssh "${sopts[@]}" "$target" "$remote_cmd")
@@ -283,7 +305,8 @@ collect_remote_node() {
 
   set +e
   # shellcheck disable=SC2086
-  COPYFILE_DISABLE=1 tar $noxattrs -cf - -C "$COLLECT_ROOT" lib/common.sh lib/collect-node.sh | gzip -c |
+  COPYFILE_DISABLE=1 tar $noxattrs -cf - -C "$COLLECT_ROOT" \
+    lib/common.sh lib/collect-node.sh lib/collect-var-log.sh | gzip -c |
     "${ssh_cmd[@]}" >"$node_tar"
   rc=$?
   set -e
@@ -326,6 +349,9 @@ HOST_TARGETS=()
 main() {
   local inventory='' ssh_key='' seed_override='' out_dir="$COLLECT_ROOT/results"
   local mode=auto since=24h timeout=20 node_timeout=600 skip_logs=0 keep_workdir=0
+  local keep_original_logs=0 var_log_max_bytes=10737418240
+  local allow_cephadm_shell=${CEPH_INCIDENT_ALLOW_CEPHADM_SHELL:-0}
+  local allow_kubectl_exec=${CEPH_INCIDENT_ALLOW_KUBECTL_EXEC:-0}
   local trust_ssh_host_key=1 redact_enabled=1
   local prom_url='' prom_job_regex='ceph|node' prom_step='' prom_timeout=600
   local seed='' ssh_user='' seed_host='' rook_namespace=rook-ceph rook_operator_namespace=rook-ceph kube_context='' kube_mode=remote
@@ -398,6 +424,22 @@ main() {
         skip_logs=1
         shift
         ;;
+      --keep-original-logs)
+        keep_original_logs=1
+        shift
+        ;;
+      --var-log-max-bytes)
+        var_log_max_bytes=${2-}
+        shift 2
+        ;;
+      --allow-cephadm-shell)
+        allow_cephadm_shell=1
+        shift
+        ;;
+      --allow-kubectl-exec)
+        allow_kubectl_exec=1
+        shift
+        ;;
       --trust-ssh-host-key)
         trust_ssh_host_key=1
         shift
@@ -434,6 +476,10 @@ main() {
   done
 
   [[ "$mode" == "auto" || "$mode" == "cephadm" || "$mode" == "rook" ]] || die "unsupported mode: $mode"
+  [[ "$var_log_max_bytes" == "unlimited" || "$var_log_max_bytes" =~ ^[0-9]+$ ]] \
+    || die "invalid --var-log-max-bytes: $var_log_max_bytes"
+  export CEPH_INCIDENT_ALLOW_CEPHADM_SHELL=$allow_cephadm_shell
+  export CEPH_INCIDENT_ALLOW_KUBECTL_EXEC=$allow_kubectl_exec
   # kube-context runs through a remote shell (ssh kubectl --context ...). Block the
   # actual shell metacharacters but allow the chars real contexts use (@ : / for
   # e.g. kubernetes-admin@kubernetes and EKS ARNs).
@@ -452,22 +498,23 @@ main() {
   [[ -n "$ssh_key" && -f "$ssh_key" ]] || die "missing ssh key: ${ssh_key:-<unset>}"
   export CEPH_INCIDENT_TRUST_SSH_HOST_KEY=$trust_ssh_host_key
 
-  # shellcheck disable=SC1090
-  source "$inventory"
-
-  if ! declare -p HOSTS >/dev/null 2>&1; then
-    die "inventory must define HOSTS"
-  fi
+  load_inventory "$inventory" || die "inventory must contain only supported quoted assignments and HOSTS entries"
 
   ssh_user=${SSH_USER:-}
   seed_host=${SEED_HOST:-}
   rook_namespace=${ROOK_NAMESPACE:-rook-ceph}
   rook_operator_namespace=${ROOK_OPERATOR_NAMESPACE:-rook-ceph}
+  if [[ -n "$ssh_user" && ( "$ssh_user" == -* || ! "$ssh_user" =~ ^[A-Za-z0-9._%+-]+$ ) ]]; then
+    die "invalid SSH_USER in inventory"
+  fi
+  is_safe_namespace "$rook_namespace" || die "invalid ROOK_NAMESPACE in inventory"
+  is_safe_namespace "$rook_operator_namespace" || die "invalid ROOK_OPERATOR_NAMESPACE in inventory"
   if [[ -n "$seed_override" ]]; then
     seed=$seed_override
   elif [[ -n "$seed_host" ]]; then
     seed="$(ssh_target_for_host "$seed_host" "$ssh_user")"
   fi
+  [[ -z "$seed" ]] || is_safe_ssh_target "$seed" || die "invalid SSH seed target"
 
   if [[ -z "$(timeout_cmd)" ]]; then
     log "WARNING: no 'timeout'/'gtimeout' found on this workstation; outer timeouts are disabled — relying on SSH ConnectTimeout/ServerAlive only (install coreutils for full bounding)"
@@ -478,6 +525,8 @@ main() {
   workdir="$out_dir/tmp.$timestamp.$$"
   manifest="$workdir/manifest.jsonl"
   ensure_dir "$workdir"
+  : >"$workdir/.runtime-known-hosts"
+  export CEPH_INCIDENT_KNOWN_HOSTS_FILE="$workdir/.runtime-known-hosts"
   # Used by cleanup_workdir/on_interrupt trap handlers from lib/bundle.sh.
   # shellcheck disable=SC2034
   CLEANUP_WORKDIR="$workdir"
@@ -502,8 +551,21 @@ main() {
       rc=2
       continue
     fi
+    if [[ ! "${entry%%=*}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ||
+          "${entry%%=*}" == "." || "${entry%%=*}" == ".." ]]; then
+      append_error "$workdir" "skipped unsafe host alias: ${entry%%=*}"
+      rc=2
+      continue
+    fi
+    local parsed_target
+    parsed_target="$(ssh_target_for_host "${entry#*=}" "$ssh_user")"
+    if ! is_safe_ssh_target "$parsed_target"; then
+      append_error "$workdir" "skipped unsafe SSH target for alias ${entry%%=*}"
+      rc=2
+      continue
+    fi
     HOST_ALIASES+=("${entry%%=*}")
-    HOST_TARGETS+=("$(ssh_target_for_host "${entry#*=}" "$ssh_user")")
+    HOST_TARGETS+=("$parsed_target")
   done
 
   progress "starting: mode=$mode, ${#HOST_TARGETS[@]} hosts"
@@ -543,7 +605,8 @@ main() {
       alias="${HOST_ALIASES[$i]}"
       target="${HOST_TARGETS[$i]}"
       progress "[$((i + 1))/$ntotal] node ${alias}…"
-      if collect_remote_node "$workdir" "$alias" "$target" "$ssh_key" "$since" "$timeout" "$skip_logs" "$node_timeout"; then
+      if collect_remote_node "$workdir" "$alias" "$target" "$ssh_key" "$since" "$timeout" \
+        "$skip_logs" "$node_timeout" "$keep_original_logs" "$var_log_max_bytes"; then
         node_ok=$((node_ok + 1))
         progress "[$((i + 1))/$ntotal] node $alias: ok"
       else
@@ -563,10 +626,17 @@ main() {
 
   if [[ "$redact_enabled" == "1" ]]; then
     progress "redacting…"
-    redact_bundle_text "$workdir"
+    if ! redact_bundle_text "$workdir"; then
+      append_error "$workdir" "redaction failed; original collected artifact was preserved"
+      rc=2
+    fi
   else
     : >"$workdir/redactions.log"
   fi
+  if ! enforce_node_log_caps "$workdir" "$var_log_max_bytes"; then
+    rc=2
+  fi
+  rm -f -- "$workdir/.runtime-known-hosts"
   write_summary "$workdir" "$mode" "$seed" "$node_ok" "$node_failed" "$cluster_rc" "$rc"
   write_catalog "$workdir"
 

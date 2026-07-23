@@ -29,7 +29,7 @@ mkdir -p "$fake_timesyncd_conf_d"
 printf 'current ceph log\n' >"$fake_log_dir/ceph.log"
 printf 'rotated ceph log\n' >"$fake_log_dir/ceph.log.1"
 printf 'rotated osd log\n' >"$fake_log_dir/ceph-osd.0.log.1"
-printf 'compressed ceph log bytes\n' >"$fake_log_dir/ceph.log.2.gz"
+printf 'compressed ceph log bytes\n' | gzip -c >"$fake_log_dir/ceph.log.2.gz"
 printf '%0200d\n' 1 >"$fake_log_dir/ceph-too-large.log"
 
 printf 'fsid = fake\n' >"$fake_var_lib/fsid/mon.a/config"
@@ -61,6 +61,10 @@ fi
 if [[ ${FAKE_TIMESYNCD_MISSING:-0} == "1" && "$*" == *"-u systemd-timesyncd"* ]]; then
   printf 'No journal files were found for systemd-timesyncd\n' >&2
   exit 1
+fi
+if [[ "${FAKE_JOURNALCTL_LARGE:-0}" == "1" && "$*" != *"-u "* ]]; then
+  printf '%010000d\n' 1
+  exit 0
 fi
 printf 'fake journalctl %s\n' "$*"
 EOF
@@ -197,9 +201,9 @@ PATH="$fakebin:$PATH"
 
 outdir="$tmpdir/node"
 set +e
-CEPH_INCIDENT_VAR_LOG_CEPH_DIR="$fake_log_dir" \
+CEPH_INCIDENT_VAR_LOG_DIR="$fake_log_dir" \
 CEPH_INCIDENT_VAR_LIB_CEPH_DIR="$fake_var_lib" \
-CEPH_INCIDENT_LOG_FILE_CAP_BYTES=128 \
+CEPH_INCIDENT_TEST_ALLOW_ATIME_READ=1 \
 CEPH_INCIDENT_TIMESYNCD_CONF="$fake_timesyncd_conf" \
 CEPH_INCIDENT_TIMESYNCD_CONF_D_DIR="$fake_timesyncd_conf_d" \
 bash "$ROOT/lib/collect-node.sh" \
@@ -230,7 +234,8 @@ for artifact in \
   time/systemd-timesyncd-journal.txt \
   systemd/failed-units.txt \
   cephadm/cephadm-ls.json \
-  logs/ceph-log-listing.txt; do
+  logs/var-log/INDEX.tsv \
+  logs/var-log/journal-all-since.txt; do
   [[ -f "$outdir/$artifact" ]] || fail "missing artifact: $artifact"
 done
 
@@ -242,21 +247,17 @@ assert_file_contains "$outdir/time/timedatectl-timesync-status.txt" 'Poll interv
 assert_file_contains "$outdir/time/systemd-timesyncd-status.txt" 'Network Time Synchronization'
 assert_file_contains "$outdir/time/systemd-timesyncd-journal.txt" 'systemd-timesyncd'
 assert_file_contains "$outdir/containers/docker-ps.txt" 'fake docker'
-assert_file_contains "$outdir/logs/ceph-log-listing.txt" "$fake_log_dir"
+assert_file_contains "$outdir/logs/var-log/INDEX.tsv" "ceph.log"
 assert_file_contains "$outdir/time/ntpq-peers.txt" 'SKIPPED: command not found: ntpq'
 assert_file_contains "$outdir/time/systemd-timesyncd-config/timesyncd.conf" 'NTP=192.168.18.1'
 assert_file_contains "$outdir/time/systemd-timesyncd-config/timesyncd.conf.d/10-lab.conf" 'FallbackNTP=time.cloudflare.com'
 
-[[ -f "$outdir/logs/ceph/ceph.log" ]] || fail "missing copied current ceph log"
-[[ -f "$outdir/logs/ceph/ceph.log.1" ]] || fail "missing copied rotated ceph log"
-[[ -f "$outdir/logs/ceph/ceph-osd.0.log.1" ]] || fail "missing copied rotated osd log"
-[[ -f "$outdir/logs/ceph/ceph.log.2.gz" ]] || fail "missing copied gz ceph log"
-# R2: oversized logs are tail-captured (not silently dropped) with a marker
-[[ -f "$outdir/logs/ceph/ceph-too-large.log" ]] || fail "oversized ceph log should be tail-captured"
-toobig_bytes="$(wc -c <"$outdir/logs/ceph/ceph-too-large.log" | tr -d '[:space:]')"
-[[ "$toobig_bytes" -le 128 ]] || fail "oversized ceph log tail should be <= cap (got $toobig_bytes)"
-[[ -f "$outdir/logs/ceph/ceph-too-large.log.TRUNCATED" ]] || fail "oversized ceph log missing .TRUNCATED marker"
-assert_file_contains "$outdir/logs/ceph/ceph-too-large.log.TRUNCATED" "original_bytes="
+[[ -f "$outdir/logs/var-log/merged/tree/files/ceph.log.merged" ]] || fail "missing merged ceph log family"
+assert_file_contains "$outdir/logs/var-log/merged/tree/files/ceph.log.merged" "compressed ceph log bytes"
+assert_file_contains "$outdir/logs/var-log/merged/tree/files/ceph.log.merged" "rotated ceph log"
+assert_file_contains "$outdir/logs/var-log/merged/tree/files/ceph.log.merged" "current ceph log"
+[[ -f "$outdir/logs/var-log/merged/tree/files/ceph-osd.0.log.merged" ]] || fail "missing merged osd log family"
+[[ -f "$outdir/logs/var-log/merged/tree/files/ceph-too-large.log.merged" ]] || fail "large log should be collected whole"
 
 [[ -f "$outdir/cephadm/var-lib-ceph-configs/fsid/mon.a/config" ]] || fail "missing copied var-lib ceph config"
 [[ ! -e "$outdir/cephadm/var-lib-ceph-configs/fsid/mon.a/keyring" ]] || fail "keyring should not be copied from var-lib ceph"
@@ -276,12 +277,35 @@ grep -qF -- '-n dmesg' "$FAKE_SUDO_LOG" || fail "dmesg was not collected through
 assert_file_contains "$outdir/kernel/dmesg.txt" '# timeout: 120s'
 assert_file_contains "$outdir/systemd/journal-ceph.txt" '# timeout: 120s'
 
+# The readable all-journal export shares the same hard cap as /var/log payloads.
+# On overflow no partial-looking merged/raw/original payload is retained.
+outdir_log_cap="$tmpdir/node-log-cap"
+set +e
+FAKE_JOURNALCTL_LARGE=1 \
+CEPH_INCIDENT_VAR_LOG_DIR="$fake_log_dir" \
+CEPH_INCIDENT_VAR_LIB_CEPH_DIR="$fake_var_lib" \
+CEPH_INCIDENT_TEST_ALLOW_ATIME_READ=1 \
+bash "$ROOT/lib/collect-node.sh" \
+  --out "$outdir_log_cap" \
+  --host-alias monitor-cap \
+  --since "24h" \
+  --timeout 5 \
+  --var-log-max-bytes 4096
+log_cap_rc=$?
+set -e
+[[ "$log_cap_rc" == "2" ]] || fail "combined /var/log+journal overflow should exit 2, got $log_cap_rc"
+[[ -f "$outdir_log_cap/logs/var-log/OVER-LIMIT.txt" ]] || fail "combined cap marker missing"
+[[ ! -e "$outdir_log_cap/logs/var-log/merged" &&
+   ! -e "$outdir_log_cap/logs/var-log/raw" &&
+   ! -e "$outdir_log_cap/logs/var-log/original" ]] \
+  || fail "combined cap overflow retained log payload"
+
 outdir_no_ceph_journal="$tmpdir/node-no-ceph-journal"
 set +e
 FAKE_JOURNALCTL_NO_CEPH=1 \
-CEPH_INCIDENT_VAR_LOG_CEPH_DIR="$fake_log_dir" \
+CEPH_INCIDENT_VAR_LOG_DIR="$fake_log_dir" \
 CEPH_INCIDENT_VAR_LIB_CEPH_DIR="$fake_var_lib" \
-CEPH_INCIDENT_LOG_FILE_CAP_BYTES=128 \
+CEPH_INCIDENT_TEST_ALLOW_ATIME_READ=1 \
 bash "$ROOT/lib/collect-node.sh" \
   --out "$outdir_no_ceph_journal" \
   --host-alias kubenode \
@@ -296,9 +320,9 @@ assert_file_contains "$outdir_no_ceph_journal/systemd/journal-ceph.txt" 'no entr
 missing_timesyncd_outdir="$tmpdir/node-missing-timesyncd"
 set +e
 FAKE_TIMESYNCD_MISSING=1 \
-CEPH_INCIDENT_VAR_LOG_CEPH_DIR="$fake_log_dir" \
+CEPH_INCIDENT_VAR_LOG_DIR="$fake_log_dir" \
 CEPH_INCIDENT_VAR_LIB_CEPH_DIR="$fake_var_lib" \
-CEPH_INCIDENT_LOG_FILE_CAP_BYTES=128 \
+CEPH_INCIDENT_TEST_ALLOW_ATIME_READ=1 \
 CEPH_INCIDENT_TIMESYNCD_CONF="$tmpdir/missing-timesyncd.conf" \
 CEPH_INCIDENT_TIMESYNCD_CONF_D_DIR="$tmpdir/missing-timesyncd.conf.d" \
 bash "$ROOT/lib/collect-node.sh" \

@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export CEPH_INCIDENT_ALLOW_CEPHADM_SHELL=1
+export CEPH_INCIDENT_ALLOW_KUBECTL_EXEC=1
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
@@ -62,6 +64,10 @@ help_output="${help_result#*$'\n'}"
 [[ "$help_output" == *"--no-trust-ssh-host-key"* ]] || fail "help should document --no-trust-ssh-host-key"
 [[ "$help_output" == *"--no-redact"* ]] || fail "help should document --no-redact"
 [[ "$help_output" == *"--prom-url"* ]] || fail "help should document --prom-url"
+[[ "$help_output" == *"--keep-original-logs"* ]] || fail "help should document --keep-original-logs"
+[[ "$help_output" == *"--var-log-max-bytes"* ]] || fail "help should document --var-log-max-bytes"
+[[ "$help_output" == *"--allow-cephadm-shell"* ]] || fail "help should document --allow-cephadm-shell"
+[[ "$help_output" == *"--allow-kubectl-exec"* ]] || fail "help should document --allow-kubectl-exec"
 
 missing_result="$(run_and_capture "$ROOT/run/collect.sh" --inventory "$tmpdir/missing.env")"
 missing_status="${missing_result%%$'\n'*}"
@@ -213,6 +219,35 @@ export FAKE_SSH_LOG="$tmpdir/ssh.log"
 export FAKE_TIMEOUT_LOG="$tmpdir/timeout.log"
 export FIXTURE_SSH="$ROOT/tests/fixtures/bin/ssh"
 
+# Inventory is declarative input, never executable shell.
+inventory_marker="$tmpdir/inventory-command-ran"
+malicious_inventory="$tmpdir/inv-malicious.env"
+# shellcheck disable=SC2016
+printf 'SSH_USER="$(touch %s)"\nHOSTS=(\n  "safe=10.0.0.1"\n)\n' \
+  "$inventory_marker" >"$malicious_inventory"
+malicious_result="$(run_and_capture "$ROOT/run/collect.sh" \
+  --inventory "$malicious_inventory" --ssh-key "$ssh_key")"
+malicious_status="${malicious_result%%$'\n'*}"
+[[ "$malicious_status" == "1" ]] || fail "executable inventory should be rejected"
+[[ ! -e "$inventory_marker" ]] || fail "inventory command substitution was executed"
+
+unsafe_alias_inventory="$tmpdir/inv-unsafe-alias.env"
+printf 'SSH_USER="tester"\nHOSTS=(\n  "../escape=10.0.0.1"\n)\n' >"$unsafe_alias_inventory"
+unsafe_alias_result="$(run_and_capture "$ROOT/run/collect.sh" \
+  --inventory "$unsafe_alias_inventory" --ssh-key "$ssh_key" --mode cephadm)"
+unsafe_alias_status="${unsafe_alias_result%%$'\n'*}"
+[[ "$unsafe_alias_status" == "1" ]] || fail "unsafe alias should fail before collection"
+[[ ! -e "$tmpdir/escape" ]] || fail "unsafe alias escaped the output root"
+
+unsafe_target_inventory="$tmpdir/inv-unsafe-target.env"
+printf 'SSH_USER="tester"\nHOSTS=(\n  "node=--ProxyCommand=touch-bad"\n)\n' >"$unsafe_target_inventory"
+: >"$FAKE_SSH_LOG"
+unsafe_target_result="$(PATH="$fakebin:$PATH" run_and_capture "$ROOT/run/collect.sh" \
+  --inventory "$unsafe_target_inventory" --ssh-key "$ssh_key" --mode cephadm)"
+unsafe_target_status="${unsafe_target_result%%$'\n'*}"
+[[ "$unsafe_target_status" != "0" ]] || fail "unsafe SSH target should fail collection"
+[[ ! -s "$FAKE_SSH_LOG" ]] || fail "unsafe SSH target reached ssh"
+
 # external topology: a ceph node + a kube node
 inventory="$tmpdir/inv-external.env"
 cat >"$inventory" <<'EOF'
@@ -232,7 +267,8 @@ out_auto="$tmpdir/out-auto"
 FAKE_CEPH_TARGETS="10.0.0.1" FAKE_KUBE_TARGETS="10.0.0.9" \
 PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
   --inventory "$inventory" --ssh-key "$ssh_key" \
-  --mode auto --kube-context lab --out "$out_auto" --since 24h --timeout 5 --node-timeout 90
+  --mode auto --kube-context lab --out "$out_auto" --since 24h --timeout 5 --node-timeout 90 \
+  --keep-original-logs --var-log-max-bytes 123456
 bundle_auto="$(find_bundle "$out_auto")"
 assert_archive_contains "$bundle_auto" "cluster/ceph/json/status.json"
 assert_archive_contains "$bundle_auto" "cluster/rook/pods-wide.txt"
@@ -243,6 +279,9 @@ grep -qF -- '--context lab' "$FAKE_SSH_LOG" || fail "rook kubectl missing --cont
 grep -qF '10.0.0.9 kubectl' "$FAKE_SSH_LOG" || fail "rook kubectl did not run on the kube node"
 grep -qF 'StrictHostKeyChecking=accept-new' "$FAKE_SSH_LOG" || fail "ssh host key trust should be enabled by default"
 grep -qx '90' "$FAKE_TIMEOUT_LOG" || fail "node wrapper should use --node-timeout 90"
+grep -qF -- '--keep-original-logs' "$FAKE_SSH_LOG" || fail "remote node missing --keep-original-logs"
+grep -qF -- '--var-log-max-bytes' "$FAKE_SSH_LOG" || fail "remote node missing var-log cap flag"
+grep -qF -- '123456' "$FAKE_SSH_LOG" || fail "remote node missing var-log cap value"
 # A4: the chosen cluster sources are recorded in environment.txt
 env_txt="$(tar -xOzf "$bundle_auto" ./environment.txt 2>/dev/null)"
 [[ "$env_txt" == *"ceph_source=tester@10.0.0.1"* ]] || fail "environment.txt missing ceph_source"
@@ -313,12 +352,33 @@ assert_archive_contains "$bundle_nocap" "nodes/cephnode/system/hostname.txt"
 # ---------------------------------------------------------------------------
 out_ceph="$tmpdir/out-ceph"
 : >"$FAKE_SSH_LOG"
-PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+FAKE_CEPH_TARGETS="10.0.0.1" PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
   --inventory "$inventory" --ssh-key "$ssh_key" \
   --seed tester@10.0.0.1 --mode cephadm --out "$out_ceph" --since 24h --timeout 5
 bundle_ceph="$(find_bundle "$out_ceph")"
 assert_archive_contains "$bundle_ceph" "cluster/ceph/json/status.json"
 grep -qF 'kubectl' "$FAKE_SSH_LOG" && fail "cephadm mode should not run kubectl" || true
+
+# An explicit seed with no direct/sudo Ceph runner must remain skipped when the
+# potentially state-changing cephadm-shell fallback is disabled.
+out_seed_no_runner="$tmpdir/out-seed-no-runner"
+: >"$FAKE_SSH_LOG"
+seed_no_runner_status=0
+set +e
+(
+  unset CEPH_INCIDENT_ALLOW_CEPHADM_SHELL
+  FAKE_CEPH_TARGETS="10.0.0.1" FAKE_CEPH_DIRECT_OK="" FAKE_CEPH_SUDO_OK="" \
+  PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+    --inventory "$inventory" --ssh-key "$ssh_key" \
+    --seed tester@10.0.0.1 --mode cephadm --out "$out_seed_no_runner" --since 24h --timeout 5
+)
+seed_no_runner_status=$?
+set -e
+[[ "$seed_no_runner_status" == "2" ]] || fail "unusable explicit seed should exit 2, got $seed_no_runner_status"
+bundle_seed_no_runner="$(find_bundle "$out_seed_no_runner")"
+assert_archive_contains "$bundle_seed_no_runner" "cluster/ceph/SKIPPED.txt"
+grep -qF 'cephadm shell -- ceph status --format' "$FAKE_SSH_LOG" \
+  && fail "disabled cephadm shell was used for explicit seed" || true
 
 # ---------------------------------------------------------------------------
 # two cephadm nodes: cluster ceph collected from the FIRST only
@@ -347,7 +407,7 @@ grep -qF '10.0.0.2 sudo -n cephadm shell -- ceph status' "$FAKE_SSH_LOG" \
 # ---------------------------------------------------------------------------
 run_nodecase() {
   # $1=outdir ; remaining env set by caller
-  PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  FAKE_CEPH_TARGETS="10.0.0.1" PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
     --inventory "$inventory" --ssh-key "$ssh_key" \
     --seed tester@10.0.0.1 --mode cephadm --out "$1" --since 24h --timeout 5
 }
@@ -379,7 +439,7 @@ assert_archive_contains "$(find_bundle "$out_fail")" "errors.log"
 # C2: abort mid-run -> trap cleans workdir (no tmp.* left)
 out_abort="$tmpdir/out-abort"
 set +e
-COLLECT_TEST_ABORT_AFTER_NODES=1 PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+COLLECT_TEST_ABORT_AFTER_NODES=1 FAKE_CEPH_TARGETS="10.0.0.1" PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
   --inventory "$inventory" --ssh-key "$ssh_key" \
   --seed tester@10.0.0.1 --mode cephadm --out "$out_abort" --since 24h --timeout 5 >/dev/null 2>&1
 abort_status=$?
@@ -391,7 +451,7 @@ leftover="$(find "$out_abort" -maxdepth 1 -name 'tmp.*' 2>/dev/null | wc -l | tr
 # C3: verify failure (forbidden secret path) -> exit 1, workdir kept, no bundle
 out_verify="$tmpdir/out-verify"
 set +e
-FAKE_SSH_PEM_ALIAS=kubenode PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+FAKE_SSH_PEM_ALIAS=kubenode FAKE_CEPH_TARGETS="10.0.0.1" PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
   --inventory "$inventory" --ssh-key "$ssh_key" \
   --seed tester@10.0.0.1 --mode cephadm --out "$out_verify" --since 24h --timeout 5 >/dev/null 2>&1
 verify_status=$?

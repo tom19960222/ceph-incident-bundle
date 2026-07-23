@@ -2,7 +2,7 @@
 
 ## 這是做什麼的
 
-這套 script 是事故發生時的「先保留現場」工具。它會從一台工作機透過 SSH 到所有 Ceph node 收集系統狀態、time sync 狀態、Ceph 狀態、log 清單與必要 log，最後打包成一個 `.tar.gz`。
+這套 script 是事故發生時的「先保留現場」工具。它會從一台工作機透過 SSH 到所有 Ceph node 收集系統狀態、time sync 狀態、Ceph 狀態，以及每台 node 的 `/var/log`，最後打包成一個 `.tar.gz`。
 
 它不會修復 Ceph，也不會執行 restart、delete、repair、scrub 這類會改變 cluster 狀態的操作。
 
@@ -15,15 +15,11 @@
 - node CPU、RAM、disk、網路或 time sync 看起來異常，但還不確定是不是 Ceph 問題
 - 準備請別人或 AI 協助判讀，需要保留當下證據
 
-## 前置需求（known_hosts）
+## SSH host key
 
-工具的 SSH 都用 `BatchMode=yes`(不互動),所以**第一次從一台新跳板機執行前**,跳板機的 `known_hosts` 必須已經有所有目標 node 的 host key,否則每台會以 `Host key verification failed` 失敗、被標 SKIPPED(exit 2)。先做一次:
-
-```bash
-# 對 inventory 裡每台 host 先建立 host key（擇一）
-ssh-keyscan -H 192.168.18.166 192.168.18.167 ... >> ~/.ssh/known_hosts
-# 或手動 ssh 每台一次，確認指紋後接受
-```
+工具的 SSH 使用 `BatchMode=yes`。預設 `accept-new` 會先讀既有
+`~/.ssh/known_hosts`，但新的 host key 只寫進本次 collector workdir 的暫存檔，
+不修改使用者的 `known_hosts`；已知 host 的 key 不一致仍會拒絕連線。
 
 ## 最短操作流程
 
@@ -70,16 +66,22 @@ HOSTS=(
 - `ROOK_NAMESPACE`：Rook 的 namespace，未填時預設 `rook-ceph`。
 - `HOSTS`：每個項目是 `alias=host`，alias 會成為 bundle 裡 `nodes/<alias>/` 的目錄名稱。external-ceph rook 拓樸可以把 **external ceph 主機與 k8s node 混在同一份** `HOSTS` 裡。
 
+Inventory 是 declarative 格式，只接受上述 quoted scalar 與 `HOSTS` array；
+不會再當成 shell script `source`，因此不能放 command substitution 或其他命令。
+
 ## 自動偵測（auto，預設）
 
 預設 `--mode auto` 會逐台 node 經 ssh 偵測能力，再分層收集：
 
-- node 上有 `ceph` 或 `cephadm` → 從**第一台連得上 cluster** 的 node 收 cluster-level ceph。執行方式優先序：直接 `ceph`（最快，免每條起 container）→ `sudo -n ceph` → `sudo -n cephadm shell -- ceph`。「可用」= `ceph -s` 連得上,不是 binary 存在;選到哪個會記在進度（`via ceph` / `via cephadm shell`）與 `environment.txt` 的 `ceph_runner=`。
+- node 上有 `ceph` 或 `cephadm` → 從**第一台連得上 cluster** 的 node 收 cluster-level ceph。預設只試直接 `ceph` → `sudo -n ceph`，兩者都是既有 CLI 的唯讀查詢。`cephadm shell` 可能啟動或 pull container，因此預設禁用；只有明確給 `--allow-cephadm-shell` 才作最後 fallback。「可用」= `ceph -s` 連得上，不是 binary 存在；選到哪個會記在進度與 `environment.txt` 的 `ceph_runner=`。
 - rook 層的 `kubectl` 由 `--kube-mode` 決定（預設 `remote`）：
   - `remote`（預設）：從**第一台**有 kubectl 的 inventory node、用 ssh 在該 node 上跑 `kubectl`。
   - `local`：在**執行工具的跳板機本機**跑 `kubectl`（kubectl/kubeconfig 在跳板機、不在 node 上時用這個）。
   - 兩種都可配 `--kube-context`。
 - 兩層都有來源就都收、各收一次;node 層一律每台都收。
+
+Rook 層預設不執行 toolbox `kubectl exec`，因為它會在 Pod 內啟動 process；
+需要這份額外證據時才明確加 `--allow-kubectl-exec`。
 
 ```bash
 bash run/collect.sh \
@@ -147,11 +149,15 @@ bash run/collect.sh \
 - **來源挑「第一台」**：cluster-ceph 取第一台**ceph 連得上**的 node(會實際試 `ceph -s`,連不上就換下一個候選);cluster-rook(remote)取第一台**有 `kubectl` 指令**的 node(只看指令存在,不檢查 k8s 健康、不 fallback 到第二台)。若想釘住一台已知健康的 mon,用 `--seed USER@HOST`。
 - **探測是逐台序列 ssh**:某層的能力完全不存在時(例如純 cephadm 叢集仍會為了 rook 掃完每台),或 node 沒回應時,探測會逐台等到 `ConnectTimeout`。大型 inventory 建議直接用 `--mode cephadm --seed ...` 跳過探測。探測 ssh 失敗的 node 會記進 `errors.log`(`capability probe failed for ...`),不會被當成「沒有該能力」而靜默忽略。
 
-## 逾時與大型 log
+## `/var/log` 收集、合併與容量
 
 - `--timeout`（預設 20s）是**單一指令 / SSH 連線**的逾時。
 - `--node-timeout`（預設 600s）是**單一 node 整輪收集**的逾時。兩者分開：慢或大的 node 不會被單指令逾時誤殺。
-- 大型 Ceph log（超過 `CEPH_INCIDENT_LOG_FILE_CAP_BYTES`，預設 1 MiB）不會被靜默丟棄，而是收最後一段（tail）並附 `<檔名>.TRUNCATED` 記錄原始大小；壓縮過的 `*.gz` 過大時則只記錄、不收（gzip 的尾段無法解壓）。
+- 每台 node 會遞迴掃描 `/var/log` 的 regular files，不跟隨 symlink，也不讀 socket/device/FIFO。
+- 同目錄、同 family 的 active/rotated log 會依最舊到最新合併；支援 `.gz`、`.xz`、`.bz2`、`.zst`。ZIP、tar、binary、journal raw file 不合併，原樣放在 `raw/` 並列入 `UNREDACTED-OPAQUE.txt`。合併檔使用 collision-free tree：每層來源目錄放在 `merged/tree/dirs/<name>/`，該層的 family 放在 `files/<family>.merged`。
+- `/var/log` file history 不受 `--since` 限制；`journalctl` 的可讀文字輸出仍遵守 `--since`。
+- 預設每台 log payload 上限 10 GiB。用 `--var-log-max-bytes BYTES|unlimited` 調整；payload 包含 merged/raw/original 與 `journal-all-since.txt`，redaction 後會再驗一次。預估或實際超限、遠端暫存空間不足時只留下 index/原因並回傳 exit 2，不產生看似完整的半套 log。另以 64 MiB scan-path staging 與 100,000 entries 上限約束 metadata/記憶體；超過時留下 `SCAN-LIMIT.txt`。
+- 成功合併後預設不重複保存文字來源；`--keep-original-logs` 才會在 `original/` 保留來源格式。`--skip-logs` 可完全跳過 `/var/log` file collection。
 - 被逾時砍掉（exit 124/137）的指令輸出會在 artifact 末尾標 `# TRUNCATED`，讓判讀者知道內容被截斷。
 - **工作機若沒有 `timeout` / `gtimeout`**（如預設 macOS），會在開頭印警告；此時外層逾時停用，只靠 SSH `ConnectTimeout` / `ServerAlive` 把關。要完整把關可 `brew install coreutils`（提供 `gtimeout`），或在 Linux ops 機執行。
 
@@ -204,7 +210,7 @@ BUNDLE=$(bash .../run/collect.sh --inventory inv.env --ssh-key key --since 24h -
 - `redactions.log`：每個檔遮蔽了幾行。
 - `cluster/`：cephadm(直接 `ceph` 或 `cephadm shell`)或 Rook cluster-level 狀態。
 - `cluster/prometheus/` — 選用的 metrics dump（有給 `--prom-url` 才存在）
-- `nodes/<alias>/`：每台 node 的系統、資源、disk、kernel、systemd、time sync、Ceph log 與 cephadm 狀態。
+- `nodes/<alias>/`：每台 node 的系統、資源、disk、kernel、systemd、time sync、`logs/var-log/{merged/tree,raw,original}` 與 cephadm 狀態。
 
 time sync 會同時保留常見工具的狀態：`timedatectl` / `systemd-timesyncd`、`chronyc`、`ntpq`。如果 node 使用 `systemd-timesyncd`，bundle 會收 `timedatectl status`、`timedatectl show-timesync --all`、`timedatectl timesync-status`、`systemctl status systemd-timesyncd`、`journalctl -u systemd-timesyncd`，以及 `/etc/systemd/timesyncd.conf` 與 `/etc/systemd/timesyncd.conf.d/*.conf`。
 
@@ -224,7 +230,9 @@ time sync 會同時保留常見工具的狀態：`timedatectl` / `systemd-timesy
 
 ## 安全界線
 
-- 這套工具以 read-only 收集為原則，不會主動修復或改變 Ceph 狀態。
+- 這套工具以 operationally read-only 收集為原則：不修改 persistent config、service、package、mount、Ceph cluster 或 Kubernetes workload。它只在 collector 自己的遠端暫存目錄組裝輸出，結束後清除；SSH/sudo/audit log 的自然增長是觀測行為不可避免的副作用。
+- `/var/log` 來源以 GNU `dd iflag=noatime,nofollow`（必要時 `sudo -n`）讀取；不支援 no-atime/no-follow read 時回傳 partial，不退回會更新 atime 或跟隨 race-time symlink 的一般讀法。目錄列舉仍由 `find` 完成，在少見的 `strictatime` filesystem 上可能更新目錄 atime；因此保證是「不改 operational/config state」，不是宣稱遠端磁碟每個 metadata bit 都不變。
+- 不會自動安裝缺少的解壓工具、不會修改來源權限，也不會在來源目錄原地解壓。
 - 遮蔽（redaction）預設開啟，涵蓋：含 `password`/`secret`/`token`/`keyring`/`private key` 的文字行、Ceph 金鑰材料（`key = AQB..==` 與 base64 區塊）、整段多行 PEM private key block；並會把 `*.gz` 解壓後遮蔽再壓回。但這**不是完整 DLP**。若使用 `--no-redact`，bundle 會保留原始內容。
 - `verify-bundle.sh` 會以**檔名**（keyring/.ssh/id_ed25519/private_key/*.pem/*.key/*.crt）與**內容**（殘留的 PRIVATE KEY block / `key = <base64>`）兩道把關，但仍不能保證內容完全沒有敏感資料。
 - 分享 bundle 前仍應自行檢查是否包含內部 IP、hostname、路徑、帳號名稱或其他敏感資料。

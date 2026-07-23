@@ -15,6 +15,67 @@ ssh_target_for_host() {
   fi
 }
 
+is_safe_ssh_target() {
+  local target=$1
+  [[ -n "$target" && "$target" != -* ]] || return 1
+  [[ "$target" =~ ^([A-Za-z0-9._%+-]+@)?(\[[0-9A-Fa-f:.%]+\]|[A-Za-z0-9._:-]+)$ ]]
+}
+
+is_safe_namespace() {
+  local namespace=$1
+  [[ "$namespace" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]
+}
+
+# Parse the intentionally small inventory format without sourcing executable
+# shell. Accepted statements are quoted scalar assignments and a quoted HOSTS
+# array; commands, substitutions, redirections, and arbitrary variables fail.
+load_inventory() {
+  local inventory=$1 line value in_hosts=0
+  local assignment_re='^[[:space:]]*(SSH_USER|SEED_HOST|ROOK_NAMESPACE|ROOK_OPERATOR_NAMESPACE)="([^"]*)"[[:space:]]*(#.*)?$'
+  local host_re='^[[:space:]]*"([^"]+)"[[:space:]]*(#.*)?$'
+  SSH_USER=''
+  SEED_HOST=''
+  ROOK_NAMESPACE='rook-ceph'
+  ROOK_OPERATOR_NAMESPACE='rook-ceph'
+  HOSTS=()
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ $in_hosts -eq 1 ]]; then
+      if [[ "$line" =~ ^[[:space:]]*\)[[:space:]]*(#.*)?$ ]]; then
+        in_hosts=0
+      elif [[ "$line" =~ $host_re ]]; then
+        HOSTS+=("${BASH_REMATCH[1]}")
+      else
+        return 1
+      fi
+    elif [[ "$line" =~ ^[[:space:]]*HOSTS=\(\)[[:space:]]*(#.*)?$ ]]; then
+      :
+    elif [[ "$line" =~ ^[[:space:]]*HOSTS=\([[:space:]]*$ ]]; then
+      in_hosts=1
+    elif [[ "$line" =~ $assignment_re ]]; then
+      value=${BASH_REMATCH[2]}
+      # shellcheck disable=SC2016
+      case "$value" in
+        *'$('*|*'${'*|*'`'*) return 1 ;;
+      esac
+      # These globals are intentionally consumed by run/collect.sh after this
+      # parser returns; ShellCheck cannot see that cross-file use.
+      # shellcheck disable=SC2034
+      case "${BASH_REMATCH[1]}" in
+        SSH_USER) SSH_USER=$value ;;
+        SEED_HOST) SEED_HOST=$value ;;
+        ROOK_NAMESPACE) ROOK_NAMESPACE=$value ;;
+        ROOK_OPERATOR_NAMESPACE) ROOK_OPERATOR_NAMESPACE=$value ;;
+      esac
+    else
+      return 1
+    fi
+  done <"$inventory"
+
+  [[ $in_hosts -eq 0 ]]
+}
+
 # Quote a value for safe interpolation into a remote shell string. Returns 1 if
 # the value contains a single quote (callers treat that as a hard input error).
 shell_quote() {
@@ -129,6 +190,9 @@ write_catalog() {
       if [[ -f "$nd/manifest.jsonl" ]]; then
         printf '| exit | file | command |\n|---|---|---|\n'
         catalog_rows "$nd/manifest.jsonl" "${nd%/}" "nodes/$alias/"
+        if [[ -f "$nd/logs/var-log/INDEX.tsv" ]]; then
+          printf '\n- `nodes/%s/logs/var-log/INDEX.tsv` — source-to-family map, codec, sizes, and merge/raw/skip disposition for `/var/log`.\n' "$alias"
+        fi
       else
         printf 'Not collected — see `nodes/%s/SKIPPED.txt`.\n' "$alias"
       fi
@@ -164,19 +228,61 @@ on_interrupt() {
 redact_bundle_text() {
   local workdir=$1
   local redaction_log="$workdir/redactions.log"
-  local path
+  local path path_rc rc=0
 
   # Per-metric Prometheus dumps (workdir/cluster/prometheus/<job>/*.json.gz) are
   # numeric time series in single multi-MB JSON lines: line-based redaction is
   # pathologically slow there and one regex false-positive would blank the
   # whole file. They are excluded; dump-info/index/buildinfo/targets in
   # cluster/prometheus/ still go through redaction like everything else.
-  while IFS= read -r path; do
+  while IFS= read -r -d '' path; do
+    path_rc=0
     case "$path" in
-      *.gz) redact_gz_file "$path" "$redaction_log" ;;
-      *) redact_file "$path" "$redaction_log" ;;
+      *.gz) redact_gz_file "$path" "$redaction_log" || path_rc=$? ;;
+      *.xz) redact_compressed_file "$path" "$redaction_log" xz || path_rc=$? ;;
+      *.bz2) redact_compressed_file "$path" "$redaction_log" bz2 || path_rc=$? ;;
+      *.zst) redact_compressed_file "$path" "$redaction_log" zst || path_rc=$? ;;
+      *) redact_file "$path" "$redaction_log" || path_rc=$? ;;
     esac
+    [[ $path_rc -eq 0 ]] || rc=2
   done < <(find "$workdir/cluster" "$workdir/nodes" -type f \
     -not -path "$workdir/cluster/prometheus/*/*.json.gz" \
-    \( -name '*.txt' -o -name '*.log' -o -name '*.log.*' -o -name '*.yaml' -o -name '*.json' -o -name '*.jsonl' -o -name '*.conf' -o -name 'config' -o -name '*.gz' \) -print 2>/dev/null || true)
+    -not -path "$workdir/nodes/*/logs/var-log/raw/*" \
+    \( -name '*.txt' -o -name '*.log' -o -name '*.log.*' -o -name '*.merged' -o -name '*.yaml' -o -name '*.json' -o -name '*.jsonl' -o -name '*.conf' -o -name 'config' -o -name '*.gz' -o -name '*.xz' -o -name '*.bz2' -o -name '*.zst' \) -print0 2>/dev/null || true)
+  return "$rc"
+}
+
+enforce_node_log_caps() {
+  local workdir=$1 max_bytes=$2 node_dir var_dir path size total rc=0
+  [[ "$max_bytes" == "unlimited" ]] && return 0
+
+  for node_dir in "$workdir"/nodes/*; do
+    [[ -d "$node_dir" ]] || continue
+    var_dir="$node_dir/logs/var-log"
+    [[ -d "$var_dir" ]] || continue
+    total=0
+    while IFS= read -r -d '' path; do
+      size="$(stat -c '%s' "$path" 2>/dev/null || stat -f '%z' "$path" 2>/dev/null || printf 0)"
+      total=$((total + size))
+    done < <(find "$var_dir/merged" "$var_dir/raw" "$var_dir/original" -type f -print0 2>/dev/null || true)
+    if [[ -f "$var_dir/journal-all-since.txt" ]]; then
+      size="$(stat -c '%s' "$var_dir/journal-all-since.txt" 2>/dev/null ||
+        stat -f '%z' "$var_dir/journal-all-since.txt" 2>/dev/null || printf 0)"
+      total=$((total + size))
+    fi
+
+    if [[ $total -gt $max_bytes ]]; then
+      rm -rf -- "$var_dir/merged" "$var_dir/raw" "$var_dir/original"
+      write_skip_artifact "$var_dir/journal-all-since.txt" \
+        "not collected because post-redaction node log payload exceeded the per-node cap"
+      rm -f -- "$var_dir/PAYLOAD-BYTES.txt"
+      printf 'actual_payload_bytes=%s\nmax_bytes=%s\nstatus=not-collected-post-redaction-cap\n' \
+        "$total" "$max_bytes" >"$var_dir/OVER-LIMIT.txt"
+      append_error "$workdir" "node $(basename -- "$node_dir") log payload exceeded cap after redaction"
+      rc=2
+    elif [[ -f "$var_dir/PAYLOAD-BYTES.txt" ]]; then
+      printf '%s\n' "$total" >"$var_dir/PAYLOAD-BYTES.txt"
+    fi
+  done
+  return "$rc"
 }

@@ -195,7 +195,10 @@ collect_cluster_rook() {
   fi
 
   toolbox_pod="$(rook_get_first_pod "$namespace" "app=rook-ceph-tools")"
-  if [[ -n "$toolbox_pod" ]]; then
+  if [[ "${CEPH_INCIDENT_ALLOW_KUBECTL_EXEC:-0}" != "1" ]]; then
+    write_skip_artifact "$outdir/cluster/rook/toolbox-SKIPPED.txt" \
+      "kubectl exec disabled by default for operational read-only collection"
+  elif [[ -n "$toolbox_pod" ]]; then
     if ! rook_run_capture "$outdir" "$manifest" "$timeout" "cluster/rook/toolbox-status.txt" \
       "${ROOK_KUBECTL_ARGV[@]}" exec -n "$namespace" "$toolbox_pod" -- ceph status; then
       failed=1

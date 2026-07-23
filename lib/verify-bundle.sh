@@ -23,6 +23,10 @@ verify_members() {
   # -print0 so newlines in filenames cannot smuggle a forbidden component
   # past the glob (this is a security boundary).
   while IFS= read -r -d '' path; do
+    if [[ -L "$root/${path#./}" ]]; then
+      verify_fail "symlink is not allowed in bundle: ${path#./}"
+      return 1
+    fi
     case "$path" in
       *keyring*|*.ssh*|*id_ed25519*|*private_key*|*.pem|*.key|*.crt|*.pfx|*.p12)
         verify_fail "forbidden path: ${path#./}"
@@ -30,6 +34,24 @@ verify_members() {
         ;;
     esac
   done < <(cd "$root" && find . -mindepth 1 -print0)
+}
+
+verify_archive_listing() {
+  local bundle=$1 member
+  while IFS= read -r member; do
+    member=${member#./}
+    case "$member" in
+      /*|../*|*/../*|*/..)
+        verify_fail "unsafe archive member: $member"
+        return 1
+        ;;
+    esac
+  done < <(tar -tzf "$bundle" 2>/dev/null)
+
+  if tar -tvzf "$bundle" 2>/dev/null | grep -Eq '^[lh]'; then
+    verify_fail "archive contains symlink or hardlink member"
+    return 1
+  fi
 }
 
 verify_no_secret_content() {
@@ -97,6 +119,10 @@ verify_bundle_path() {
     rm -rf "$workdir"
     return 1
   fi
+  verify_archive_listing "$bundle" || {
+    rm -rf "$workdir"
+    return 1
+  }
   if ! tar -xzf "$bundle" -C "$workdir" >/dev/null 2>/dev/null; then
     verify_fail "invalid archive: $bundle"
     rm -rf "$workdir"

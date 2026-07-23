@@ -41,6 +41,9 @@ ssh_base_opts() {
     -o ServerAliveCountMax=1
   if [[ "${CEPH_INCIDENT_TRUST_SSH_HOST_KEY:-1}" == "1" ]]; then
     printf '%s\n' -o StrictHostKeyChecking=accept-new
+    if [[ -n "${CEPH_INCIDENT_KNOWN_HOSTS_FILE:-}" ]]; then
+      printf '%s\n' -o "UserKnownHostsFile=$CEPH_INCIDENT_KNOWN_HOSTS_FILE ${HOME}/.ssh/known_hosts"
+    fi
   fi
 }
 
@@ -198,29 +201,51 @@ redact_file() {
   printf '%s: %s line(s) redacted\n' "$source_file" "$count" >>"$redaction_log"
 }
 
-redact_gz_file() {
-  # Decompress a gzipped artifact, redact it, recompress in place so rotated
-  # logs (*.gz) get the same redaction as plain text.
-  local source_file=$1 redaction_log=$2
+redact_compressed_file() {
+  local source_file=$1 redaction_log=$2 codec=$3
   require_file "$source_file"
   ensure_dir "$(dirname -- "$redaction_log")"
 
-  local dir tmp_plain
+  local dir tmp_plain tmp_encoded mode decode_rc=0 encode_rc=0
   dir="$(dirname -- "$source_file")"
+  mode="$(stat -c '%a' "$source_file" 2>/dev/null || stat -f '%Lp' "$source_file" 2>/dev/null || printf '600')"
   tmp_plain="$(mktemp "$dir/.${source_file##*/}.plain.XXXXXX")"
-  if ! gzip -dc -- "$source_file" >"$tmp_plain" 2>/dev/null; then
-    rm -f -- "$tmp_plain"
-    printf '%s: gz decompress failed, left as-is (NOT redacted)\n' "$source_file" >>"$redaction_log"
+  tmp_encoded="$(mktemp "$dir/.${source_file##*/}.encoded.XXXXXX")"
+  case "$codec" in
+    gz) gzip -dc -- "$source_file" >"$tmp_plain" 2>/dev/null || decode_rc=$? ;;
+    xz) xz -dc -- "$source_file" >"$tmp_plain" 2>/dev/null || decode_rc=$? ;;
+    bz2) bzip2 -dc -- "$source_file" >"$tmp_plain" 2>/dev/null || decode_rc=$? ;;
+    zst) zstd -qdc -- "$source_file" >"$tmp_plain" 2>/dev/null || decode_rc=$? ;;
+    *) rm -f -- "$tmp_plain" "$tmp_encoded"; return 1 ;;
+  esac
+  if [[ $decode_rc -ne 0 ]]; then
+    rm -f -- "$tmp_plain" "$tmp_encoded"
+    printf '%s: %s decompress failed, left as-is (NOT redacted)\n' \
+      "$source_file" "$codec" >>"$redaction_log"
     return 0
   fi
 
   redact_file "$tmp_plain" "$redaction_log"
-  if gzip -c -- "$tmp_plain" >"$source_file"; then
+  case "$codec" in
+    gz) gzip -c -- "$tmp_plain" >"$tmp_encoded" || encode_rc=$? ;;
+    xz) xz -c -- "$tmp_plain" >"$tmp_encoded" || encode_rc=$? ;;
+    bz2) bzip2 -c -- "$tmp_plain" >"$tmp_encoded" || encode_rc=$? ;;
+    zst) zstd -q -c -- "$tmp_plain" >"$tmp_encoded" || encode_rc=$? ;;
+  esac
+  if [[ $encode_rc -eq 0 ]]; then
     rm -f -- "$tmp_plain"
+    chmod "$mode" "$tmp_encoded" 2>/dev/null || true
+    mv -f -- "$tmp_encoded" "$source_file"
   else
-    rm -f -- "$tmp_plain"
+    rm -f -- "$tmp_plain" "$tmp_encoded"
+    printf '%s: %s recompress failed, original left as-is (NOT redacted)\n' \
+      "$source_file" "$codec" >>"$redaction_log"
     return 1
   fi
+}
+
+redact_gz_file() {
+  redact_compressed_file "$1" "$2" gz
 }
 
 run_capture() {

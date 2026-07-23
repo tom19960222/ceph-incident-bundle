@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export CEPH_INCIDENT_ALLOW_KUBECTL_EXEC=1
 BASH_BIN="$(command -v bash)"
 
 fail() {
@@ -188,6 +189,19 @@ set -e
 [[ "$connection_refused_rc" == "2" ]] || fail "explicit rook with connection failure should exit 2, got $connection_refused_rc"
 assert_file_contains "$out_connection_refused/cluster/rook/SKIPPED.txt" "kubectl cannot connect to cluster API"
 assert_file_contains "$out_connection_refused/cluster/rook/SKIPPED.txt" "connection to the server"
+
+out_default_no_exec="$tmpdir/out-default-no-exec"
+manifest_default_no_exec="$tmpdir/manifest-default-no-exec.jsonl"
+: >"$FAKE_KUBECTL_LOG"
+(
+  unset CEPH_INCIDENT_ALLOW_KUBECTL_EXEC
+  FAKE_KUBECTL_MODE=with-toolbox PATH="$fakebin:$PATH" \
+    run_rook_collector "$out_default_no_exec" "$manifest_default_no_exec"
+)
+assert_file_contains "$out_default_no_exec/cluster/rook/toolbox-SKIPPED.txt" \
+  "kubectl exec disabled"
+grep -qF 'exec -n rook-ceph' "$FAKE_KUBECTL_LOG" \
+  && fail "default-off collector ran kubectl exec" || true
 
 out_present="$tmpdir/out-present"
 manifest_present="$tmpdir/manifest-present.jsonl"

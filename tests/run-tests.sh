@@ -21,11 +21,13 @@ for path in \
   "$ROOT/lib/collect-cluster-cephadm.sh" \
   "$ROOT/lib/collect-cluster-rook.sh" \
   "$ROOT/lib/collect-node.sh" \
+  "$ROOT/lib/collect-var-log.sh" \
   "$ROOT/lib/collect-prometheus.sh" \
   "$ROOT/lib/verify-bundle.sh" \
   "$ROOT/tests/test-collect.sh" \
   "$ROOT/tests/test-cephadm-collector.sh" \
   "$ROOT/tests/test-node-collector.sh" \
+  "$ROOT/tests/test-var-log-collector.sh" \
   "$ROOT/tests/test-rook-collector.sh" \
   "$ROOT/tests/test-prom-collector.sh" \
   "$ROOT/tests/test-verify-bundle.sh"; do
@@ -79,6 +81,11 @@ node_collector_args="$(run_and_capture "$ROOT/tests/test-node-collector.sh")"
 node_collector_status="${node_collector_args%%$'\n'*}"
 node_collector_output="${node_collector_args#*$'\n'}"
 [[ "$node_collector_status" == "0" ]] || fail "test-node-collector.sh failed: $node_collector_output"
+
+var_log_collector_args="$(run_and_capture "$ROOT/tests/test-var-log-collector.sh")"
+var_log_collector_status="${var_log_collector_args%%$'\n'*}"
+var_log_collector_output="${var_log_collector_args#*$'\n'}"
+[[ "$var_log_collector_status" == "0" ]] || fail "test-var-log-collector.sh failed: $var_log_collector_output"
 
 rook_collector_args="$(run_and_capture "$ROOT/tests/test-rook-collector.sh")"
 rook_collector_status="${rook_collector_args%%$'\n'*}"

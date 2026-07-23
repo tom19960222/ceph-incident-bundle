@@ -6,10 +6,19 @@ set -euo pipefail
 NODE_COLLECTOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$NODE_COLLECTOR_DIR/common.sh"
+# shellcheck disable=SC1091
+source "$NODE_COLLECTOR_DIR/collect-var-log.sh"
 
 usage() {
   cat <<'EOF'
-Usage: collect-node.sh --out DIR --host-alias ALIAS [--since DURATION] [--timeout SECONDS] [--skip-logs]
+Usage: collect-node.sh --out DIR --host-alias ALIAS [options]
+
+Options:
+  --since DURATION
+  --timeout SECONDS
+  --skip-logs
+  --keep-original-logs
+  --var-log-max-bytes BYTES|unlimited
 EOF
 }
 
@@ -55,6 +64,63 @@ node_run_privileged() {
   node_run_capture "$outdir" "$manifest" "$host_alias" "$timeout" "$artifact_rel" sudo -n "$command_name" "$@"
 }
 
+node_run_privileged_bounded() {
+  local outdir=$1 manifest=$2 host_alias=$3 timeout=$4 artifact_rel=$5 limit=$6 command_name=$7
+  shift 7
+
+  local artifact="$outdir/$artifact_rel" payload_tmp artifact_tmp started ended
+  local command_string payload_size command_rc=0 tbin
+  local -a cmd exec_cmd stream_status
+  if [[ $EUID -eq 0 ]]; then
+    cmd=("$command_name" "$@")
+  elif command -v sudo >/dev/null 2>&1; then
+    cmd=(sudo -n "$command_name" "$@")
+  else
+    write_skip_artifact "$artifact" "sudo command not found for privileged read: $command_name"
+    return 2
+  fi
+
+  ensure_dir "$(dirname -- "$artifact")"
+  payload_tmp="$(mktemp "$(dirname -- "$artifact")/.${artifact##*/}.payload.XXXXXX")"
+  artifact_tmp="$(mktemp "$(dirname -- "$artifact")/.${artifact##*/}.XXXXXX")"
+  printf -v command_string '%q ' "${cmd[@]}"
+  command_string=${command_string% }
+  started="$(date -u +%FT%TZ)"
+  exec_cmd=("${cmd[@]}")
+  tbin="$(timeout_cmd)"
+  [[ -n "$tbin" ]] && exec_cmd=("$tbin" "$timeout" "${cmd[@]}")
+
+  set +e
+  set +o pipefail
+  "${exec_cmd[@]}" 2>&1 | head -c "$((limit + 1))" >"$payload_tmp"
+  stream_status=("${PIPESTATUS[@]}")
+  set -o pipefail
+  set -e
+  command_rc=${stream_status[0]}
+  payload_size="$(var_log_stat_size "$payload_tmp" 2>/dev/null || printf 0)"
+  ended="$(date -u +%FT%TZ)"
+
+  if [[ "$payload_size" -gt "$limit" ]]; then
+    rm -f -- "$payload_tmp" "$artifact_tmp"
+    manifest_add "$manifest" "$host_alias" "collect-node" "$artifact" "$command_string" 75 "$started" "$ended"
+    return 3
+  fi
+
+  {
+    printf '# host: %s\n# collector: collect-node\n# started: %s\n' "$host_alias" "$started"
+    [[ -n "$tbin" ]] && printf '# timeout: %ss\n' "$timeout" || printf '# timeout: unavailable\n'
+    cat -- "$payload_tmp"
+    if [[ $command_rc -eq 124 || $command_rc -eq 137 ]]; then
+      printf '# TRUNCATED: command timed out after %ss (exit %s)\n' "$timeout" "$command_rc"
+    fi
+  } >"$artifact_tmp"
+  rm -f -- "$payload_tmp"
+  mv -f -- "$artifact_tmp" "$artifact"
+  manifest_add "$manifest" "$host_alias" "collect-node" "$artifact" "$command_string" "$command_rc" "$started" "$ended"
+  [[ $command_rc -eq 0 ]] || return 2
+  return 0
+}
+
 journal_since_arg() {
   local since=$1
   if [[ "$since" =~ ^[0-9]+[smhdw]$ ]]; then
@@ -81,69 +147,46 @@ node_find0() {
   find "$root" "$@" 2>/dev/null
 }
 
-node_file_size() {
-  local source=$1 size
+node_copy_file() {
+  local source=$1 dest=$2 tmp
+  ensure_dir "$(dirname -- "$dest")"
+  tmp="$dest.tmp.$$"
 
-  if [[ $EUID -eq 0 || -r "$source" ]]; then
-    size="$(wc -c <"$source" 2>/dev/null | tr -d '[:space:]')" || return 1
+  if [[ "${CEPH_INCIDENT_TEST_ALLOW_ATIME_READ:-0}" == "1" ]]; then
+    if ! cat -- "$source" >"$tmp"; then
+      rm -f -- "$tmp"
+      return 1
+    fi
+  elif [[ $EUID -eq 0 || -O "$source" ]]; then
+    if ! dd "if=$source" iflag=noatime status=none >"$tmp"; then
+      rm -f -- "$tmp"
+      return 1
+    fi
   elif command -v sudo >/dev/null 2>&1; then
-    size="$(sudo -n wc -c "$source" 2>/dev/null | awk '{print $1}')" || return 1
+    # Read as root with O_NOATIME, but write the collector-owned destination as
+    # the calling user. This avoids mutating source atime and output ownership.
+    # shellcheck disable=SC2024
+    if ! sudo -n dd "if=$source" iflag=noatime status=none >"$tmp"; then
+      rm -f -- "$tmp"
+      return 1
+    fi
   else
     return 1
   fi
 
-  [[ "$size" =~ ^[0-9]+$ ]] || return 1
-  printf '%s' "$size"
-}
-
-node_copy_file() {
-  local source=$1 dest=$2
-  ensure_dir "$(dirname -- "$dest")"
-
-  if [[ $EUID -eq 0 || -r "$source" ]]; then
-    cp -p -- "$source" "$dest"
-    return $?
-  fi
-
-  if command -v sudo >/dev/null 2>&1; then
-    # Intentional: read the source as root, but write $dest as the calling user
-    # (who owns the bundle). `sudo tee` would create $dest as root — not wanted.
-    # shellcheck disable=SC2024
-    sudo -n cat -- "$source" >"$dest"
-    return $?
-  fi
-
-  return 1
-}
-
-node_tail_file() {
-  local source=$1 nbytes=$2 dest=$3
-  ensure_dir "$(dirname -- "$dest")"
-
-  if [[ $EUID -eq 0 || -r "$source" ]]; then
-    tail -c "$nbytes" "$source" >"$dest"
-    return $?
-  fi
-
-  if command -v sudo >/dev/null 2>&1; then
-    # Intentional: read as root, write $dest as the calling user (see node_copy_file).
-    # shellcheck disable=SC2024
-    sudo -n tail -c "$nbytes" "$source" >"$dest"
-    return $?
-  fi
-
-  return 1
+  mv -f -- "$tmp" "$dest"
 }
 
 copy_readable_etc_files() {
   local outdir=$1
-  local source dest_name
+  local source dest_name failed=0
 
   for source in /etc/os-release /etc/hosts /etc/resolv.conf; do
     [[ -r "$source" ]] || continue
     dest_name="${source#/etc/}"
-    copy_if_exists "$source" "$outdir/system/$dest_name"
+    node_copy_file "$source" "$outdir/system/$dest_name" || failed=1
   done
+  [[ $failed -eq 0 ]] || return 2
 }
 
 collect_timesyncd_config() {
@@ -177,73 +220,6 @@ collect_timesyncd_config() {
   if [[ $copied -eq 0 ]]; then
     write_skip_artifact "$dest/SKIPPED.txt" "systemd-timesyncd config not found at $conf or $conf_d"
   fi
-
-  [[ $failed -eq 0 ]] || return 2
-}
-
-collect_ceph_log_listing() {
-  local outdir=$1 manifest=$2 host_alias=$3 timeout=$4
-  local log_dir=${CEPH_INCIDENT_VAR_LOG_CEPH_DIR:-/var/log/ceph}
-  local listing="$outdir/logs/ceph-log-listing.txt"
-
-  if [[ -d "$log_dir" ]]; then
-    # SC2016: the sh -c body is meant to expand on the remote sh, not here.
-    # shellcheck disable=SC2016
-    if ! node_run_privileged "$outdir" "$manifest" "$host_alias" "$timeout" "logs/ceph-log-listing.txt" \
-      find "$log_dir" -maxdepth 2 -type f -exec sh -c '
-        for path do
-          size=$(wc -c <"$path" 2>/dev/null || printf unknown)
-          printf "%s %s bytes\n" "$path" "$size"
-        done
-      ' sh {} +; then
-      return 2
-    fi
-  else
-    ensure_dir "$(dirname -- "$listing")"
-    printf 'SKIPPED: %s is not a readable directory on this node\n' "$log_dir" >"$listing"
-  fi
-}
-
-copy_ceph_logs() {
-  local outdir=$1
-  local log_dir=${CEPH_INCIDENT_VAR_LOG_CEPH_DIR:-/var/log/ceph}
-  local cap_bytes=${CEPH_INCIDENT_LOG_FILE_CAP_BYTES:-1048576}
-  local copied_dir="$outdir/logs/ceph"
-  local source rel dest size
-  local failed=0
-
-  [[ -d "$log_dir" ]] || return 0
-  ensure_dir "$copied_dir"
-
-  while IFS= read -r -d '' source; do
-    if ! size="$(node_file_size "$source")"; then
-      failed=1
-      continue
-    fi
-    rel="${source#"$log_dir"/}"
-    dest="$copied_dir/$rel"
-    if (( size <= cap_bytes )); then
-      if ! node_copy_file "$source" "$dest"; then
-        failed=1
-      fi
-    elif [[ "$source" == *.gz ]]; then
-      # A byte-tail of a gzip stream is not decompressible (and would evade
-      # redaction); record it instead of shipping garbage.
-      ensure_dir "$(dirname -- "$dest")"
-      printf 'original_bytes=%s\nnote=oversized compressed log skipped (gzip tail is not usable)\n' \
-        "$size" >"$dest.TRUNCATED"
-    else
-      # Oversized: keep the most recent cap_bytes (tail) instead of dropping the
-      # file silently — the active large log is often exactly what's wanted —
-      # and record the truncation so the omission is visible.
-      if node_tail_file "$source" "$cap_bytes" "$dest"; then
-        printf 'original_bytes=%s\ntail_bytes=%s\nnote=captured trailing bytes only (file exceeded cap)\n' \
-          "$size" "$cap_bytes" >"$dest.TRUNCATED"
-      else
-        failed=1
-      fi
-    fi
-  done < <(node_find0 "$log_dir" -maxdepth 2 -type f \( -name '*.log' -o -name '*.log.*' -o -name '*.txt' -o -name '*.gz' \) -print0 2>/dev/null || true)
 
   [[ $failed -eq 0 ]] || return 2
 }
@@ -296,6 +272,7 @@ collect_var_lib_ceph() {
 
 collect_node_main() {
   local outdir='' host_alias='' since="24h" timeout=20 skip_logs=0
+  local keep_original_logs=0 var_log_max_bytes=10737418240
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -319,6 +296,14 @@ collect_node_main() {
         skip_logs=1
         shift
         ;;
+      --keep-original-logs)
+        keep_original_logs=1
+        shift
+        ;;
+      --var-log-max-bytes)
+        var_log_max_bytes=${2-}
+        shift 2
+        ;;
       --help|-h)
         usage
         return 0
@@ -332,6 +317,10 @@ collect_node_main() {
 
   [[ -n "$outdir" && -n "$host_alias" ]] || {
     usage >&2
+    return 1
+  }
+  [[ "$var_log_max_bytes" == "unlimited" || "$var_log_max_bytes" =~ ^[0-9]+$ ]] || {
+    printf 'invalid --var-log-max-bytes: %s\n' "$var_log_max_bytes" >&2
     return 1
   }
 
@@ -430,18 +419,69 @@ collect_node_main() {
     write_skip_artifact "$outdir/cephadm/cephadm-ls.json" "command not found: cephadm"
   fi
 
-  copy_readable_etc_files "$outdir"
+  if ! copy_readable_etc_files "$outdir"; then
+    failed=1
+  fi
   if ! collect_var_lib_ceph "$outdir" "$manifest" "$host_alias" "$timeout"; then
     failed=1
   fi
 
   if [[ $skip_logs -eq 1 ]]; then
-    write_skip_artifact "$outdir/logs/ceph-log-listing.txt" "log collection disabled by --skip-logs"
+    write_skip_artifact "$outdir/logs/var-log/SKIPPED.txt" "log collection disabled by --skip-logs"
   else
-    if ! collect_ceph_log_listing "$outdir" "$manifest" "$host_alias" "$timeout"; then
+    local var_log_rc=0 journal_rc=0 payload_bytes=0 journal_limit
+    collect_var_logs \
+      "${CEPH_INCIDENT_VAR_LOG_DIR:-/var/log}" \
+      "$outdir/logs/var-log" \
+      "$var_log_max_bytes" \
+      "$keep_original_logs" || var_log_rc=$?
+    if [[ $var_log_rc -ne 0 ]]; then
       failed=1
     fi
-    if ! copy_ceph_logs "$outdir"; then
+    if [[ "$var_log_max_bytes" == "unlimited" ]]; then
+      if ! node_run_privileged "$outdir" "$manifest" "$host_alias" "$heavy_timeout" \
+        "logs/var-log/journal-all-since.txt" journalctl --since "$journal_since" --no-pager; then
+        failed=1
+      fi
+    elif [[ -f "$outdir/logs/var-log/OVER-LIMIT.txt" ]]; then
+      write_skip_artifact "$outdir/logs/var-log/journal-all-since.txt" \
+        "not collected because /var/log payload exceeded the per-node cap"
+      failed=1
+    elif [[ -f "$outdir/logs/var-log/PAYLOAD-BYTES.txt" ]]; then
+      payload_bytes="$(tr -d '[:space:]' <"$outdir/logs/var-log/PAYLOAD-BYTES.txt")"
+      [[ "$payload_bytes" =~ ^[0-9]+$ ]] || payload_bytes=$var_log_max_bytes
+      journal_limit=$((var_log_max_bytes - payload_bytes))
+      [[ $journal_limit -ge 0 ]] || journal_limit=0
+      node_run_privileged_bounded "$outdir" "$manifest" "$host_alias" "$heavy_timeout" \
+        "logs/var-log/journal-all-since.txt" "$journal_limit" \
+        journalctl --since "$journal_since" --no-pager || journal_rc=$?
+      if [[ $journal_rc -eq 3 ]]; then
+        rm -rf -- "$outdir/logs/var-log/merged" "$outdir/logs/var-log/raw" "$outdir/logs/var-log/original"
+        rm -f -- "$outdir/logs/var-log/PAYLOAD-BYTES.txt"
+        printf 'max_bytes=%s\nstatus=not-collected-journal-exceeded-remaining-cap\n' \
+          "$var_log_max_bytes" >"$outdir/logs/var-log/OVER-LIMIT.txt"
+        write_skip_artifact "$outdir/logs/var-log/journal-all-since.txt" \
+          "not collected because combined /var/log and journal text exceeded the per-node cap"
+        failed=1
+      elif [[ $journal_rc -ne 0 ]]; then
+        failed=1
+      else
+        payload_bytes=$((payload_bytes + $(var_log_stat_size "$outdir/logs/var-log/journal-all-since.txt" 2>/dev/null || printf 0)))
+        if [[ $payload_bytes -gt $var_log_max_bytes ]]; then
+          rm -rf -- "$outdir/logs/var-log/merged" "$outdir/logs/var-log/raw" "$outdir/logs/var-log/original"
+          rm -f -- "$outdir/logs/var-log/PAYLOAD-BYTES.txt"
+          printf 'max_bytes=%s\nstatus=not-collected-combined-payload-exceeded-cap\n' \
+            "$var_log_max_bytes" >"$outdir/logs/var-log/OVER-LIMIT.txt"
+          write_skip_artifact "$outdir/logs/var-log/journal-all-since.txt" \
+            "not collected because combined /var/log and journal text exceeded the per-node cap"
+          failed=1
+        else
+          printf '%s\n' "$payload_bytes" >"$outdir/logs/var-log/PAYLOAD-BYTES.txt"
+        fi
+      fi
+    elif [[ $var_log_rc -ne 0 ]]; then
+      write_skip_artifact "$outdir/logs/var-log/journal-all-since.txt" \
+        "not collected because /var/log payload accounting was unavailable"
       failed=1
     fi
   fi
