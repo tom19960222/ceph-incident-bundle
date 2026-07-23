@@ -1,0 +1,5 @@
+/results/*
+!/results/.gitkeep
+/tmp/
+/env.sh
+/*.tar.gz

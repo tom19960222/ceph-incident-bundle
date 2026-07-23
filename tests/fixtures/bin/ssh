@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log_file=${FAKE_SSH_LOG:-}
+fail_on=${FAKE_SSH_FAIL_ON:-}
+crash_ls_broken=${FAKE_SSH_CRASH_LS_BROKEN:-0}
+
+if [[ -n "$log_file" ]]; then
+  printf '%s\n' "$*" >>"$log_file"
+fi
+
+cmd="$*"
+
+emit_json() {
+  printf '%s\n' "$1"
+}
+
+emit_text() {
+  printf '%s\n' "$1"
+}
+
+maybe_fail() {
+  local needle=$1
+  if [[ -n "$fail_on" && "$cmd" == *"$needle"* ]]; then
+    printf 'simulated failure for %s\n' "$needle" >&2
+    exit 17
+  fi
+}
+
+case "$cmd" in
+  *"ceph status --format json-pretty"*)
+    maybe_fail 'status --format json-pretty'
+    emit_json '{"health":"HEALTH_OK","fsid":"fsid-1"}'
+    ;;
+  *"ceph status"*)
+    maybe_fail 'status'
+    emit_text 'cluster is healthy'
+    ;;
+  *"ceph health detail --format json-pretty"*)
+    maybe_fail 'health detail --format json-pretty'
+    emit_json '{"checks":[{"severity":"HEALTH_OK"}]}'
+    ;;
+  *"ceph health detail"*)
+    maybe_fail 'health detail'
+    emit_text 'HEALTH_OK'
+    ;;
+  *"ceph versions --format json-pretty"*)
+    maybe_fail 'versions --format json-pretty'
+    emit_json '{"mon":"19.2.3","mgr":"19.2.3"}'
+    ;;
+  *"ceph df detail --format json-pretty"*)
+    maybe_fail 'df detail --format json-pretty'
+    emit_json '{"stats":{"total_bytes":100,"total_avail_bytes":80}}'
+    ;;
+  *"ceph osd tree --format json-pretty"*)
+    maybe_fail 'osd tree --format json-pretty'
+    emit_json '{"nodes":[{"id":0,"name":"osd.0"}]}'
+    ;;
+  *"ceph osd tree"*)
+    maybe_fail 'osd tree'
+    emit_text 'ID CLASS WEIGHT TYPE NAME STATUS REWEIGHT PRI-AFF'
+    ;;
+  *"ceph osd df --format json-pretty"*)
+    maybe_fail 'osd df --format json-pretty'
+    emit_json '{"nodes":[{"id":0,"utilization":10}]}'
+    ;;
+  *"ceph osd dump --format json-pretty"*)
+    maybe_fail 'osd dump --format json-pretty'
+    emit_json '{"osds":[{"osd":0,"state":["up","in"]}]}'
+    ;;
+  *"ceph osd perf --format json-pretty"*)
+    maybe_fail 'osd perf --format json-pretty'
+    emit_json '{"osd_perf_infos":[{"id":0,"commit_latency_ms":1.2}]}'
+    ;;
+  *"ceph osd blocked-by --format json-pretty"*)
+    maybe_fail 'osd blocked-by --format json-pretty'
+    emit_json '{"blocked_by":[]}'
+    ;;
+  *"ceph pg stat --format json-pretty"*)
+    maybe_fail 'pg stat --format json-pretty'
+    emit_json '{"num_pgs":1,"num_bytes":2048}'
+    ;;
+  *"ceph pg dump --format json-pretty"*)
+    maybe_fail 'pg dump --format json-pretty'
+    emit_json '{"pg_map":{"pg_stats":[{"pgid":"1.1"}]}}'
+    ;;
+  *"ceph pg dump_stuck --format json-pretty"*)
+    maybe_fail 'pg dump_stuck --format json-pretty'
+    emit_json '{"stuck_pg_stats":[]}'
+    ;;
+  *"ceph mon dump --format json-pretty"*)
+    maybe_fail 'mon dump --format json-pretty'
+    emit_json '{"mons":[{"name":"a"}]}'
+    ;;
+  *"ceph quorum_status --format json-pretty"*)
+    maybe_fail 'quorum_status --format json-pretty'
+    emit_json '{"quorum_names":["a"]}'
+    ;;
+  *"ceph mgr dump --format json-pretty"*)
+    maybe_fail 'mgr dump --format json-pretty'
+    emit_json '{"active_name":"mgr.a"}'
+    ;;
+  *"ceph orch host ls --format json-pretty"*)
+    maybe_fail 'orch host ls --format json-pretty'
+    emit_json '[{"hostname":"host-a"}]'
+    ;;
+  *"ceph orch ps --format json-pretty"*)
+    maybe_fail 'orch ps --format json-pretty'
+    emit_json '[{"daemon_type":"mon","daemon_id":"a"}]'
+    ;;
+  *"ceph orch ps"*)
+    maybe_fail 'orch ps'
+    emit_text 'NAME HOST STATUS'
+    ;;
+  *"ceph orch device ls --wide --format json-pretty"*)
+    maybe_fail 'orch device ls --wide --format json-pretty'
+    emit_json '[{"path":"/dev/sda","available":true}]'
+    ;;
+  *"ceph config dump --format json-pretty"*)
+    maybe_fail 'config dump --format json-pretty'
+    emit_json '[{"who":"mon.a","value":"1"}]'
+    ;;
+  *"ceph crash ls --format json-pretty"*)
+    maybe_fail 'crash ls --format json-pretty'
+    if [[ "$crash_ls_broken" == "1" ]]; then
+      emit_text '{not-json'
+      exit 0
+    fi
+    emit_json '[
+      {"crash_id":"crash-01"},
+      {"crash_id":"crash/02"},
+      {"crash_id":"crash:02"},
+      {"crash_id":"crash-04"},
+      {"crash_id":"crash-05"},
+      {"crash_id":"crash-06"},
+      {"crash_id":"crash-07"},
+      {"crash_id":"crash-08"},
+      {"crash_id":"crash-09"},
+      {"crash_id":"crash-10"},
+      {"crash_id":"crash-11"},
+      {"crash_id":"crash-12"}
+    ]'
+    ;;
+  *"ceph crash info crash-01"*)
+    maybe_fail 'crash info crash-01'
+    emit_json '{"crash_id":"crash-01","detail":"detail-01"}'
+    ;;
+  *"ceph crash info crash/02"*)
+    maybe_fail 'crash info crash/02'
+    emit_json '{"crash_id":"crash/02","detail":"detail-02"}'
+    ;;
+  *"ceph crash info crash:02"*)
+    maybe_fail 'crash info crash:02'
+    emit_json '{"crash_id":"crash:02","detail":"detail-02-collision"}'
+    ;;
+  *"ceph crash info crash-04"*)
+    maybe_fail 'crash info crash-04'
+    emit_json '{"crash_id":"crash-04","detail":"detail-04"}'
+    ;;
+  *"ceph crash info crash-05"*)
+    maybe_fail 'crash info crash-05'
+    emit_json '{"crash_id":"crash-05","detail":"detail-05"}'
+    ;;
+  *"ceph crash info crash-06"*)
+    maybe_fail 'crash info crash-06'
+    emit_json '{"crash_id":"crash-06","detail":"detail-06"}'
+    ;;
+  *"ceph crash info crash-07"*)
+    maybe_fail 'crash info crash-07'
+    emit_json '{"crash_id":"crash-07","detail":"detail-07"}'
+    ;;
+  *"ceph crash info crash-08"*)
+    maybe_fail 'crash info crash-08'
+    emit_json '{"crash_id":"crash-08","detail":"detail-08"}'
+    ;;
+  *"ceph crash info crash-09"*)
+    maybe_fail 'crash info crash-09'
+    emit_json '{"crash_id":"crash-09","detail":"detail-09"}'
+    ;;
+  *"ceph crash info crash-10"*)
+    maybe_fail 'crash info crash-10'
+    emit_json '{"crash_id":"crash-10","detail":"detail-10"}'
+    ;;
+  *)
+    printf 'unexpected ssh command: %s\n' "$cmd" >&2
+    exit 99
+    ;;
+esac
