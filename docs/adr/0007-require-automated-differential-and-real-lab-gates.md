@@ -5,6 +5,7 @@ Python cutover 不能只靠假資料測試。刪除 shell 前，既有 shell sui
 ## Consequences
 
 - Shell 實作保留到所有 gates 通過，作為 differential reference。
+- Shell reference 必須先通過 #23 的 Node Evidence Archive pre-extraction hardening，才可參與 real-lab qualification；behavior reference 身份不能豁免 read-only safety contract。
 - Real-lab canary 必須在 collect 前後取得 stable state snapshot，確認 identity/configuration 未改變，且 node 沒有殘留 collector 暫存目錄。
 - 自然變動的 Ceph counters、epochs 與時間資料不得用來判定 read-only regression。
 - 每份 real-lab incident bundle 都必須通過 structural verification；cutover 階段也必須通過仍存在的 content-safety checks。

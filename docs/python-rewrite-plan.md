@@ -61,6 +61,7 @@
 
 ### 6. Real-lab validation and cutover
 
+- 先完成 #23，讓 shell reference 在任何 extraction write 前驗證 Node Evidence Archive；未完成時不得把 shell run 當成 qualification evidence。
 - 在同一 lab 連續執行 shell reference full collect 與 Python candidate full collect；每次 invocation 都同時收齊 Ceph、Rook、Prometheus 與全部 nodes（包含 `/var/log`）。
 - 比較兩份已驗證 bundle 的 normalized observable contracts。
 - 證明 stable state snapshot 前後一致，且遠端沒有 collector 暫存資源殘留。

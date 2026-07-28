@@ -27,7 +27,7 @@ The non-negotiable rules are:
 - Treat every Node Evidence Archive as untrusted. Validate every member before extraction, and never allow absolute paths, traversal, links, devices, FIFOs, or writes outside the collector-owned workspace.
 - Real-lab qualification must keep `cephadm shell` and `kubectl exec` disabled. Those opt-ins can create runtime side effects and cannot be used as read-only proof.
 - Fail closed on any SSH fingerprint, Ceph/Rook identity, required-node, or endpoint mismatch. Never bypass an identity mismatch to make a gate pass.
-- `CEPH-LAB-CONNECTION.md` is human-maintained context only. Automation must use an explicitly selected local TOML Lab Profile and must never parse that Markdown file.
+- `CEPH-LAB-CONNECTION.md` is human-maintained context only. Real-lab validation automation must use an explicitly selected local TOML Lab Profile and must never parse that Markdown file. Ordinary inventory-driven collect retains its documented CLI contract and is not, by itself, qualification evidence.
 - Profiles and reports may reference credential paths, but must never contain private keys, keyrings, passwords, tokens, or other credential contents.
 - Ordinary `make validate` must remain offline. Real-lab execution always requires a separate explicit opt-in and a reviewed active Lab Profile.
 

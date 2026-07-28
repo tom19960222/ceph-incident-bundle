@@ -10,12 +10,12 @@
 
 現有 shell implementation 是 observable behaviour 的 reference，不是安全性已被完整證明的 oracle。Python cutover 不得照搬下列已知缺口：
 
-- 工作機目前會在完整檢查 node archive member table 前呼叫外部 tar 解壓。Python node transport（#11）必須在任何 extraction write 前拒絕 traversal、absolute path、link、special member、collision、oversize、truncated stream 與缺少 manifest；#17 的 structural verification 也必須保留同一安全邊界。
+- 工作機目前會在完整檢查 node archive member table 前呼叫外部 tar 解壓。Shell reference 必須先由 #23 補上 pre-extraction validation，才有資格參與 qualification；Python node transport（#11）也必須在任何 extraction write 前拒絕 traversal、absolute path、link、special member、collision、oversize、truncated stream 與缺少 manifest；#17 的 structural verification 必須保留同一安全邊界。
 - Shell remote cleanup 依賴 trap，對一般 success/failure/timeout/interrupt 是 best effort，但無法在 process/host 被強制終止時保證執行。#11 必須測試可恢復的所有終止路徑，#20/#21 必須以 invocation identifier 和 residue check 提供實機證據。
 - 現行 `/var/log` 測試會啟用測試用的普通讀取 escape hatch，source immutability assertion 尚未涵蓋 atime、nofollow 與安全讀取失敗時 fail closed。#12 必須補齊 production read path，#18 必須把這些 invariants 納入 offline gate。
 - Shell 保留 `cephadm shell` 與 `kubectl exec` 的明確 opt-in compatibility paths。它們是 default-off，而且不得出現在 #20/#21 的 operationally read-only qualification。
 
-在上述 tickets 完成前，不得宣稱現有 shell 已滿足本文件的完整 proof obligations。受控 real lab 中使用 shell reference 時，仍必須先確認 nodes 身份可信、關閉兩個 opt-ins、限制 workstation output boundary，並在執行後檢查 stable state 與 remote residue。
+在上述 tickets 完成前，不得宣稱現有 shell 已滿足本文件的完整 proof obligations。#23 完成前，shell reference 不得作為 real-lab qualification evidence；非 qualification 的受控診斷執行仍必須確認 nodes 身份可信、關閉兩個 opt-ins、限制 workstation output boundary，並在執行後檢查 remote residue。
 
 ## Safety Boundary
 
