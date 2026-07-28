@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import io
 import os
 import subprocess
@@ -179,6 +180,27 @@ class VerifyCliTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 1)
                     self.assertEqual(result.stdout, "")
                     self.assertIn("invalid archive", result.stderr)
+
+    def test_archive_with_invalid_deflate_body_is_rejected_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            bundle = temporary_root / "incident"
+            self.make_valid_bundle_dir(bundle)
+
+            tar_stream = io.BytesIO()
+            with tarfile.open(fileobj=tar_stream, mode="w") as output:
+                output.add(bundle, arcname=".")
+            corrupt_bytes = bytearray(gzip.compress(tar_stream.getvalue()))
+            corrupt_bytes[10] |= 0x06  # Deflate BTYPE=3 is reserved/invalid.
+            corrupt_archive = temporary_root / "invalid-deflate.tar.gz"
+            corrupt_archive.write_bytes(corrupt_bytes)
+
+            result = self.run_cli("verify", str(corrupt_archive))
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("VERIFY FAIL: invalid archive", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_unsafe_archive_members_are_rejected_without_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

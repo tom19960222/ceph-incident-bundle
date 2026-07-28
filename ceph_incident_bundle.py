@@ -6,6 +6,7 @@ from __future__ import annotations
 import gzip
 import sys
 import tarfile
+import zlib
 from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 
@@ -87,7 +88,7 @@ def _read_archive(target: Path) -> set[str]:
                 with stream:
                     while stream.read(1024 * 1024):
                         pass
-    except (OSError, tarfile.TarError, EOFError) as error:
+    except (OSError, tarfile.TarError, EOFError, zlib.error) as error:
         raise VerificationError(f"invalid archive: {target}") from error
     return files
 
