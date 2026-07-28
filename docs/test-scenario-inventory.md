@@ -38,13 +38,13 @@
 
 | # | 情境描述 | fixture 手法 | 行號 | 分類 |
 |---|---|---|---|---|
-| R1 | 所有實作與測試檔存在於預期路徑 | 無 | 18–35 | 【實作細節-不移植】repo 佈局檢查，Python 化後由 import / 打包取代 |
-| R2 | `run/collect.sh`、`lib/verify-bundle.sh` 具可執行位 | 無 | 37–39 | 【實作細節-不移植】打包細節（入口點形式會改變） |
-| R3 | `collect.sh` 無參數 → exit 1 且輸出含 `Usage:` | `run_and_capture`（捕捉 status+輸出） | 41–45 | 【功能等價-必移植】CLI 契約 |
-| R4 | `verify-bundle.sh` 無參數 → exit 1 且輸出含 `Usage:` | 同上 | 47–51 | 【功能等價-必移植】 |
-| R5 | `verify-bundle.sh` 指到不存在路徑 → 非 0，輸出說明失敗（`VERIFY FAIL:`/`Usage:`/`error` 擇一） | 同上 | 53–57 | 【功能等價-必移植】 |
-| R6 | `collect.sh` 帶不存在的 inventory → 非 0，輸出說明（`missing inventory` 等） | 同上 | 59–63 | 【功能等價-必移植】 |
-| R7 | 依序執行 8 個子測試檔並要求 exit 0 | 無 | 65–103 | 【實作細節-不移植】測試 harness 本身，由 unittest discovery 取代 |
+| R1 | 所有實作與測試檔存在於預期路徑 | 無 | 20–37 | 【實作細節-不移植】repo 佈局檢查，Python 化後由 import / 打包取代 |
+| R2 | `run/collect.sh`、`lib/verify-bundle.sh` 具可執行位 | 無 | 39–41 | 【實作細節-不移植】打包細節（入口點形式會改變） |
+| R3 | `collect.sh` 無參數 → exit 1 且輸出含 `Usage:` | `run_and_capture`（捕捉 status+輸出） | 43–47 | 【功能等價-必移植】CLI 契約 |
+| R4 | `verify-bundle.sh` 無參數 → exit 1 且輸出含 `Usage:` | 同上 | 49–53 | 【功能等價-必移植】 |
+| R5 | `verify-bundle.sh` 指到不存在路徑 → 非 0，輸出說明失敗（`VERIFY FAIL:`/`Usage:`/`error` 擇一） | 同上 | 55–59 | 【功能等價-必移植】 |
+| R6 | `collect.sh` 帶不存在的 inventory → 非 0，輸出說明（`missing inventory` 等） | 同上 | 61–65 | 【功能等價-必移植】 |
+| R7 | 依序執行 8 個子測試檔並要求 exit 0 | 無 | 67–105 | 【實作細節-不移植】測試 harness 本身，由 unittest discovery 取代 |
 
 ## 2. `tests/test-common.sh`（common.sh / bundle.sh helpers）
 
@@ -319,7 +319,7 @@ match」分派，模擬透過 ssh 在遠端跑 `ceph ...` 的回應。
     `FAKE_CEPH_TARGETS` / `FAKE_CEPH_BIN_TARGETS` / `FAKE_KUBE_TARGETS` 輸出
     `cephadm` / `ceph` / `kubectl` 能力字。
   - `cephadm shell -- ceph` 與 ` ceph `：exec 委派給 `$FIXTURE_SSH`（10.1 的共用 fixture）。
-  - `collect-node.sh`：就地捏造 node bundle tar 回傳 stdout；旋鈕：
+  - `collect-node.sh`：就地捏造 Node Evidence Archive 回傳 stdout；旋鈕：
     `FAKE_SSH_BAD_TAR_ALIAS`（回非 tar）、`FAKE_SSH_NO_MANIFEST_ALIAS`（tar 缺 manifest）、
     `FAKE_SSH_FAIL_ALIAS`（tar 完整但 exit 2）、`FAKE_SSH_PEM_ALIAS`（夾帶 .pem 觸發
     verify 失敗）、`FAKE_SSH_SLEEP`。

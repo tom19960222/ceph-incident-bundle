@@ -95,7 +95,7 @@ Residue check 只能檢查本次 invocation 的 identifier 或安全的固定 co
 - Lab Profile 是 automation 唯一的連線來源。它只可保存 endpoint、host map、expected identity/fingerprint，以及 SSH private key、kubeconfig 等 credential **檔案路徑**。
 - Profile、report、log、bundle comparison 與 `next_action` 不得複製 private key、keyring、password、token、kubeconfig credential payload 或其他 secret content。
 - `CEPH-LAB-CONNECTION.md` 只供人閱讀；production code、test、discovery、status 與 validation harness 永遠不得解析它。
-- 執行任何 collect 前，必須比對 active profile 的 SSH host fingerprints、Ceph/Rook FSID、必要 hostname/host map 與其他定義的 stable identity。缺值、連線目標不一致、fingerprint/FSID mismatch 或 candidate 尚未明確啟用時，一律 fail closed；禁止用 accept-current、skip-check 或自動改寫 active profile 繞過。
+- 執行任何 real-lab qualification collect 前，必須比對 active profile 的 SSH host fingerprints、Ceph/Rook FSID、必要 hostname/host map 與其他定義的 stable identity。缺值、連線目標不一致、fingerprint/FSID mismatch 或 candidate 尚未明確啟用時，一律 fail closed；禁止用 accept-current、skip-check 或自動改寫 active profile 繞過。一般 inventory-driven collect 仍保留既有 CLI/host-key contract，但不能被當成通過 strict lab identity gate 的證據。
 
 ## Proof Obligations
 

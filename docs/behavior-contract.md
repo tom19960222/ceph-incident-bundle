@@ -365,6 +365,7 @@ kubectl 前綴（:146-153）：有 `--ssh-target` → `ssh <base_opts> <target> 
    - rc 255/124/137 → 寫 ssh-debug（label `node-<alias>`）。
    - rc 124/137（timeout 砍）→ `nodes/<alias>/SKIPPED.txt`：`node collection timed out after <s>s (exit <rc>) from <target>`，刪 tar，return 2。
    - tar 非空且解得開 → 解進 `nodes/<alias>/`；若缺 `manifest.jsonl` → 視為截斷，寫 SKIPPED（`node archive from <target> is incomplete (no manifest.jsonl); treated as failure`）、rc=2。
+     **Safety note:** 這一點只記錄 shell reference 的現況，不是 Python target。Shell 會在完整驗證 member table 前解壓；Python node transport 必須依 `docs/read-only-safety.md` 在任何 extraction write 前拒絕 traversal、absolute path、link、special member、collision、oversize、truncated stream 與缺少 manifest。
    - 解不開/空 → 清掉目錄重建，寫 `SKIPPED: no usable node archive returned from <target> (ssh exit <rc>)`；此時 rc 若原為 0 改成 2。
    - 刪除暫存 tar；return rc（node collector 自己的 2 也會走到這裡：**遠端 partial 時 tar 已解開、證據保留，只是計入 node_failed**）。
 
