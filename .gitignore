@@ -4,3 +4,5 @@
 /env.sh
 /*.tar.gz
 .ssh/
+__pycache__/
+*.py[cod]
