@@ -13,3 +13,22 @@ The five canonical triage roles use their default label strings (`needs-triage`,
 ### Domain docs
 
 Single-context — one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+## Evidence collection safety
+
+This repository builds an operationally read-only evidence collector. Before changing or running collection code, read:
+
+- `docs/read-only-safety.md` for the safety contract and proof obligations.
+- `docs/lab-validation-runbook.md` for the fail-closed lab workflow.
+
+The non-negotiable rules are:
+
+- Collection must not change persistent configuration, services, packages, mounts, Ceph desired state, or Kubernetes objects/workloads. Writes are limited to collector-owned workspaces and final bundle output; query-side audit/access logs and counters may change naturally.
+- Treat every Node Evidence Archive as untrusted. Validate every member before extraction, and never allow absolute paths, traversal, links, devices, FIFOs, or writes outside the collector-owned workspace.
+- Real-lab qualification must keep `cephadm shell` and `kubectl exec` disabled. Those opt-ins can create runtime side effects and cannot be used as read-only proof.
+- Fail closed on any SSH fingerprint, Ceph/Rook identity, required-node, or endpoint mismatch. Never bypass an identity mismatch to make a gate pass.
+- `CEPH-LAB-CONNECTION.md` is human-maintained context only. Automation must use an explicitly selected local TOML Lab Profile and must never parse that Markdown file.
+- Profiles and reports may reference credential paths, but must never contain private keys, keyrings, passwords, tokens, or other credential contents.
+- Ordinary `make validate` must remain offline. Real-lab execution always requires a separate explicit opt-in and a reviewed active Lab Profile.
+
+The `lab-status`, `lab-profile-discover`, and `validate-lab` targets described by the runbook are planned interfaces owned by issues #19 and #20. Until those tickets land, do not invent ad-hoc replacements or claim that the automated real-lab gate exists.
