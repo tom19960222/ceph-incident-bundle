@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gzip
 import sys
 import tarfile
 from collections.abc import Sequence
@@ -40,13 +41,32 @@ def _verify_nodes_artifact(files: set[str]) -> None:
         raise VerificationError("missing nodes/ artifact")
 
 
+def _verify_file_set(files: set[str]) -> None:
+    _verify_required_files(files)
+    _verify_cluster_artifact(files)
+    _verify_nodes_artifact(files)
+
+
 def _read_archive(target: Path) -> set[str]:
     files: set[str] = set()
     try:
+        with gzip.open(target, mode="rb") as compressed_stream:
+            while compressed_stream.read(1024 * 1024):
+                pass
+
         with tarfile.open(target, mode="r:gz") as archive:
             members = archive.getmembers()
+            normalised_members: list[tuple[tarfile.TarInfo, str]] = []
+            seen_names: dict[str, str] = {}
             for member in members:
-                _normalise_member_name(member.name)
+                normalised_name = _normalise_member_name(member.name)
+                if normalised_name in seen_names:
+                    raise VerificationError(
+                        "duplicate archive member after normalisation: "
+                        f"{member.name} collides with {seen_names[normalised_name]}"
+                    )
+                seen_names[normalised_name] = member.name
+                normalised_members.append((member, normalised_name))
                 if not (member.isfile() or member.isdir()):
                     member_kind = (
                         "symlink or hardlink"
@@ -57,10 +77,10 @@ def _read_archive(target: Path) -> set[str]:
                         f"archive contains {member_kind} member: {member.name}"
                     )
 
-            for member in members:
+            for member, normalised_name in normalised_members:
                 if member.isdir():
                     continue
-                files.add(_normalise_member_name(member.name))
+                files.add(normalised_name)
                 stream = archive.extractfile(member)
                 if stream is None:
                     raise VerificationError(f"cannot read archive member: {member.name}")
@@ -80,9 +100,7 @@ def _verify_directory(target: Path) -> None:
             raise VerificationError(f"symlink is not allowed in bundle: {relative_name}")
         if path.is_file():
             files.add(relative_name)
-    _verify_required_files(files)
-    _verify_cluster_artifact(files)
-    _verify_nodes_artifact(files)
+    _verify_file_set(files)
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -104,9 +122,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     if target.is_file() and args[1].endswith(".tar.gz"):
         try:
             files = _read_archive(target)
-            _verify_required_files(files)
-            _verify_cluster_artifact(files)
-            _verify_nodes_artifact(files)
+            _verify_file_set(files)
         except VerificationError as error:
             print(f"VERIFY FAIL: {error}", file=sys.stderr)
             return 1

@@ -160,6 +160,26 @@ class VerifyCliTests(unittest.TestCase):
                     self.assertEqual(result.stdout, "")
                     self.assertIn("invalid archive", result.stderr)
 
+    def test_archive_with_truncated_gzip_tail_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            bundle = temporary_root / "incident"
+            complete_archive = temporary_root / "complete.tar.gz"
+            self.make_valid_bundle_dir(bundle)
+            self.make_bundle_archive(bundle, complete_archive)
+            complete_bytes = complete_archive.read_bytes()
+
+            for removed_bytes in (1, 8, 16):
+                with self.subTest(removed_bytes=removed_bytes):
+                    truncated_archive = temporary_root / f"tail-{removed_bytes}.tar.gz"
+                    truncated_archive.write_bytes(complete_bytes[:-removed_bytes])
+
+                    result = self.run_cli("verify", str(truncated_archive))
+
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("invalid archive", result.stderr)
+
     def test_unsafe_archive_members_are_rejected_without_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
@@ -178,6 +198,31 @@ class VerifyCliTests(unittest.TestCase):
                     "unsafe archive member",
                 ),
                 ("symlink", "nodes/link", tarfile.SYMTYPE, "symlink"),
+                ("hardlink", "nodes/hardlink", tarfile.LNKTYPE, "hardlink"),
+                (
+                    "fifo",
+                    "nodes/monitor01/system/pipe",
+                    tarfile.FIFOTYPE,
+                    "non-file/non-directory",
+                ),
+                (
+                    "device",
+                    "nodes/monitor01/system/device",
+                    tarfile.CHRTYPE,
+                    "non-file/non-directory",
+                ),
+                (
+                    "duplicate",
+                    "./manifest.jsonl",
+                    tarfile.REGTYPE,
+                    "duplicate archive member",
+                ),
+                (
+                    "normalised-collision",
+                    "cluster//ceph/status.txt",
+                    tarfile.REGTYPE,
+                    "duplicate archive member",
+                ),
             )
             for case_name, member_name, member_type, expected_error in cases:
                 with self.subTest(case=case_name):
@@ -191,7 +236,11 @@ class VerifyCliTests(unittest.TestCase):
                             member.size = len(payload)
                             output.addfile(member, io.BytesIO(payload))
                         else:
-                            member.linkname = "/etc/passwd"
+                            if member_type in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+                                member.linkname = "/etc/passwd"
+                            if member_type == tarfile.CHRTYPE:
+                                member.devmajor = 1
+                                member.devminor = 3
                             output.addfile(member)
 
                     result = self.run_cli(
