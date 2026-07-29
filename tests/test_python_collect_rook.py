@@ -409,6 +409,25 @@ class RookNamespaceTests(RookFixture, unittest.TestCase):
 
             self.assertIn("kube-context", result.stderr)
 
+    def test_remote_since_metacharacters_are_rejected_before_any_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, kubectl_ledger, ssh_ledger = self.make_fake_environment(root)
+
+            result = self.assert_rejected_before_any_command(
+                root,
+                environment,
+                (kubectl_ledger, ssh_ledger),
+                extra_arguments=(
+                    "--kube-mode",
+                    "remote",
+                    "--since",
+                    "24h; touch /tmp/rook-mutated",
+                ),
+            )
+
+            self.assertIn("--since", result.stderr)
+
     def test_unsafe_inventory_namespace_is_rejected_before_any_command(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

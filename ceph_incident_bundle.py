@@ -37,6 +37,7 @@ KUBE_MODES = ("local", "remote")
 # /, but nothing here may become a shell metacharacter or an option prefix.
 SAFE_KUBE_CONTEXT = re.compile(r"[A-Za-z0-9._@:/-]*\Z")
 SAFE_NAMESPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\Z")
+SAFE_REMOTE_KUBECTL_SINCE = re.compile(r"[0-9]+[smhdw]?\Z")
 DEFAULT_ROOK_NAMESPACE = "rook-ceph"
 CLUSTER_LAYERS = ("ceph", "rook", "prometheus")
 
@@ -151,6 +152,17 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
         else:
             values[key] = _positive_integer(raw_value, argument)
         index += 2
+    if values.get("kube_mode") == "remote":
+        since = str(values["since"])
+        duration = since[:-1] if since[-1:] in "smhdw" else since
+        if (
+            SAFE_REMOTE_KUBECTL_SINCE.fullmatch(since) is None
+            or not duration.strip("0")
+        ):
+            raise CollectUsageError(
+                "remote Rook --since must be N, Ns, Nm, Nh, Nd, or Nw "
+                "with N greater than 0"
+            )
     if values.get("help"):
         return values
     for required in ("inventory", "ssh_key"):
