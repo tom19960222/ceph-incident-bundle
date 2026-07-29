@@ -476,7 +476,7 @@ def _collect(arguments: Sequence[str]) -> int:
             known_hosts.touch(mode=0o600)
         want_ceph = mode in ("auto", "cephadm")
         want_rook = mode in ("auto", "rook")
-        ceph_source = ceph_seed
+        ceph_source = ceph_seed if want_ceph else ""
         ceph_runner: str | None = None
         rook_source = "local" if want_rook and kube_mode == "local" else ""
 
@@ -634,6 +634,9 @@ def _collect(arguments: Sequence[str]) -> int:
         prometheus_status = prometheus.exit_code if prometheus is not None else None
         node_ok = sum(result.exit_code == 0 for _, result in node_results)
         node_failed = len(node_results) - node_ok
+        cluster_exit_code = (
+            2 if cluster_status or rook_status or missing_cluster_source else 0
+        )
         exit_code = (
             2
             if (
@@ -668,11 +671,10 @@ def _collect(arguments: Sequence[str]) -> int:
             f"created_utc={created}",
             f"mode={mode}",
             f"seed={ceph_seed}",
+            f"cluster_status={cluster_exit_code}",
             f"node_ok={node_ok}",
             f"node_failed={node_failed}",
         ]
-        if cluster_status is not None:
-            summary.append(f"cluster_status={cluster_status}")
         if rook_status is not None:
             environment.extend(
                 [
@@ -682,7 +684,6 @@ def _collect(arguments: Sequence[str]) -> int:
             )
             if kube_context:
                 environment.append(f"kube_context={kube_context}")
-            summary.append(f"rook_status={rook_status}")
         if prometheus is not None:
             if prometheus.dump_completed:
                 environment.extend(
@@ -691,7 +692,6 @@ def _collect(arguments: Sequence[str]) -> int:
                         f"prom_jobs={' '.join(prometheus.jobs_matched) or '<none>'}",
                     ]
                 )
-            summary.append(f"prometheus_status={prometheus.exit_code}")
         summary.append(f"final_status={exit_code}")
         (workdir / "environment.txt").write_text(
             "".join(f"{line}\n" for line in environment), encoding="utf-8"

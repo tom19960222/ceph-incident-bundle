@@ -484,7 +484,7 @@ class RookUnavailableTests(RookFixture, unittest.TestCase):
             for artifact in REQUIRED_ROOK_ARTIFACTS:
                 self.assertNotIn(artifact, contents)
             self.assertIn("rook collection exited 2", contents["errors.log"])
-            self.assertIn("rook_status=2", contents["summary.txt"])
+            self.assertIn("cluster_status=2", contents["summary.txt"])
             self.assertIn("final_status=2", contents["summary.txt"])
             self.assert_bundle_verifies(bundle)
 
@@ -607,7 +607,7 @@ class RookPartialCollectionTests(RookFixture, unittest.TestCase):
             self.assertIn("exit=17", errors)
             self.assertIn("events.txt", errors)
             self.assertIn("rook collection exited 2", errors)
-            self.assertIn("rook_status=2", contents["summary.txt"])
+            self.assertIn("cluster_status=2", contents["summary.txt"])
             self.assertIn("final_status=2", contents["summary.txt"])
             self.assert_bundle_verifies(bundle)
 
