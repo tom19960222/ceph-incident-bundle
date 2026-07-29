@@ -24,6 +24,9 @@ SHELL_VERIFIER = ROOT / "lib" / "verify-bundle.sh"
 FAKE_CURL = ROOT / "tests" / "fixtures" / "bin" / "curl"
 FAKE_SSH = ROOT / "tests" / "fixtures" / "python-prometheus" / "bin" / "ssh"
 FAKE_GREP = ROOT / "tests" / "fixtures" / "python-prometheus" / "bin" / "grep"
+FAKE_KUBECTL = (
+    ROOT / "tests" / "fixtures" / "python-prometheus" / "bin" / "kubectl"
+)
 PROM_URL = "http://prom.example:9090"
 
 
@@ -38,6 +41,7 @@ class PrometheusFixture:
         (fake_bin / "curl").symlink_to(FAKE_CURL)
         (fake_bin / "ssh").symlink_to(FAKE_SSH)
         (fake_bin / "grep").symlink_to(FAKE_GREP)
+        (fake_bin / "kubectl").symlink_to(FAKE_KUBECTL)
         curl_ledger = root / "curl-argv.nul"
         environment = {
             **os.environ,
@@ -76,9 +80,13 @@ class PrometheusFixture:
                 str(root / "results"),
                 "--timeout",
                 "5",
-                "--node-timeout",
-                "20",
-                "--no-trust-ssh-host-key",
+            "--node-timeout",
+            "20",
+            "--mode",
+            "rook",
+            "--kube-mode",
+            "local",
+            "--no-trust-ssh-host-key",
                 *extra_arguments,
             ],
             cwd=ROOT,
@@ -502,7 +510,6 @@ class PrometheusUnavailableTests(PrometheusFixture, unittest.TestCase):
             errors = self.text_of(contents, "errors.log")
             self.assertIn("prometheus dump skipped", errors)
             self.assertIn("prometheus collection exited 2", errors)
-            self.assertIn("prometheus_status=2", self.text_of(contents, "summary.txt"))
             self.assertIn("final_status=2", self.text_of(contents, "summary.txt"))
             # Only the connectivity probe runs; nothing else is attempted.
             self.assertEqual(len(self.curl_commands(curl_ledger)), 1)

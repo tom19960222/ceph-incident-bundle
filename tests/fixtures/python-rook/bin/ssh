@@ -60,6 +60,8 @@ class PinnedDigest:
 
 BOOTSTRAP_SOURCE = PinnedDigest(BOOTSTRAP_SOURCE_SHA256)
 
+CAPABILITY_PROBE = 'caps=""; command -v cephadm >/dev/null 2>&1 && caps="$caps cephadm"; command -v ceph >/dev/null 2>&1 && caps="$caps ceph"; command -v kubectl >/dev/null 2>&1 && caps="$caps kubectl"; printf "%s\\n" "$caps"'
+
 Matcher = str | re.Pattern[str] | PinnedDigest
 
 BASE_OPTIONS: tuple[Matcher, ...] = (
@@ -196,6 +198,10 @@ if not tail or SSH_TARGET.fullmatch(tail[0]) is None:
 tail = tail[1:]
 
 if len(tail) == 1:
+    if tail[0] == CAPABILITY_PROBE:
+        if not os.environ.get("FAKE_SSH_MISSING_KUBECTL"):
+            sys.stdout.write("kubectl\n")
+        raise SystemExit(0)
     serve_bootstrap(tail[0])
 
 if tail[:1] == ["kubectl"]:

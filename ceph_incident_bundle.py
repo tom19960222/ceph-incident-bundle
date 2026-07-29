@@ -28,16 +28,13 @@ from ceph_incident_collectors import (
     collect_prometheus_cluster,
     collect_rook_cluster,
     collect_single_node,
+    probe_node_capabilities,
     prometheus_duration_seconds,
+    select_ceph_runner,
 )
 
 
-# Public collect stays fixed to the direct Ceph CLI runner; choosing a runner
-# (and the source it belongs to) is multi-source orchestration work (#16).
-CEPH_RUNNER = "direct"
-# Rook is collected only when a kubectl runner is named explicitly.  Probing
-# the inventory for a kubectl-capable source, and the auto mode that falls back
-# between layers, are multi-source orchestration work (#16) too.
+MODES = ("auto", "cephadm", "rook")
 KUBE_MODES = ("local", "remote")
 # The shell contract's kube-context allowlist: EKS-style ARNs contain @, : and
 # /, but nothing here may become a shell metacharacter or an option prefix.
@@ -50,16 +47,16 @@ SAFE_PROMETHEUS_URL = re.compile(r"https?://[^\s\x00-\x1f\x7f]+\Z")
 PROMETHEUS_STEP = re.compile(r"[1-9][0-9]*\Z")
 PROMETHEUS_BUDGET = re.compile(r"[0-9]+\Z")
 DEFAULT_ROOK_NAMESPACE = "rook-ceph"
-CLUSTER_LAYERS = ("ceph", "rook", "prometheus")
 
 
 USAGE = """Usage:
   ceph_incident_bundle.py collect --inventory PATH --ssh-key PATH [options]
-    [--seed USER@HOST] [--since RANGE] [--skip-logs] [--keep-original-logs]
+    [--seed USER@HOST] [--mode auto|cephadm|rook] [--since RANGE]
+    [--skip-logs] [--keep-original-logs]
     [--var-log-max-bytes BYTES|unlimited]
     [--kube-mode local|remote] [--kube-context CTX]
     [--prom-url URL] [--prom-job-regex RE] [--prom-step SECONDS]
-    [--prom-timeout SECONDS]
+    [--prom-timeout SECONDS] [--quiet] [--keep-workdir]
   ceph_incident_bundle.py verify <bundle-dir|bundle.tar.gz>"""
 REQUIRED_FILES = ("manifest.jsonl", "summary.txt", "README-FIRST.txt")
 SAFE_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -99,8 +96,12 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
         "trust_ssh_host_key": True,
         "skip_logs": False,
         "keep_original_logs": False,
+        "keep_workdir": False,
+        "quiet": False,
         "var_log_max_bytes": 10 * 1024**3,
         "since": "24h",
+        "mode": "auto",
+        "kube_mode": "remote",
         "prom_url": "",
         "prom_job_regex": PROMETHEUS_DEFAULT_JOB_REGEX,
         "prom_step": "",
@@ -117,7 +118,12 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
             values["trust_ssh_host_key"] = argument == "--trust-ssh-host-key"
             index += 1
             continue
-        if argument in ("--skip-logs", "--keep-original-logs"):
+        if argument in (
+            "--skip-logs",
+            "--keep-original-logs",
+            "--keep-workdir",
+            "--quiet",
+        ):
             values[argument.removeprefix("--").replace("-", "_")] = True
             index += 1
             continue
@@ -126,6 +132,7 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
             "--ssh-key": "ssh_key",
             "--out": "out",
             "--seed": "seed",
+            "--mode": "mode",
             "--timeout": "timeout",
             "--node-timeout": "node_timeout",
             "--var-log-max-bytes": "var_log_max_bytes",
@@ -160,6 +167,10 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
             values[key] = raw_value
         elif key == "seed":
             values[key] = _validated_ssh_target(raw_value, "invalid SSH seed target")
+        elif key == "mode":
+            if raw_value not in MODES:
+                raise CollectUsageError(f"unsupported mode: {raw_value}")
+            values[key] = raw_value
         elif key == "kube_mode":
             if raw_value not in KUBE_MODES:
                 raise CollectUsageError(f"unsupported kube-mode: {raw_value}")
@@ -177,7 +188,10 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
         else:
             values[key] = _positive_integer(raw_value, argument)
         index += 2
-    if values.get("kube_mode") == "remote":
+    if (
+        values.get("mode") in ("auto", "rook")
+        and values.get("kube_mode") == "remote"
+    ):
         since = str(values["since"])
         duration = since[:-1] if since[-1:] in "smhdw" else since
         if (
@@ -251,12 +265,18 @@ def _ssh_target_for_host(host: str, ssh_user: str) -> str:
 
 
 @dataclass(frozen=True)
-class SingleNodeInventory:
+class InventoryNode:
     host_alias: str
     target: str
+
+
+@dataclass(frozen=True)
+class Inventory:
+    nodes: tuple[InventoryNode, ...]
     seed: str
     rook_namespace: str
     rook_operator_namespace: str
+    rejected_entries: tuple[str, ...]
 
 
 def _validated_namespace(value: str, option: str) -> str:
@@ -265,7 +285,7 @@ def _validated_namespace(value: str, option: str) -> str:
     return value
 
 
-def _read_single_node_inventory(path: Path) -> SingleNodeInventory:
+def _read_inventory(path: Path) -> Inventory:
     if not path.is_file():
         raise CollectUsageError(f"missing inventory: {path}")
     try:
@@ -318,21 +338,35 @@ def _read_single_node_inventory(path: Path) -> SingleNodeInventory:
             rook_operator_namespace = assignment.group(2)
     if in_hosts:
         raise CollectUsageError("inventory HOSTS block is not closed")
-    if len(hosts) != 1:
-        raise CollectUsageError("this Python candidate requires exactly one inventory node")
+    if not hosts:
+        raise CollectUsageError("inventory HOSTS is empty")
     if ssh_user and (
         ssh_user.startswith("-") or SAFE_SSH_USER.fullmatch(ssh_user) is None
     ):
         raise CollectUsageError("invalid SSH_USER")
-    entry = hosts[0]
-    if "=" not in entry:
-        raise CollectUsageError("invalid HOSTS entry")
-    alias, host = entry.split("=", 1)
-    if alias in (".", "..") or SAFE_ALIAS.fullmatch(alias) is None:
-        raise CollectUsageError("invalid host alias")
-    target = _validated_ssh_target(
-        _ssh_target_for_host(host, ssh_user), "invalid SSH target"
-    )
+    nodes: list[InventoryNode] = []
+    rejected_entries: list[str] = []
+    for entry in hosts:
+        if "=" not in entry:
+            rejected_entries.append(f"skipped malformed HOSTS entry: {entry}")
+            continue
+        alias, host = entry.split("=", 1)
+        if not alias or not host:
+            rejected_entries.append(f"skipped malformed HOSTS entry: {entry}")
+            continue
+        if alias in (".", "..") or SAFE_ALIAS.fullmatch(alias) is None:
+            rejected_entries.append(f"skipped unsafe host alias: {alias}")
+            continue
+        try:
+            target = _validated_ssh_target(
+                _ssh_target_for_host(host, ssh_user), "invalid SSH target"
+            )
+        except CollectUsageError:
+            rejected_entries.append(f"skipped unsafe SSH target for alias {alias}")
+            continue
+        nodes.append(InventoryNode(alias, target))
+    if not nodes:
+        raise CollectUsageError("inventory contains no valid HOSTS entries")
     seed = (
         _validated_ssh_target(
             _ssh_target_for_host(seed_host, ssh_user), "invalid SSH seed target"
@@ -347,24 +381,27 @@ def _read_single_node_inventory(path: Path) -> SingleNodeInventory:
     operator_namespace = _validated_namespace(
         rook_operator_namespace or DEFAULT_ROOK_NAMESPACE, "ROOK_OPERATOR_NAMESPACE"
     )
-    return SingleNodeInventory(alias, target, seed, namespace, operator_namespace)
+    return Inventory(
+        tuple(nodes), seed, namespace, operator_namespace, tuple(rejected_entries)
+    )
 
 
-def _write_initial_bundle_files(workdir: Path, *, collected: Sequence[str]) -> None:
+def _write_initial_bundle_files(workdir: Path) -> None:
     (workdir / "cluster").mkdir(mode=0o700)
     (workdir / "nodes").mkdir(mode=0o700)
-    uncollected = [layer for layer in CLUSTER_LAYERS if layer not in collected]
-    (workdir / "cluster" / "SKIPPED.txt").write_text(
-        f"SKIPPED: {', '.join(uncollected)} cluster collectors are outside "
-        "the current Python slice\n",
-        encoding="utf-8",
-    )
     (workdir / "README-FIRST.txt").write_text(
         "Operationally read-only incident evidence. Review errors.log and summary.txt.\n",
         encoding="utf-8",
     )
     (workdir / "manifest.jsonl").touch(mode=0o600)
     (workdir / "errors.log").touch(mode=0o600)
+
+
+def _write_cluster_skip_once(workdir: Path, layer: str, reason: str) -> None:
+    destination = workdir / "cluster" / layer / "SKIPPED.txt"
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not destination.exists():
+        destination.write_text(f"SKIPPED: {reason}\n", encoding="utf-8")
 
 
 def _verify_bundle_path(target: Path) -> None:
@@ -389,6 +426,26 @@ def _reserve_archive_path(output_root: Path, timestamp: str) -> Path:
     raise OSError("cannot reserve a unique incident bundle output path")
 
 
+def _rewrite_summary_final_status(workdir: Path, final_status: int) -> None:
+    """Make a retained summary describe the fatal workstation result."""
+
+    summary = workdir / "summary.txt"
+    if not summary.is_file():
+        return
+    lines = summary.read_text(encoding="utf-8").splitlines()
+    replacement = f"final_status={final_status}"
+    rewritten = [
+        replacement if line.startswith("final_status=") else line for line in lines
+    ]
+    if not any(line.startswith("final_status=") for line in lines):
+        rewritten.append(replacement)
+    temporary = workdir / ".summary.txt.tmp"
+    temporary.write_text(
+        "".join(f"{line}\n" for line in rewritten), encoding="utf-8"
+    )
+    os.replace(temporary, summary)
+
+
 def _collect(arguments: Sequence[str]) -> int:
     try:
         options = _parse_collect_arguments(arguments)
@@ -403,12 +460,11 @@ def _collect(arguments: Sequence[str]) -> int:
         assert isinstance(output_root, Path)
         if not ssh_key.is_file():
             raise CollectUsageError(f"missing ssh key: {ssh_key}")
-        node = _read_single_node_inventory(inventory)
-        host_alias = node.host_alias
-        target = node.target
+        inventory_data = _read_inventory(inventory)
         # --seed overrides the inventory SEED_HOST, as in the shell contract.
-        ceph_seed = str(options.get("seed") or node.seed)
-        kube_mode = str(options.get("kube_mode") or "")
+        ceph_seed = str(options.get("seed") or inventory_data.seed)
+        mode = str(options["mode"])
+        kube_mode = str(options["kube_mode"])
         kube_context = str(options.get("kube_context") or "")
         prom_url = str(options["prom_url"])
     except CollectUsageError as error:
@@ -425,61 +481,148 @@ def _collect(arguments: Sequence[str]) -> int:
         print(f"FATAL: cannot create collector-owned workspace: {error}", file=sys.stderr)
         return 1
     archive: Path | None = None
-    keep_workdir = False
+    retain_workdir = bool(options["keep_workdir"])
     previous_term_handler = signal.getsignal(signal.SIGTERM)
+
+    def progress(message: str) -> None:
+        if not options["quiet"]:
+            print(message, file=sys.stderr)
 
     def interrupt_handler(_signum: int, _frame: object) -> None:
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, interrupt_handler)
     try:
-        collected_layers = [
-            layer
-            for layer, enabled in (
-                ("ceph", bool(ceph_seed)),
-                ("rook", bool(kube_mode)),
-                ("prometheus", bool(prom_url)),
-            )
-            if enabled
-        ]
-        _write_initial_bundle_files(workdir, collected=collected_layers)
+        _write_initial_bundle_files(workdir)
+        progress(f"starting: mode={mode}, {len(inventory_data.nodes)} hosts")
+        for rejection in inventory_data.rejected_entries:
+            with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
+                errors.write(f"{rejection}\n")
         known_hosts: Path | None = None
         if options["trust_ssh_host_key"]:
             known_hosts = workdir / ".runtime-known-hosts"
             known_hosts.touch(mode=0o600)
-        cluster_status: int | None = None
-        if ceph_seed:
-            cluster_status = collect_direct_ceph_cluster(
+        want_ceph = mode in ("auto", "cephadm")
+        want_rook = mode in ("auto", "rook")
+        ceph_source = ceph_seed if want_ceph else ""
+        ceph_runner: str | None = None
+        rook_source = "local" if want_rook and kube_mode == "local" else ""
+
+        if want_ceph and ceph_source:
+            progress(f"probing Ceph runner on {ceph_source}")
+            ceph_runner = select_ceph_runner(
                 workdir=workdir,
-                seed=ceph_seed,
+                target=ceph_source,
+                ssh_key=ssh_key,
+                connection_timeout=int(options["timeout"]),
+                known_hosts_file=known_hosts,
+            )
+
+        need_capabilities = (want_ceph and not ceph_source) or (
+            want_rook and kube_mode == "remote"
+        )
+        if need_capabilities:
+            progress(
+                f"probing {len(inventory_data.nodes)} nodes for cluster capabilities"
+            )
+            for inventory_node in inventory_data.nodes:
+                capabilities = probe_node_capabilities(
+                    workdir=workdir,
+                    target=inventory_node.target,
+                    ssh_key=ssh_key,
+                    connection_timeout=int(options["timeout"]),
+                    known_hosts_file=known_hosts,
+                )
+                if want_ceph and not ceph_source and capabilities.intersection(
+                    {"ceph", "cephadm"}
+                ):
+                    selected = select_ceph_runner(
+                        workdir=workdir,
+                        target=inventory_node.target,
+                        ssh_key=ssh_key,
+                        connection_timeout=int(options["timeout"]),
+                        known_hosts_file=known_hosts,
+                    )
+                    if selected is not None:
+                        ceph_source = inventory_node.target
+                        ceph_runner = selected
+                if (
+                    want_rook
+                    and kube_mode == "remote"
+                    and not rook_source
+                    and "kubectl" in capabilities
+                ):
+                    rook_source = inventory_node.target
+                if (not want_ceph or bool(ceph_source)) and (
+                    not want_rook or kube_mode == "local" or bool(rook_source)
+                ):
+                    break
+
+        ceph_status: int | None = None
+        ceph_done = False
+        if want_ceph and ceph_source and ceph_runner:
+            progress(f"collecting Ceph cluster from {ceph_source} via {ceph_runner}")
+            ceph_status = collect_direct_ceph_cluster(
+                workdir=workdir,
+                seed=ceph_source,
                 ssh_key=ssh_key,
                 connection_timeout=int(options["timeout"]),
                 command_timeout=int(options["timeout"]),
                 known_hosts_file=known_hosts,
-                runner=CEPH_RUNNER,
+                runner=ceph_runner,
             )
-            if cluster_status != 0:
+            ceph_done = True
+            if ceph_status != 0:
                 with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
-                    errors.write(f"cluster collection exited {cluster_status}\n")
+                    errors.write(f"cluster collection exited {ceph_status}\n")
         rook_status: int | None = None
-        if kube_mode:
+        rook_done = False
+        if want_rook and rook_source:
+            progress(f"collecting Rook cluster through {rook_source}")
             rook_status = collect_rook_cluster(
                 workdir=workdir,
-                namespace=node.rook_namespace,
-                operator_namespace=node.rook_operator_namespace,
+                namespace=inventory_data.rook_namespace,
+                operator_namespace=inventory_data.rook_operator_namespace,
                 since=str(options["since"]),
                 command_timeout=int(options["timeout"]),
                 kube_context=kube_context,
-                ssh_target=target if kube_mode == "remote" else None,
+                ssh_target=rook_source if kube_mode == "remote" else None,
                 ssh_key=ssh_key,
                 connection_timeout=int(options["timeout"]),
                 known_hosts_file=known_hosts,
+                allow_skip=mode == "auto",
             )
+            rook_done = (workdir / "cluster" / "rook" / "pods-wide.txt").is_file()
             if rook_status != 0:
                 with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
                     errors.write(f"rook collection exited {rook_status}\n")
+        missing_cluster_source = False
+        if mode == "cephadm" and not ceph_done:
+            _write_cluster_skip_once(
+                workdir,
+                "ceph",
+                "no cephadm-capable node found (or --seed unreachable)",
+            )
+            missing_cluster_source = True
+        elif mode == "rook" and not rook_done:
+            _write_cluster_skip_once(
+                workdir, "rook", "no kubectl-capable node found"
+            )
+            missing_cluster_source = True
+        elif mode == "auto":
+            if not ceph_done:
+                _write_cluster_skip_once(
+                    workdir, "ceph", "no cephadm-capable node in inventory (auto)"
+                )
+            if not rook_done:
+                _write_cluster_skip_once(
+                    workdir, "rook", "no kubectl-capable node in inventory (auto)"
+                )
+            missing_cluster_source = not ceph_done and not rook_done
+
         prometheus: PrometheusCollectionResult | None = None
         if prom_url:
+            progress("collecting Prometheus evidence")
             prometheus = collect_prometheus_cluster(
                 workdir=workdir,
                 url=prom_url,
@@ -494,73 +637,93 @@ def _collect(arguments: Sequence[str]) -> int:
                     errors.write(
                         f"prometheus collection exited {prometheus.exit_code}\n"
                     )
-        node_source = (Path(__file__).resolve().parent / "ceph_incident_node.py").read_bytes()
-        result = collect_single_node(
-            workspace=workdir,
-            destination=workdir / "nodes" / host_alias,
-            host_alias=host_alias,
-            target=target,
-            ssh_key=ssh_key,
-            node_source=node_source,
-            connection_timeout=int(options["timeout"]),
-            node_timeout=int(options["node_timeout"]),
-            command_timeout=int(options["timeout"]),
-            known_hosts_file=known_hosts,
-            skip_logs=bool(options["skip_logs"]),
-            keep_original_logs=bool(options["keep_original_logs"]),
-            var_log_max_bytes=options["var_log_max_bytes"],
-            since=str(options["since"]),
-        )
-        if result.reason is not None:
-            with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
-                errors.write(f"node {host_alias} ({target}): {result.reason}\n")
+        node_source = (
+            Path(__file__).resolve().parent / "ceph_incident_node.py"
+        ).read_bytes()
+        node_results = []
+        for index, inventory_node in enumerate(inventory_data.nodes, start=1):
+            progress(
+                f"[{index}/{len(inventory_data.nodes)}] collecting node "
+                f"{inventory_node.host_alias}"
+            )
+            result = collect_single_node(
+                workspace=workdir,
+                destination=workdir / "nodes" / inventory_node.host_alias,
+                host_alias=inventory_node.host_alias,
+                target=inventory_node.target,
+                ssh_key=ssh_key,
+                node_source=node_source,
+                connection_timeout=int(options["timeout"]),
+                node_timeout=int(options["node_timeout"]),
+                command_timeout=int(options["timeout"]),
+                known_hosts_file=known_hosts,
+                skip_logs=bool(options["skip_logs"]),
+                keep_original_logs=bool(options["keep_original_logs"]),
+                var_log_max_bytes=options["var_log_max_bytes"],
+                since=str(options["since"]),
+            )
+            node_results.append((inventory_node, result))
+            if result.reason is not None:
+                with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
+                    errors.write(
+                        f"node {inventory_node.host_alias} "
+                        f"({inventory_node.target}): {result.reason}\n"
+                    )
         if known_hosts is not None:
             known_hosts.unlink(missing_ok=True)
         prometheus_status = prometheus.exit_code if prometheus is not None else None
+        node_ok = sum(result.exit_code == 0 for _, result in node_results)
+        node_failed = len(node_results) - node_ok
+        cluster_exit_code = (
+            2 if ceph_status or rook_status or missing_cluster_source else 0
+        )
         exit_code = (
             2
             if (
-                result.exit_code != 0
-                or cluster_status
+                bool(inventory_data.rejected_entries)
+                or node_failed
+                or ceph_status
                 or rook_status
                 or prometheus_status
+                or missing_cluster_source
             )
             else 0
         )
         created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        slices = [
-            *(["direct-ceph"] if ceph_seed else []),
-            *(["rook"] if kube_mode else []),
-            *(["prometheus"] if prom_url else []),
-            "node",
-        ]
         environment = [
             f"created_utc={created}",
-            f"mode=python-{'-'.join(slices)}-slice",
-            f"node_target={target}",
-            f"node_invocation_id={result.invocation_id}",
+            f"mode={mode}",
+            f"seed={ceph_seed}",
+            f"since={options['since']}",
+            f"timeout={options['timeout']}",
+            f"ceph_source={ceph_source or '<none>'}",
+            f"ceph_runner={ceph_runner or '<none>'}",
+            f"rook_source={rook_source or '<none>'}",
         ]
+        for inventory_node, result in node_results:
+            environment.extend(
+                [
+                    f"node_target_{inventory_node.host_alias}={inventory_node.target}",
+                    f"node_invocation_id_{inventory_node.host_alias}={result.invocation_id}",
+                ]
+            )
         summary = [
             f"created_utc={created}",
-            f"node_ok={1 if result.exit_code == 0 else 0}",
-            f"node_failed={1 if result.exit_code != 0 else 0}",
+            f"mode={mode}",
+            f"seed={ceph_seed}",
+            f"cluster_status={cluster_exit_code}",
+            f"node_ok={node_ok}",
+            f"node_failed={node_failed}",
         ]
-        if cluster_status is not None:
-            environment.extend(
-                [f"ceph_source={ceph_seed}", f"ceph_runner={CEPH_RUNNER}"]
-            )
-            summary.append(f"cluster_status={cluster_status}")
         if rook_status is not None:
             environment.extend(
                 [
-                    f"rook_source={target if kube_mode == 'remote' else 'local'}",
-                    f"rook_namespace={node.rook_namespace}",
-                    f"rook_operator_namespace={node.rook_operator_namespace}",
+                    f"rook_namespace={inventory_data.rook_namespace}",
+                    f"rook_operator_namespace={inventory_data.rook_operator_namespace}",
                 ]
             )
             if kube_context:
                 environment.append(f"kube_context={kube_context}")
-            summary.append(f"rook_status={rook_status}")
         if prometheus is not None:
             if prometheus.dump_completed:
                 environment.extend(
@@ -569,7 +732,6 @@ def _collect(arguments: Sequence[str]) -> int:
                         f"prom_jobs={' '.join(prometheus.jobs_matched) or '<none>'}",
                     ]
                 )
-            summary.append(f"prometheus_status={prometheus.exit_code}")
         summary.append(f"final_status={exit_code}")
         (workdir / "environment.txt").write_text(
             "".join(f"{line}\n" for line in environment), encoding="utf-8"
@@ -577,10 +739,12 @@ def _collect(arguments: Sequence[str]) -> int:
         (workdir / "summary.txt").write_text(
             "".join(f"{line}\n" for line in summary), encoding="utf-8"
         )
+        progress("verifying collected evidence")
         _verify_bundle_path(workdir)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         archive = _reserve_archive_path(output_root, timestamp)
         packaged_candidate = workdir / ".incident-bundle.tar.gz"
+        progress("packaging incident bundle")
         packaged = subprocess.run(
             [
                 "tar",
@@ -603,26 +767,42 @@ def _collect(arguments: Sequence[str]) -> int:
         _verify_bundle_path(packaged_candidate)
         os.replace(packaged_candidate, archive)
         print(f"bundle: {archive}")
+        if retain_workdir:
+            print(f"kept workdir: {workdir}", file=sys.stderr)
         return exit_code
     except CollectionInterrupted:
         if archive is not None:
             archive.unlink(missing_ok=True)
-        print("interrupted — stopping and cleaning up…", file=sys.stderr)
+        print(
+            f"interrupted — workdir kept at {workdir}"
+            if retain_workdir
+            else "interrupted — stopping and cleaning up…",
+            file=sys.stderr,
+        )
         return 130
     except KeyboardInterrupt:
         if archive is not None:
             archive.unlink(missing_ok=True)
-        print("interrupted — stopping and cleaning up…", file=sys.stderr)
+        print(
+            f"interrupted — workdir kept at {workdir}"
+            if retain_workdir
+            else "interrupted — stopping and cleaning up…",
+            file=sys.stderr,
+        )
         return 130
     except (OSError, VerificationError) as error:
-        keep_workdir = True
+        retain_workdir = True
         if archive is not None:
             archive.unlink(missing_ok=True)
+        try:
+            _rewrite_summary_final_status(workdir, 1)
+        except OSError:
+            pass
         print(f"VERIFY FAILED: workdir kept at {workdir}: {error}", file=sys.stderr)
         return 1
     finally:
         signal.signal(signal.SIGTERM, previous_term_handler)
-        if not keep_workdir:
+        if not retain_workdir:
             shutil.rmtree(workdir)
 
 

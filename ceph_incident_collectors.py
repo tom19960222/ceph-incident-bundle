@@ -513,6 +513,113 @@ def _ssh_command(
     return command
 
 
+CAPABILITY_PROBE = (
+    'caps=""; command -v cephadm >/dev/null 2>&1 && caps="$caps cephadm"; '
+    'command -v ceph >/dev/null 2>&1 && caps="$caps ceph"; '
+    'command -v kubectl >/dev/null 2>&1 && caps="$caps kubectl"; '
+    'printf "%s\\n" "$caps"'
+)
+
+
+def _run_ssh_probe_command(
+    command: Sequence[str], *, timeout: int, capture_output: bool = False
+) -> tuple[int, str]:
+    """Run one bounded SSH probe and normalize transport failures."""
+
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+            text=True,
+        )
+    except FileNotFoundError:
+        return 127, ""
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    return _exit_code_of(completed.returncode), completed.stdout or ""
+
+
+def probe_node_capabilities(
+    *,
+    workdir: Path,
+    target: str,
+    ssh_key: Path,
+    connection_timeout: int,
+    known_hosts_file: Path | None,
+) -> frozenset[str]:
+    """Return the reviewed command capabilities advertised by one node.
+
+    A transport failure is evidence, not an empty successful probe: preserve a
+    bounded diagnostic and make the node ineligible as a cluster source.
+    """
+
+    command = [
+        *_ssh_base_options(ssh_key, connection_timeout, known_hosts_file),
+        target,
+        CAPABILITY_PROBE,
+    ]
+    exit_code, output = _run_ssh_probe_command(
+        command, timeout=connection_timeout, capture_output=True
+    )
+    if exit_code != 0:
+        with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
+            errors.write(
+                f"{_utc_now()} capability probe failed for {target} "
+                f"(ssh exit {exit_code}) — node not considered as a cluster source\n"
+            )
+        if exit_code in (255, 124, 137):
+            write_ssh_debug_log(
+                workdir=workdir,
+                label="capability-probe",
+                target=target,
+                ssh_key=ssh_key,
+                connection_timeout=connection_timeout,
+                known_hosts_file=known_hosts_file,
+            )
+        return frozenset()
+    advertised = frozenset(output.split())
+    return advertised.intersection({"ceph", "cephadm", "kubectl"})
+
+
+def select_ceph_runner(
+    *,
+    workdir: Path,
+    target: str,
+    ssh_key: Path,
+    connection_timeout: int,
+    known_hosts_file: Path | None,
+) -> str | None:
+    """Select the first safe Ceph runner whose read-only probe succeeds."""
+
+    for runner, prefix in (("direct", ["ceph"]), ("sudo", ["sudo", "-n", "ceph"])):
+        command = [
+            *_ssh_base_options(ssh_key, connection_timeout, known_hosts_file),
+            target,
+            *prefix,
+            "--connect-timeout",
+            "5",
+            "-s",
+        ]
+        exit_code, _ = _run_ssh_probe_command(
+            command, timeout=connection_timeout
+        )
+        if exit_code == 0:
+            return runner
+        if exit_code in (255, 124, 137):
+            write_ssh_debug_log(
+                workdir=workdir,
+                label=f"cluster-ceph-{runner}",
+                target=target,
+                ssh_key=ssh_key,
+                connection_timeout=connection_timeout,
+                known_hosts_file=known_hosts_file,
+            )
+    return None
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -912,6 +1019,7 @@ def collect_rook_cluster(
     ssh_key: Path | None = None,
     connection_timeout: int = 20,
     known_hosts_file: Path | None = None,
+    allow_skip: bool = False,
 ) -> int:
     """Collect Rook cluster evidence through read-only kubectl operations.
 
@@ -922,8 +1030,8 @@ def collect_rook_cluster(
     array of read-only verbs; nothing here can create a process inside a Pod.
 
     Returns 0 when every required artifact was captured and 2 when the layer is
-    partial — including when no evidence could be collected at all, which is
-    recorded as a SKIPPED artifact naming the classified cause.
+    partial.  When ``allow_skip`` is true, an unavailable Rook preflight is a
+    successful optional-layer skip; required captures still fail as partial.
     """
 
     rook_dir = workdir / "cluster" / "rook"
@@ -951,7 +1059,7 @@ def collect_rook_cluster(
     # the namespace probe, which classifies it by the same rules.
     if ssh_target is None and shutil.which("kubectl") is None:
         _write_skip_artifact(rook_dir / "SKIPPED.txt", "kubectl command not found")
-        return 2
+        return 0 if allow_skip else 2
 
     probe_exit, probe_detail = _run_probe(
         [*kubectl, "get", "namespace", namespace], command_timeout
@@ -961,7 +1069,7 @@ def collect_rook_cluster(
             rook_dir / "SKIPPED.txt",
             _rook_probe_reason(namespace, kube_context, location, probe_detail),
         )
-        return 2
+        return 0 if allow_skip else 2
 
     def capture(artifact_name: str, words: Sequence[str]) -> int:
         return run_capture(

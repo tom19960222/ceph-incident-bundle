@@ -81,9 +81,11 @@ class RookFixture:
                 str(root / "results"),
                 "--timeout",
                 "5",
-                "--node-timeout",
-                "20",
-                "--no-trust-ssh-host-key",
+            "--node-timeout",
+            "20",
+            "--mode",
+            "rook",
+            "--no-trust-ssh-host-key",
                 *extra_arguments,
             ],
             cwd=ROOT,
@@ -482,7 +484,7 @@ class RookUnavailableTests(RookFixture, unittest.TestCase):
             for artifact in REQUIRED_ROOK_ARTIFACTS:
                 self.assertNotIn(artifact, contents)
             self.assertIn("rook collection exited 2", contents["errors.log"])
-            self.assertIn("rook_status=2", contents["summary.txt"])
+            self.assertIn("cluster_status=2", contents["summary.txt"])
             self.assertIn("final_status=2", contents["summary.txt"])
             self.assert_bundle_verifies(bundle)
 
@@ -500,8 +502,7 @@ class RookUnavailableTests(RookFixture, unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             contents = self.extract(self.bundle_of(result))
             skipped = contents["cluster/rook/SKIPPED.txt"]
-            self.assertIn(f"kubectl command not found on {NODE_TARGET}", skipped)
-            self.assertIn("kubectl: command not found", skipped)
+            self.assertIn("no kubectl-capable node found", skipped)
 
     def assert_probe_failure(
         self, mode: str, expected: str, kube_context: str = ""
@@ -606,7 +607,7 @@ class RookPartialCollectionTests(RookFixture, unittest.TestCase):
             self.assertIn("exit=17", errors)
             self.assertIn("events.txt", errors)
             self.assertIn("rook collection exited 2", errors)
-            self.assertIn("rook_status=2", contents["summary.txt"])
+            self.assertIn("cluster_status=2", contents["summary.txt"])
             self.assertIn("final_status=2", contents["summary.txt"])
             self.assert_bundle_verifies(bundle)
 
