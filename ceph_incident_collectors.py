@@ -68,6 +68,24 @@ CEPH_TEXT_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("orch-ps.txt", ("orch", "ps")),
 )
 CEPH_CRASH_INFO_LIMIT = 10
+ROOK_COLLECTOR = "collect-cluster-rook"
+# The manifest host column for cluster-level Rook evidence: it belongs to the
+# Kubernetes cluster, not to whichever workstation or node ran kubectl.
+ROOK_HOST = "rook"
+ROOK_RESOURCE_KINDS = (
+    "cephclusters.ceph.rook.io,cephblockpools.ceph.rook.io,"
+    "cephfilesystems.ceph.rook.io,cephobjectstores.ceph.rook.io"
+)
+ROOK_OPERATOR_LABEL = "app=rook-ceph-operator"
+ROOK_TOOLBOX_LABEL = "app=rook-ceph-tools"
+# A Pod name read back from the cluster becomes an argv word, so it must not be
+# able to look like an option to the next kubectl invocation.
+SAFE_POD_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\Z")
+# `kubectl exec` starts a process inside a running Pod, so this candidate has no
+# toolbox execution path at all and no opt-in that could reach one.
+ROOK_TOOLBOX_SKIP_REASON = (
+    "kubectl exec disabled by default for operational read-only collection"
+)
 # Anchored to crash_id: matching id/name too would feed unrelated nested fields
 # back into `ceph crash info`.
 CRASH_ID_PATTERN = re.compile(r'"crash_id"\s*:\s*"([^"]*)"')
@@ -730,6 +748,244 @@ def collect_direct_ceph_cluster(
             if capture(artifact, ("crash", "info", crash_id)) != 0:
                 failed = True
 
+    return 2 if failed else 0
+
+
+def _compact_error(detail: str) -> str:
+    """Flatten a multi-line command error into one SKIPPED-artifact line."""
+
+    return detail.replace("\r", "").strip().replace("\n", " | ")
+
+
+def _rook_probe_reason(
+    namespace: str, kube_context: str, location: str, detail: str
+) -> str:
+    """Classify why the namespace probe failed, keeping the raw error attached.
+
+    Order matters: the connection and namespace phrasings overlap, so the more
+    specific cause is matched first, exactly as the shell reference does.
+    """
+
+    context_name = kube_context or "<current-context>"
+    classifications: tuple[tuple[str, str], ...] = (
+        (
+            r"kubectl:?\s+command\s+not\s+found|command\s+not\s+found:?\s+kubectl",
+            f"kubectl command not found on {location}",
+        ),
+        (
+            r"no\s+context\s+exists|context.*(?:not\s+found|does\s+not\s+exist)",
+            f"kubectl context not found: {context_name} on {location}",
+        ),
+        (
+            r"connection\s+to\s+the\s+server|unable\s+to\s+connect\s+to\s+the\s+server"
+            r"|connection\s+refused|i/o\s+timeout|context\s+deadline\s+exceeded"
+            r"|no\s+route\s+to\s+host|tls\s+handshake\s+timeout",
+            f"kubectl cannot connect to cluster API from {location}",
+        ),
+        (
+            r"namespaces?.*not\s+found|notfound",
+            f"rook namespace not found: {namespace}",
+        ),
+        (
+            r"forbidden|unauthorized|permission\s+denied",
+            "kubectl cannot read rook namespace due to authorization failure: "
+            f"{namespace} on {location}",
+        ),
+    )
+    reason = (
+        f"kubectl namespace probe failed for rook namespace {namespace} on {location}"
+    )
+    for pattern, classified in classifications:
+        if re.search(pattern, detail, re.IGNORECASE):
+            reason = classified
+            break
+    compact = _compact_error(detail)
+    return f"{reason}: {compact}" if compact else reason
+
+
+def _run_probe(command: Sequence[str], timeout: int) -> tuple[int, str]:
+    """Run one read-only probe, merging its output; never raises on failure."""
+
+    try:
+        completed = subprocess.run(
+            list(command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError:
+        return 127, f"{command[0]}: command not found"
+    except subprocess.TimeoutExpired as expired:
+        captured = expired.output or b""
+        return 124, (
+            f"{captured.decode('utf-8', errors='replace')}"
+            f"\nprobe timed out after {timeout}s"
+        )
+    return (
+        _exit_code_of(completed.returncode),
+        completed.stdout.decode("utf-8", errors="replace"),
+    )
+
+
+def _write_skip_artifact(artifact: Path, reason: str) -> None:
+    artifact.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    artifact.write_text(f"SKIPPED: {reason}\n", encoding="utf-8")
+
+
+def _first_pod_name(command: Sequence[str], timeout: int) -> str:
+    """Return the first Pod name a label selector matched, or "" on any failure.
+
+    A lookup failure must yield no Pod — and therefore a SKIPPED artifact — not
+    abort the collector, so this deliberately swallows the probe's exit code.
+    A name that could be read as an option is treated as no match at all.
+    """
+
+    exit_code, output = _run_probe(command, timeout)
+    if exit_code != 0:
+        return ""
+    for line in output.splitlines():
+        candidate = line.strip()
+        if not candidate.startswith("pod/"):
+            continue
+        name = candidate.removeprefix("pod/")
+        return name if SAFE_POD_NAME.fullmatch(name) else ""
+    return ""
+
+
+def collect_rook_cluster(
+    *,
+    workdir: Path,
+    namespace: str,
+    operator_namespace: str,
+    since: str,
+    command_timeout: int,
+    kube_context: str = "",
+    ssh_target: str | None = None,
+    ssh_key: Path | None = None,
+    connection_timeout: int = 20,
+    known_hosts_file: Path | None = None,
+) -> int:
+    """Collect Rook cluster evidence through read-only kubectl operations.
+
+    ``ssh_target`` selects the runner: with it, kubectl runs on that node over
+    the shared SSH option vector; without it, kubectl runs on the workstation
+    against its inherited kubeconfig.  ``kube_context`` selects a kubeconfig
+    context for either runner.  Every kubectl invocation is an explicit argv
+    array of read-only verbs; nothing here can create a process inside a Pod.
+
+    Returns 0 when every required artifact was captured and 2 when the layer is
+    partial — including when no evidence could be collected at all, which is
+    recorded as a SKIPPED artifact naming the classified cause.
+    """
+
+    rook_dir = workdir / "cluster" / "rook"
+    rook_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    manifest = workdir / "manifest.jsonl"
+    errors_log = workdir / "errors.log"
+
+    if ssh_target is not None:
+        if ssh_key is None:
+            raise ValueError("the remote kubectl runner requires an SSH key")
+        kubectl: list[str] = [
+            *_ssh_base_options(ssh_key, connection_timeout, known_hosts_file),
+            ssh_target,
+            "kubectl",
+        ]
+        location = ssh_target
+    else:
+        kubectl = ["kubectl"]
+        location = "local"
+    if kube_context:
+        kubectl.extend(["--context", kube_context])
+
+    # Collecting nothing is a partial layer, not a silent success.  Only the
+    # local runner is checked here; a missing remote kubectl surfaces through
+    # the namespace probe, which classifies it by the same rules.
+    if ssh_target is None and shutil.which("kubectl") is None:
+        _write_skip_artifact(rook_dir / "SKIPPED.txt", "kubectl command not found")
+        return 2
+
+    probe_exit, probe_detail = _run_probe(
+        [*kubectl, "get", "namespace", namespace], command_timeout
+    )
+    if probe_exit != 0:
+        _write_skip_artifact(
+            rook_dir / "SKIPPED.txt",
+            _rook_probe_reason(namespace, kube_context, location, probe_detail),
+        )
+        return 2
+
+    def capture(artifact_name: str, words: Sequence[str]) -> int:
+        return run_capture(
+            manifest=manifest,
+            errors_log=errors_log,
+            host=ROOK_HOST,
+            collector=ROOK_COLLECTOR,
+            artifact=rook_dir / artifact_name,
+            command=[*kubectl, *words],
+            timeout=command_timeout,
+        )
+
+    failed = False
+    required: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("pods-wide.txt", ("get", "pods", "-n", namespace, "-o", "wide")),
+        (
+            "events.txt",
+            ("get", "events", "-n", namespace, "--sort-by=.lastTimestamp"),
+        ),
+        (
+            "rook-resources.yaml",
+            ("get", ROOK_RESOURCE_KINDS, "-n", namespace, "-o", "yaml"),
+        ),
+    )
+    for artifact_name, words in required:
+        if capture(artifact_name, words) != 0:
+            failed = True
+
+    operator_pod = _first_pod_name(
+        [
+            *kubectl,
+            "get",
+            "pods",
+            "-n",
+            operator_namespace,
+            "-l",
+            ROOK_OPERATOR_LABEL,
+            "-o",
+            "name",
+        ],
+        command_timeout,
+    )
+    if operator_pod:
+        if capture(
+            "operator.log",
+            ("logs", "-n", operator_namespace, operator_pod, f"--since={since}"),
+        ) != 0:
+            failed = True
+    else:
+        _write_skip_artifact(
+            rook_dir / "operator-SKIPPED.txt",
+            f"rook operator Pod not found in namespace: {operator_namespace}",
+        )
+
+    # Preserve the shell collector's read-only command ledger even though this
+    # candidate deliberately has no kubectl-exec opt-in or execution path.
+    _first_pod_name(
+        [
+            *kubectl,
+            "get",
+            "pods",
+            "-n",
+            namespace,
+            "-l",
+            ROOK_TOOLBOX_LABEL,
+            "-o",
+            "name",
+        ],
+        command_timeout,
+    )
+    _write_skip_artifact(rook_dir / "toolbox-SKIPPED.txt", ROOK_TOOLBOX_SKIP_REASON)
     return 2 if failed else 0
 
 

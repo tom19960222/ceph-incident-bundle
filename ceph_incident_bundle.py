@@ -14,12 +14,14 @@ import tarfile
 import tempfile
 import zlib
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from ceph_incident_collectors import (
     CollectionInterrupted,
     collect_direct_ceph_cluster,
+    collect_rook_cluster,
     collect_single_node,
 )
 
@@ -27,12 +29,23 @@ from ceph_incident_collectors import (
 # Public collect stays fixed to the direct Ceph CLI runner; choosing a runner
 # (and the source it belongs to) is multi-source orchestration work (#16).
 CEPH_RUNNER = "direct"
+# Rook is collected only when a kubectl runner is named explicitly.  Probing
+# the inventory for a kubectl-capable source, and the auto mode that falls back
+# between layers, are multi-source orchestration work (#16) too.
+KUBE_MODES = ("local", "remote")
+# The shell contract's kube-context allowlist: EKS-style ARNs contain @, : and
+# /, but nothing here may become a shell metacharacter or an option prefix.
+SAFE_KUBE_CONTEXT = re.compile(r"[A-Za-z0-9._@:/-]*\Z")
+SAFE_NAMESPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\Z")
+DEFAULT_ROOK_NAMESPACE = "rook-ceph"
+CLUSTER_LAYERS = ("ceph", "rook", "prometheus")
 
 
 USAGE = """Usage:
   ceph_incident_bundle.py collect --inventory PATH --ssh-key PATH [options]
     [--seed USER@HOST] [--since RANGE] [--skip-logs] [--keep-original-logs]
     [--var-log-max-bytes BYTES|unlimited]
+    [--kube-mode local|remote] [--kube-context CTX]
   ceph_incident_bundle.py verify <bundle-dir|bundle.tar.gz>"""
 REQUIRED_FILES = ("manifest.jsonl", "summary.txt", "README-FIRST.txt")
 SAFE_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -99,6 +112,8 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
             "--node-timeout": "node_timeout",
             "--var-log-max-bytes": "var_log_max_bytes",
             "--since": "since",
+            "--kube-mode": "kube_mode",
+            "--kube-context": "kube_context",
         }
         key = option_names.get(argument)
         if key is None:
@@ -123,6 +138,16 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
             values[key] = raw_value
         elif key == "seed":
             values[key] = _validated_ssh_target(raw_value, "invalid SSH seed target")
+        elif key == "kube_mode":
+            if raw_value not in KUBE_MODES:
+                raise CollectUsageError(f"unsupported kube-mode: {raw_value}")
+            values[key] = raw_value
+        elif key == "kube_context":
+            if SAFE_KUBE_CONTEXT.fullmatch(raw_value) is None:
+                raise CollectUsageError(
+                    "--kube-context may only contain A-Za-z0-9._@:/-"
+                )
+            values[key] = raw_value
         else:
             values[key] = _positive_integer(raw_value, argument)
         index += 2
@@ -144,7 +169,22 @@ def _ssh_target_for_host(host: str, ssh_user: str) -> str:
     return host if "@" in host or not ssh_user else f"{ssh_user}@{host}"
 
 
-def _read_single_node_inventory(path: Path) -> tuple[str, str, str]:
+@dataclass(frozen=True)
+class SingleNodeInventory:
+    host_alias: str
+    target: str
+    seed: str
+    rook_namespace: str
+    rook_operator_namespace: str
+
+
+def _validated_namespace(value: str, option: str) -> str:
+    if SAFE_NAMESPACE.fullmatch(value) is None:
+        raise CollectUsageError(f"invalid {option}: {value}")
+    return value
+
+
+def _read_single_node_inventory(path: Path) -> SingleNodeInventory:
     if not path.is_file():
         raise CollectUsageError(f"missing inventory: {path}")
     try:
@@ -153,6 +193,8 @@ def _read_single_node_inventory(path: Path) -> tuple[str, str, str]:
         raise CollectUsageError(f"cannot read inventory: {path}") from error
     ssh_user = ""
     seed_host = ""
+    rook_namespace = ""
+    rook_operator_namespace = ""
     hosts: list[str] = []
     in_hosts = False
     hosts_closed = False
@@ -189,6 +231,10 @@ def _read_single_node_inventory(path: Path) -> tuple[str, str, str]:
             ssh_user = assignment.group(2)
         elif assignment.group(1) == "SEED_HOST":
             seed_host = assignment.group(2)
+        elif assignment.group(1) == "ROOK_NAMESPACE":
+            rook_namespace = assignment.group(2)
+        elif assignment.group(1) == "ROOK_OPERATOR_NAMESPACE":
+            rook_operator_namespace = assignment.group(2)
     if in_hosts:
         raise CollectUsageError("inventory HOSTS block is not closed")
     if len(hosts) != 1:
@@ -213,19 +259,23 @@ def _read_single_node_inventory(path: Path) -> tuple[str, str, str]:
         if seed_host
         else ""
     )
-    return alias, target, seed
+    # An empty assignment falls back to the default, as in the shell contract.
+    namespace = _validated_namespace(
+        rook_namespace or DEFAULT_ROOK_NAMESPACE, "ROOK_NAMESPACE"
+    )
+    operator_namespace = _validated_namespace(
+        rook_operator_namespace or DEFAULT_ROOK_NAMESPACE, "ROOK_OPERATOR_NAMESPACE"
+    )
+    return SingleNodeInventory(alias, target, seed, namespace, operator_namespace)
 
 
-def _write_initial_bundle_files(workdir: Path, *, ceph_seed: str) -> None:
+def _write_initial_bundle_files(workdir: Path, *, collected: Sequence[str]) -> None:
     (workdir / "cluster").mkdir(mode=0o700)
     (workdir / "nodes").mkdir(mode=0o700)
-    uncollected = (
-        "rook and prometheus collectors are outside the current Python slice"
-        if ceph_seed
-        else "cluster collectors are outside the current Python node slice"
-    )
+    uncollected = [layer for layer in CLUSTER_LAYERS if layer not in collected]
     (workdir / "cluster" / "SKIPPED.txt").write_text(
-        f"SKIPPED: {uncollected}\n",
+        f"SKIPPED: {', '.join(uncollected)} cluster collectors are outside "
+        "the current Python slice\n",
         encoding="utf-8",
     )
     (workdir / "README-FIRST.txt").write_text(
@@ -272,9 +322,13 @@ def _collect(arguments: Sequence[str]) -> int:
         assert isinstance(output_root, Path)
         if not ssh_key.is_file():
             raise CollectUsageError(f"missing ssh key: {ssh_key}")
-        host_alias, target, inventory_seed = _read_single_node_inventory(inventory)
+        node = _read_single_node_inventory(inventory)
+        host_alias = node.host_alias
+        target = node.target
         # --seed overrides the inventory SEED_HOST, as in the shell contract.
-        ceph_seed = str(options.get("seed") or inventory_seed)
+        ceph_seed = str(options.get("seed") or node.seed)
+        kube_mode = str(options.get("kube_mode") or "")
+        kube_context = str(options.get("kube_context") or "")
     except CollectUsageError as error:
         print(f"FATAL: {error}", file=sys.stderr)
         print(USAGE, file=sys.stderr)
@@ -297,7 +351,12 @@ def _collect(arguments: Sequence[str]) -> int:
 
     signal.signal(signal.SIGTERM, interrupt_handler)
     try:
-        _write_initial_bundle_files(workdir, ceph_seed=ceph_seed)
+        collected_layers = [
+            layer
+            for layer, enabled in (("ceph", bool(ceph_seed)), ("rook", bool(kube_mode)))
+            if enabled
+        ]
+        _write_initial_bundle_files(workdir, collected=collected_layers)
         known_hosts: Path | None = None
         if options["trust_ssh_host_key"]:
             known_hosts = workdir / ".runtime-known-hosts"
@@ -316,6 +375,23 @@ def _collect(arguments: Sequence[str]) -> int:
             if cluster_status != 0:
                 with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
                     errors.write(f"cluster collection exited {cluster_status}\n")
+        rook_status: int | None = None
+        if kube_mode:
+            rook_status = collect_rook_cluster(
+                workdir=workdir,
+                namespace=node.rook_namespace,
+                operator_namespace=node.rook_operator_namespace,
+                since=str(options["since"]),
+                command_timeout=int(options["timeout"]),
+                kube_context=kube_context,
+                ssh_target=target if kube_mode == "remote" else None,
+                ssh_key=ssh_key,
+                connection_timeout=int(options["timeout"]),
+                known_hosts_file=known_hosts,
+            )
+            if rook_status != 0:
+                with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
+                    errors.write(f"rook collection exited {rook_status}\n")
         node_source = (Path(__file__).resolve().parent / "ceph_incident_node.py").read_bytes()
         result = collect_single_node(
             workspace=workdir,
@@ -338,11 +414,18 @@ def _collect(arguments: Sequence[str]) -> int:
                 errors.write(f"node {host_alias} ({target}): {result.reason}\n")
         if known_hosts is not None:
             known_hosts.unlink(missing_ok=True)
-        exit_code = 2 if (result.exit_code != 0 or cluster_status) else 0
+        exit_code = (
+            2 if (result.exit_code != 0 or cluster_status or rook_status) else 0
+        )
         created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        slices = [
+            *(["direct-ceph"] if ceph_seed else []),
+            *(["rook"] if kube_mode else []),
+            "node",
+        ]
         environment = [
             f"created_utc={created}",
-            f"mode=python-{'direct-ceph' if ceph_seed else 'node'}-slice",
+            f"mode=python-{'-'.join(slices)}-slice",
             f"node_target={target}",
             f"node_invocation_id={result.invocation_id}",
         ]
@@ -356,6 +439,17 @@ def _collect(arguments: Sequence[str]) -> int:
                 [f"ceph_source={ceph_seed}", f"ceph_runner={CEPH_RUNNER}"]
             )
             summary.append(f"cluster_status={cluster_status}")
+        if rook_status is not None:
+            environment.extend(
+                [
+                    f"rook_source={target if kube_mode == 'remote' else 'local'}",
+                    f"rook_namespace={node.rook_namespace}",
+                    f"rook_operator_namespace={node.rook_operator_namespace}",
+                ]
+            )
+            if kube_context:
+                environment.append(f"kube_context={kube_context}")
+            summary.append(f"rook_status={rook_status}")
         summary.append(f"final_status={exit_code}")
         (workdir / "environment.txt").write_text(
             "".join(f"{line}\n" for line in environment), encoding="utf-8"
