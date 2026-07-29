@@ -363,6 +363,8 @@ class VerifyCliTests(unittest.TestCase):
             b"-----BEGIN"
             + b"A" * (1024 * 1024 + 1024)
             + b"PRIVATE KEY-----\n",
+            b"-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            + b"x" * (2 * 1024 * 1024),
         ):
             self.assert_content_rejected_for_directory_and_archive(
                 Path("nodes/monitor01/system/leak.txt"),

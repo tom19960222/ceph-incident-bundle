@@ -741,7 +741,7 @@ def _scan_private_key_marker(
                 if byte == target[target_progress]:
                     target_progress += 1
                     if target_progress == len(target):
-                        return active, begin_tail, target_progress, True
+                        return False, b"", 0, True
                 elif byte == target[0]:
                     target_progress = 1
                 else:
