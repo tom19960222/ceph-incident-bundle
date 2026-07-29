@@ -19,6 +19,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 from urllib.parse import urlsplit
 
 from ceph_incident_collectors import (
@@ -845,7 +846,7 @@ def _verify_content_safety(target: Path) -> None:
             return
 
         with tarfile.open(target, mode="r:gz") as archive:
-            for member in archive.getmembers():
+            for member in archive:
                 normalised = _normalise_member_name(member.name)
                 if _forbidden_content_path(normalised):
                     raise VerificationError(f"forbidden path: {normalised}")
@@ -1459,6 +1460,20 @@ def _raise_walk_error(error: OSError) -> None:
     raise error
 
 
+def _verify_zero_tar_trailer(snapshot: BinaryIO, payload_end: int) -> None:
+    snapshot.seek(payload_end)
+    trailing_bytes = 0
+    while True:
+        chunk = snapshot.read(1024 * 1024)
+        if not chunk:
+            break
+        trailing_bytes += len(chunk)
+        if any(chunk):
+            raise VerificationError("invalid archive: missing tar end markers")
+    if trailing_bytes < 1024:
+        raise VerificationError("invalid archive: missing tar end markers")
+
+
 def _read_archive(target: Path) -> set[str]:
     files: set[str] = set()
     try:
@@ -1532,10 +1547,7 @@ def _read_archive(target: Path) -> set[str]:
                     ),
                     default=0,
                 )
-                snapshot.seek(payload_end)
-                trailing = snapshot.read()
-                if len(trailing) < 1024 or any(trailing):
-                    raise VerificationError("invalid archive: missing tar end markers")
+                _verify_zero_tar_trailer(snapshot, payload_end)
 
                 for member, normalised_name in normalised_members:
                     if member.isdir():

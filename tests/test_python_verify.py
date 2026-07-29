@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import ceph_incident_bundle as bundle_entry
+
 
 ROOT = Path(__file__).resolve().parents[1]
 ENTRYPOINT = ROOT / "ceph_incident_bundle.py"
@@ -425,6 +427,32 @@ class VerifyCliTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("missing tar end markers", result.stderr)
+
+    def test_tar_trailer_is_checked_with_bounded_reads(self) -> None:
+        class BoundedZeroTrailer:
+            def __init__(self) -> None:
+                self.remaining = 3 * 1024 * 1024 + 1024
+                self.read_sizes: list[int] = []
+
+            def seek(self, offset: int) -> int:
+                self.offset = offset
+                return offset
+
+            def read(self, size: int = -1) -> bytes:
+                if size < 0:
+                    raise AssertionError("unbounded trailer read")
+                self.read_sizes.append(size)
+                count = min(size, self.remaining)
+                self.remaining -= count
+                return b"\0" * count
+
+        trailer = BoundedZeroTrailer()
+
+        bundle_entry._verify_zero_tar_trailer(trailer, 4096)
+
+        self.assertEqual(trailer.offset, 4096)
+        self.assertGreater(len(trailer.read_sizes), 1)
+        self.assertEqual(set(trailer.read_sizes), {1024 * 1024})
 
     def test_archive_file_ancestor_collision_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
