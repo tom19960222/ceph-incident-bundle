@@ -4,3 +4,7 @@
 /env.sh
 /*.tar.gz
 .ssh/
+.claude/worktrees/
+/CEPH-LAB-CONNECTION.md
+__pycache__/
+*.py[cod]

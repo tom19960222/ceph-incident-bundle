@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PLACEHOLDER_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ceph-incident-tests.XXXXXX")"
+trap 'rm -rf "$PLACEHOLDER_ROOT"' EXIT
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 ok() { printf 'ok: %s\n' "$*"; }
@@ -30,11 +32,13 @@ for path in \
   "$ROOT/tests/test-var-log-collector.sh" \
   "$ROOT/tests/test-rook-collector.sh" \
   "$ROOT/tests/test-prom-collector.sh" \
-  "$ROOT/tests/test-verify-bundle.sh"; do
+  "$ROOT/tests/test-verify-bundle.sh" \
+  "$ROOT/tests/export-shell-collect-fixture.sh" \
+  "$ROOT/tests/fixtures/shell-collect-environment.sh"; do
   [[ -f "$path" ]] || fail "missing $path"
 done
 
-for path in "$ROOT/run/collect.sh" "$ROOT/lib/verify-bundle.sh"; do
+for path in "$ROOT/run/collect.sh" "$ROOT/lib/verify-bundle.sh" "$ROOT/tests/export-shell-collect-fixture.sh"; do
   [[ -x "$path" ]] || fail "not executable $path"
 done
 
@@ -50,13 +54,13 @@ verify_no_args_output="${verify_no_args#*$'\n'}"
 [[ "$verify_no_args_status" == "1" ]] || fail "verify-bundle.sh no args should exit 1, got $verify_no_args_status"
 [[ "$verify_no_args_output" == *"Usage:"* ]] || fail "verify-bundle.sh no args should print usage"
 
-verify_placeholder_args="$(run_and_capture "$ROOT/lib/verify-bundle.sh" /tmp/definitely-not-a-bundle)"
+verify_placeholder_args="$(run_and_capture "$ROOT/lib/verify-bundle.sh" "$PLACEHOLDER_ROOT/missing-bundle")"
 verify_placeholder_status="${verify_placeholder_args%%$'\n'*}"
 verify_placeholder_output="${verify_placeholder_args#*$'\n'}"
 [[ "$verify_placeholder_status" != "0" ]] || fail "verify-bundle.sh placeholder args should not exit 0"
 [[ "$verify_placeholder_output" == *"VERIFY FAIL:"* || "$verify_placeholder_output" == *"Usage:"* || "$verify_placeholder_output" == *"error"* ]] || fail "verify-bundle.sh placeholder args should explain failure"
 
-collect_placeholder_args="$(run_and_capture "$ROOT/run/collect.sh" --inventory /tmp/example.env --ssh-key /tmp/id_ed25519 --seed 192.168.18.166)"
+collect_placeholder_args="$(run_and_capture "$ROOT/run/collect.sh" --inventory "$PLACEHOLDER_ROOT/missing-inventory.env" --ssh-key "$PLACEHOLDER_ROOT/missing-key" --seed invalid.invalid)"
 collect_placeholder_status="${collect_placeholder_args%%$'\n'*}"
 collect_placeholder_output="${collect_placeholder_args#*$'\n'}"
 [[ "$collect_placeholder_status" != "0" ]] || fail "collect.sh placeholder args should not exit 0"

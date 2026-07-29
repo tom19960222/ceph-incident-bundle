@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Public entrypoint; the current Verify boundary is documented in the rewrite plan."""
+
+from __future__ import annotations
+
+import gzip
+import os
+import sys
+import tarfile
+import zlib
+from collections.abc import Sequence
+from pathlib import Path, PurePosixPath
+
+
+USAGE = "Usage: ceph_incident_bundle.py verify <bundle-dir|bundle.tar.gz>"
+REQUIRED_FILES = ("manifest.jsonl", "summary.txt", "README-FIRST.txt")
+
+
+class VerificationError(Exception):
+    """An incident bundle failed structural verification."""
+
+
+def _normalise_member_name(name: str) -> str:
+    path = PurePosixPath(name)
+    if not name or path.is_absolute() or ".." in path.parts:
+        raise VerificationError(f"unsafe archive member: {name}")
+    return path.as_posix()
+
+
+def _verify_required_files(files: set[str]) -> None:
+    for required in REQUIRED_FILES:
+        if required not in files:
+            raise VerificationError(f"missing required file: {required}")
+
+
+def _verify_artifact_prefix(files: set[str], prefix: str) -> None:
+    if not any(name.startswith(f"{prefix}/") for name in files):
+        raise VerificationError(f"missing {prefix}/ artifact")
+
+
+def _verify_file_set(files: set[str]) -> None:
+    _verify_required_files(files)
+    _verify_artifact_prefix(files, "cluster")
+    _verify_artifact_prefix(files, "nodes")
+
+
+def _raise_walk_error(error: OSError) -> None:
+    raise error
+
+
+def _read_archive(target: Path) -> set[str]:
+    files: set[str] = set()
+    try:
+        # Consume the gzip stream to EOF before opening the tar.  This verifies
+        # the gzip trailer/CRC even when every tar member itself is readable.
+        with gzip.open(target, mode="rb") as compressed_stream:
+            while compressed_stream.read(1024 * 1024):
+                pass
+
+        with tarfile.open(target, mode="r:gz") as archive:
+            members = archive.getmembers()
+            normalised_members: list[tuple[tarfile.TarInfo, str]] = []
+            seen_names: dict[str, str] = {}
+            for member in members:
+                normalised_name = _normalise_member_name(member.name)
+                if normalised_name in seen_names:
+                    raise VerificationError(
+                        "duplicate archive member after normalisation: "
+                        f"{member.name} collides with {seen_names[normalised_name]}"
+                    )
+                seen_names[normalised_name] = member.name
+                normalised_members.append((member, normalised_name))
+                if not (member.isfile() or member.isdir()):
+                    if member.issym():
+                        member_kind = "symlink"
+                    elif member.islnk():
+                        member_kind = "hardlink"
+                    else:
+                        member_kind = "non-file/non-directory"
+                    raise VerificationError(
+                        f"archive contains {member_kind} member: {member.name}"
+                    )
+
+            for member, normalised_name in normalised_members:
+                if member.isdir():
+                    continue
+                files.add(normalised_name)
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise VerificationError(f"cannot read archive member: {member.name}")
+                with stream:
+                    while stream.read(1024 * 1024):
+                        pass
+    except (OSError, tarfile.TarError, EOFError, zlib.error) as error:
+        raise VerificationError(f"invalid archive: {target}") from error
+    return files
+
+
+def _verify_directory(target: Path) -> None:
+    files: set[str] = set()
+    try:
+        for root, directories, filenames in os.walk(
+            target, topdown=True, onerror=_raise_walk_error
+        ):
+            for name in (*directories, *filenames):
+                path = Path(root, name)
+                relative_name = path.relative_to(target).as_posix()
+                if path.is_symlink():
+                    raise VerificationError(
+                        f"symlink is not allowed in bundle: {relative_name}"
+                    )
+                if path.is_dir():
+                    continue
+                if path.is_file():
+                    files.add(relative_name)
+                    continue
+                raise VerificationError(
+                    f"non-file/non-directory entry in bundle: {relative_name}"
+                )
+    except OSError as error:
+        raise VerificationError(f"cannot read bundle directory: {target}") from error
+    _verify_file_set(files)
+
+
+def main(arguments: Sequence[str] | None = None) -> int:
+    args = list(sys.argv[1:] if arguments is None else arguments)
+    if len(args) != 2 or args[0] != "verify":
+        print(USAGE, file=sys.stderr)
+        return 1
+
+    target = Path(args[1])
+    try:
+        if target.is_dir():
+            _verify_directory(target)
+        elif target.is_file() and args[1].endswith(".tar.gz"):
+            files = _read_archive(target)
+            _verify_file_set(files)
+        else:
+            raise VerificationError(
+                f"expected a directory or .tar.gz bundle: {args[1]}"
+            )
+    except VerificationError as error:
+        print(f"VERIFY FAIL: {error}", file=sys.stderr)
+        return 1
+
+    print(f"VERIFY PASS: {args[1]}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
