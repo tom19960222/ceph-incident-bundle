@@ -12,7 +12,7 @@
 
 Lab Profile、status/discovery workflow 與 report foundation 由 issue #19 實作；同 lab 的 shell/Python full-collect automation 與完整 `validate-lab` gate 由 issue #20 實作。Issue #9 只建立契約與操作文件，不修改 production collectors 或 Makefile。
 
-Shell reference 的 Node Evidence Archive receiver 必須先完成 issue #23 的 pre-extraction hardening，才可作為 issue #20 real-lab qualification 的 evidence source。
+Shell reference 的 Node Evidence Archive receiver 已由 issue #23 完成 pre-extraction hardening；這只解除 archive receiver prerequisite，不取代 issue #20 的 strict identity、full-collect、stable-state 與 residue gates。
 
 在 #19、#20 完成前，不得用手動拼接的一組長指令冒充正式 qualification，也不得宣告 Python candidate 已通過 real-lab gate。
 

@@ -15,6 +15,8 @@ source "$COLLECT_ROOT/lib/collect-cluster-rook.sh"
 source "$COLLECT_ROOT/lib/collect-prometheus.sh"
 # shellcheck disable=SC1091
 source "$COLLECT_ROOT/lib/bundle.sh"
+# shellcheck disable=SC1091
+source "$COLLECT_ROOT/lib/node-archive.sh"
 
 usage() {
   cat <<'EOF'
@@ -314,24 +316,33 @@ collect_remote_node() {
     write_ssh_debug_log "$workdir" "node-${alias}" "$target" "$ssh_key" "$timeout"
   fi
 
-  ensure_dir "$node_dir"
+  # The shared nodes container is collector-owned metadata, not this archive's
+  # extraction root. The per-node destination itself stays absent until the
+  # complete archive has passed acceptance.
+  ensure_dir "$(dirname -- "$node_dir")"
   if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    ensure_dir "$node_dir"
     printf 'SKIPPED: node collection timed out after %ss (exit %s) from %s\n' "$node_timeout" "$rc" "$target" >"$node_dir/SKIPPED.txt"
     rm -f "$node_tar"
     return 2
   fi
 
-  if [[ -s "$node_tar" ]] && tar -xzf "$node_tar" -C "$node_dir" >/dev/null 2>/dev/null; then
-    # A node that streamed a valid archive but is missing its own manifest.jsonl
-    # was truncated (partial/interrupted transfer) — do not count it as ok.
-    if [[ ! -f "$node_dir/manifest.jsonl" ]]; then
-      printf 'SKIPPED: node archive from %s is incomplete (no manifest.jsonl); treated as failure\n' "$target" >"$node_dir/SKIPPED.txt"
-      rc=2
-    fi
+  local archive_rc=0
+  NODE_ARCHIVE_REJECTION_CLASS=
+  if [[ -s "$node_tar" ]]; then
+    accept_node_archive "$node_tar" "$node_dir" "$workdir" "$var_log_max_bytes" || archive_rc=$?
   else
-    rm -rf "$node_dir"
+    archive_rc=2
+  fi
+  if [[ $archive_rc -eq 0 ]]; then
+    : # A valid archive is retained even when the remote collector returned partial.
+  else
     ensure_dir "$node_dir"
-    printf 'SKIPPED: no usable node archive returned from %s (ssh exit %s)\n' "$target" "$rc" >"$node_dir/SKIPPED.txt"
+    if [[ "$NODE_ARCHIVE_REJECTION_CLASS" == missing-manifest ]]; then
+      printf 'SKIPPED: node archive from %s is incomplete (no manifest.jsonl); treated as failure\n' "$target" >"$node_dir/SKIPPED.txt"
+    else
+      printf 'SKIPPED: no usable node archive returned from %s (ssh exit %s)\n' "$target" "$rc" >"$node_dir/SKIPPED.txt"
+    fi
     [[ $rc -ne 0 ]] || rc=2
   fi
   rm -f "$node_tar"

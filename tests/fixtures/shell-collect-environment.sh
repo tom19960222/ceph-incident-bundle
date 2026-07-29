@@ -103,6 +103,15 @@ case "$whole" in
     alias_name="$(printf '%s\n' "$whole" | sed -n "s/.*--host-alias '\([^']*\)'.*/\1/p")"
     cat >/dev/null
     [[ -n "$alias_name" ]] || { printf 'no alias\n' >&2; exit 99; }
+    archive_case=${FAKE_SSH_NODE_ARCHIVE_CASE:-}
+    for archive_mapping in ${FAKE_SSH_NODE_ARCHIVE_CASES:-}; do
+      [[ "${archive_mapping%%:*}" == "$alias_name" ]] && archive_case=${archive_mapping#*:}
+    done
+    if [[ -n "$archive_case" ]]; then
+      python3 "$FIXTURE_NODE_ARCHIVE" "$archive_case" "$alias_name"
+      [[ "${FAKE_SSH_FAIL_ALIAS:-}" == "$alias_name" ]] && exit 2
+      exit 0
+    fi
     if [[ "${FAKE_SSH_BAD_TAR_ALIAS:-}" == "$alias_name" ]]; then
       printf 'not a tar archive\n'; exit 0
     fi
@@ -145,6 +154,7 @@ EOF
   export FAKE_SSH_LOG="$test_root/ssh.log"
   export FAKE_TIMEOUT_LOG="$test_root/timeout.log"
   export FIXTURE_SSH="$repo_root/tests/fixtures/bin/ssh"
+  export FIXTURE_NODE_ARCHIVE="$repo_root/tests/fixtures/make-node-archive.py"
 
   inventory="$test_root/inv-external.env"
   cat >"$inventory" <<'EOF'
