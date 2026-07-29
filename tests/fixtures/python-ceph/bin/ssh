@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Whitelist fake ssh for direct Ceph CLI black-box tests.
+
+Every invocation appends its full argv to ``FAKE_SSH_LOG`` as one JSON line, so
+tests can assert the external command ledger.  Nothing is answered on argv
+shape alone: the shared SSH option vector is matched exactly, and each of the
+three permitted invocations — verbose debug probe, node bootstrap, Ceph CLI
+read command — must match its complete argv, with the Ceph command itself
+dispatched by exact remote argv.  The bootstrap's Python source is not merely
+required to be nonempty: it must hash to the digest pinned below, so arbitrary
+remote source fails just as loudly as an extra token.  Anything else exits 99,
+so a collector that appends an unexpected or mutating token fails the suite
+immediately.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import io
+import json
+import os
+import re
+import shlex
+import sys
+import tarfile
+import time
+
+
+CEPH_RESPONSES = {
+    "status --format json-pretty": '{"health":"HEALTH_OK","fsid":"fsid-1"}',
+    "status": "cluster is healthy",
+    "health detail --format json-pretty": '{"checks":[{"severity":"HEALTH_OK"}]}',
+    "health detail": "HEALTH_OK",
+    "versions --format json-pretty": '{"mon":"19.2.3","mgr":"19.2.3"}',
+    "df detail --format json-pretty": '{"stats":{"total_bytes":100}}',
+    "osd tree --format json-pretty": '{"nodes":[{"id":0,"name":"osd.0"}]}',
+    "osd tree": "ID CLASS WEIGHT TYPE NAME STATUS",
+    "osd df --format json-pretty": '{"nodes":[{"id":0,"utilization":10}]}',
+    "osd dump --format json-pretty": '{"osds":[{"osd":0,"state":["up","in"]}]}',
+    "osd perf --format json-pretty": '{"osd_perf_infos":[{"id":0}]}',
+    "osd blocked-by --format json-pretty": '{"blocked_by":[]}',
+    "pg stat --format json-pretty": '{"pg_summary":{"num_pgs":33}}',
+    "pg dump --format json-pretty": '{"pg_map":{"version":7}}',
+    "pg dump_stuck --format json-pretty": '{"stuck":[]}',
+    "mon dump --format json-pretty": '{"mons":[{"name":"a"}]}',
+    "quorum_status --format json-pretty": '{"quorum":[0,1,2]}',
+    "mgr dump --format json-pretty": '{"active_name":"a"}',
+    "orch host ls --format json-pretty": '[{"hostname":"monitor01"}]',
+    "orch ps --format json-pretty": '[{"daemon_type":"mon"}]',
+    "orch ps": "NAME HOST STATUS",
+    "orch device ls --wide --format json-pretty": '[{"path":"/dev/sdb"}]',
+    "config dump --format json-pretty": '[{"who":"mon.a","value":"1"}]',
+}
+
+CRASH_IDS = (
+    "crash-01",
+    "crash/02",
+    "crash:02",
+    "crash-04",
+    "crash-05",
+    "crash-06",
+    "crash-07",
+    "crash-08",
+    "crash-09",
+    "crash-10",
+    "crash-11",
+    "crash-12",
+)
+
+# Dynamic-but-constrained argv slots: identity path, timeouts, known_hosts file
+# list and SSH target.  Everything else in the option vector is fixed text.
+IDENTITY_PATH = re.compile(r"[^-\s]\S*")
+CONNECT_TIMEOUT = re.compile(r"ConnectTimeout=[1-9][0-9]*")
+ALIVE_INTERVAL = re.compile(r"ServerAliveInterval=[1-9][0-9]*")
+KNOWN_HOSTS_FILE = re.compile(r"UserKnownHostsFile=[^\s][^\n]*")
+SSH_TARGET = re.compile(
+    r"(?:[A-Za-z0-9._%+-]+@)?(?:\[[0-9A-Fa-f:]+\]|[A-Za-z0-9._:-]+)"
+)
+ENCODED_CONFIG = re.compile(r"[A-Za-z0-9_-]+")
+
+# The one Python source this fake will ever run a bootstrap for, pinned here as
+# an independent SHA-256 of the production REMOTE_BOOTSTRAP text.  The fixture
+# deliberately does not import the production constant: pinning the digest is
+# what makes "the collector sent the reviewed bootstrap, not merely *a* Python
+# program" an assertion rather than an assumption.  When the production
+# bootstrap legitimately changes, this digest must be updated by hand — the
+# whole node-collection suite fails closed until it is.  Regenerate with:
+#   python3 -c 'import hashlib, ceph_incident_collectors as c; \
+#     print(hashlib.sha256(c.REMOTE_BOOTSTRAP.encode("utf-8")).hexdigest())'
+BOOTSTRAP_SOURCE_SHA256 = (
+    "420c17c1f51ef9dd5ff069edcd9cf4620eadc4ffa3f9d584d0afe9688c75f544"
+)
+
+
+class PinnedDigest:
+    """An argv slot that accepts exactly one text, identified by its digest."""
+
+    def __init__(self, hexdigest: str) -> None:
+        self.hexdigest = hexdigest
+
+    def accepts(self, actual: str) -> bool:
+        return hmac.compare_digest(
+            hashlib.sha256(actual.encode("utf-8")).hexdigest(), self.hexdigest
+        )
+
+
+BOOTSTRAP_SOURCE = PinnedDigest(BOOTSTRAP_SOURCE_SHA256)
+
+Matcher = str | re.Pattern[str] | PinnedDigest
+
+BASE_OPTIONS: tuple[Matcher, ...] = (
+    "-i",
+    IDENTITY_PATH,
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "IdentitiesOnly=yes",
+    "-o",
+    "IdentityAgent=none",
+    "-o",
+    "LogLevel=ERROR",
+    "-o",
+    CONNECT_TIMEOUT,
+    "-o",
+    ALIVE_INTERVAL,
+    "-o",
+    "ServerAliveCountMax=1",
+)
+TRUSTED_HOST_KEY_OPTIONS: tuple[Matcher, ...] = (
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    KNOWN_HOSTS_FILE,
+)
+
+
+def matches(expected: Matcher, actual: str) -> bool:
+    if isinstance(expected, PinnedDigest):
+        return expected.accepts(actual)
+    if isinstance(expected, re.Pattern):
+        return expected.fullmatch(actual) is not None
+    return expected == actual
+
+
+def matches_all(expected: tuple[Matcher, ...], actual: list[str]) -> bool:
+    return len(actual) == len(expected) and all(
+        matches(item, actual[index]) for index, item in enumerate(expected)
+    )
+
+
+def reject(reason: str) -> None:
+    sys.stderr.write(f"unexpected ssh command ({reason}): {shlex.join(arguments)}\n")
+    raise SystemExit(99)
+
+
+def remaining_after_base_options(argv: list[str]) -> list[str]:
+    """Consume the exact shared SSH option vector and return the rest."""
+
+    if not matches_all(BASE_OPTIONS, argv[: len(BASE_OPTIONS)]):
+        reject("base SSH options")
+    rest = argv[len(BASE_OPTIONS) :]
+    if rest[:1] == ["-o"]:
+        if not matches_all(TRUSTED_HOST_KEY_OPTIONS, rest[:4]):
+            reject("host key options")
+        rest = rest[4:]
+    return rest
+
+
+def emit(payload: str, code: int = 0) -> None:
+    sys.stdout.write(payload if payload.endswith("\n") else payload + "\n")
+    raise SystemExit(code)
+
+
+def node_archive(alias: str) -> bytes:
+    entry = {
+        "host": alias,
+        "collector": "collect-node",
+        "artifact": "/tmp/ceph-incident-node.fixture/out/system/hostname.txt",
+        "command": "hostname",
+        "exit_code": 0,
+        "started": "2026-07-29T00:00:00Z",
+        "ended": "2026-07-29T00:00:01Z",
+    }
+    files = {
+        "system/hostname.txt": f"{alias}\n".encode(),
+        "manifest.jsonl": (json.dumps(entry) + "\n").encode(),
+    }
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, payload in files.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+    return buffer.getvalue()
+
+
+def serve_debug_probe(rest: list[str]) -> None:
+    if not matches_all(
+        ("-vvv", "-o", "LogLevel=DEBUG3", SSH_TARGET, "true"), rest
+    ):
+        reject("debug probe argv")
+    sys.stdout.write("debug1: fake verbose ssh probe\ndebug3: fake verbose detail\n")
+    sys.stderr.write("debug1: connection closed by fixture\n")
+    raise SystemExit(255)
+
+
+def serve_bootstrap(remote_command: str) -> None:
+    try:
+        words = shlex.split(remote_command)
+    except ValueError:
+        reject("unparseable remote command")
+    if not matches_all(("python3", "-c", BOOTSTRAP_SOURCE, ENCODED_CONFIG), words):
+        reject("node bootstrap remote command")
+    sys.stdin.buffer.read()
+    alias = os.environ.get("FAKE_NODE_ALIAS", "monitor01")
+    sys.stdout.buffer.write(node_archive(alias))
+    raise SystemExit(int(os.environ.get("FAKE_NODE_EXIT", "0")))
+
+
+def serve_ceph(words: list[str]) -> None:
+    remote = " ".join(words)
+
+    if os.environ.get("FAKE_SSH_CONNECT_FAIL"):
+        sys.stderr.write("ssh: connect to host port 22: Connection refused\n")
+        raise SystemExit(255)
+
+    if os.environ.get("FAKE_SSH_MISSING_CEPH"):
+        sys.stderr.write("bash: ceph: command not found\n")
+        raise SystemExit(127)
+
+    sleep_on = os.environ.get("FAKE_SSH_SLEEP_ON")
+    if sleep_on and sleep_on in remote:
+        time.sleep(float(os.environ.get("FAKE_SSH_SLEEP_SECONDS", "30")))
+        raise SystemExit(0)
+
+    fail_on = os.environ.get("FAKE_SSH_FAIL_ON")
+    if fail_on and fail_on in remote:
+        sys.stderr.write(f"simulated failure for {fail_on}\n")
+        raise SystemExit(17)
+
+    if remote in CEPH_RESPONSES:
+        emit(CEPH_RESPONSES[remote])
+
+    if remote == "crash ls --format json-pretty":
+        if os.environ.get("FAKE_SSH_CRASH_LS_BROKEN"):
+            emit("{not-json")
+        if os.environ.get("FAKE_SSH_CRASH_LS_EMPTY"):
+            emit("[]")
+        emit(json.dumps([{"crash_id": crash_id} for crash_id in CRASH_IDS], indent=2))
+
+    if remote.startswith("crash info "):
+        crash_id = remote.removeprefix("crash info ")
+        if crash_id in CRASH_IDS[:10]:
+            emit(json.dumps({"crash_id": crash_id, "detail": f"detail for {crash_id}"}))
+
+    reject("remote ceph command is not whitelisted")
+
+
+arguments = sys.argv[1:]
+log_path = os.environ.get("FAKE_SSH_LOG")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as output:
+        output.write(json.dumps(arguments) + "\n")
+
+tail = remaining_after_base_options(arguments)
+
+if "-vvv" in tail:
+    serve_debug_probe(tail)
+
+if not tail or SSH_TARGET.fullmatch(tail[0]) is None:
+    reject("SSH target")
+tail = tail[1:]
+
+if len(tail) == 1:
+    serve_bootstrap(tail[0])
+
+if tail[:1] == ["ceph"]:
+    serve_ceph(tail[1:])
+
+if tail[:3] == ["sudo", "-n", "ceph"]:
+    serve_ceph(tail[3:])
+
+reject("remote command shape")
