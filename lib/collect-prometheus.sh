@@ -50,13 +50,34 @@ prom_auto_step() {
 # Mask embedded basic-auth credentials in a URL before it lands in artifacts.
 prom_mask_url() {
   local url=$1
-  local re='^([A-Za-z][A-Za-z0-9+.-]*://)([^/@]+)@(.*)$'
+  local re='^([A-Za-z][A-Za-z0-9+.-]*://)(.*)$'
   if [[ $url =~ $re ]]; then
-    local cred=${BASH_REMATCH[2]}
-    printf '%s%s:***@%s' "${BASH_REMATCH[1]}" "${cred%%:*}" "${BASH_REMATCH[3]}"
+    local scheme=${BASH_REMATCH[1]} remainder=${BASH_REMATCH[2]}
+    local authority suffix
+    authority=${remainder%%/*}
+    suffix=${remainder#"$authority"}
+    if [[ $authority == *@* ]]; then
+      local credentials=${authority%@*} endpoint=${authority##*@}
+      printf '%s%s:***@%s%s' "$scheme" "${credentials%%:*}" "$endpoint" "$suffix"
+      return
+    fi
+    printf '%s' "$url"
   else
     printf '%s' "$url"
   fi
+}
+
+# Replace an exact raw request base in external diagnostics before persistence.
+# Escape bash glob metacharacters so a URL is treated as literal text.
+prom_mask_detail() {
+  local detail=$1 raw=$2 masked pattern
+  masked="$(prom_mask_url "$raw")"
+  [[ $masked != "$raw" ]] || { printf '%s' "$detail"; return; }
+  pattern=${raw//\\/\\\\}
+  pattern=${pattern//\*/\\*}
+  pattern=${pattern//\?/\\?}
+  pattern=${pattern//\[/\\[}
+  printf '%s' "${detail//$pattern/$masked}"
 }
 
 # Workstation dependencies for this layer. Prints the missing dependency
@@ -83,12 +104,16 @@ prom_curl() {
   local base=$1 path=$2 outfile=$3 timeout=$4
   shift 4
   local -a cmd
-  local p
-  cmd=(curl -fsS -G --connect-timeout "$timeout" --max-time "$timeout" -o "$outfile" "$base$path")
+  local p detail rc
+  # -q must be the first curl option so workstation ~/.curlrc cannot change
+  # this proven GET-only command surface (for example by injecting --data).
+  cmd=(curl -q -fsS -G --connect-timeout "$timeout" --max-time "$timeout" -o "$outfile" "$base$path")
   for p in "$@"; do
     cmd+=(--data-urlencode "$p")
   done
-  "${cmd[@]}"
+  detail="$("${cmd[@]}" 2>&1)" && rc=0 || rc=$?
+  [[ -z $detail ]] || prom_mask_detail "$detail" "$base"
+  return "$rc"
 }
 
 # Print each string in a Prometheus label-values response's data[] array,

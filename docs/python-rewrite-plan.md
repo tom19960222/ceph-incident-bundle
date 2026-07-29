@@ -30,6 +30,10 @@ PR #24／#10 建立 validation foundation 的第一條 vertical slice：公開 `
 
 Rook 只在明確指定 `--kube-mode` 時收集，這和 #13 的 Ceph 層只在有 `--seed` 時收集一致：capability probe、auto mode 與跨層 source selection 仍屬 #16，本 slice 不提供替代品。#14 也不新增 `--allow-kubectl-exec`、`--kubeconfig` 或任何 lab gate。
 
+#15 再加入 Prometheus 這條 cluster evidence path，且只走既有的 HTTP operational path。這一層只在明確給了 `--prom-url` 時收集，和 #13 的 `--seed`、#14 的 `--kube-mode` 一致；公開 CLI 保留 `--prom-url`、`--prom-job-regex`（預設 `ceph|node`）、`--prom-step`（預設自動 `max(15, ceil(window/10000))`）與 `--prom-timeout`（預設 600），並沿用 shell「只有啟用該層才驗證」的語意：未啟用時 `--since`、step 與 budget 不生效也不報錯，啟用時則在發出任何請求前 fail closed。`--prom-url` 另外收斂為有 host、無 query／fragment 的 http(s) base endpoint，避免 dash 開頭、空 authority、含空白或無法安全拼接 API path 的值進入 curl。每個請求都是 explicit argv 的 `curl -q -fsS -G --connect-timeout T --max-time T -o FILE <base><path>`，置首的 `-q` 會禁止工作機 `.curlrc` 改寫 GET-only command surface；查詢參數一律走 `--data-urlencode`，原始 JSON 由 curl 直接落檔（不經 run_capture，以免 header 汙染 JSON），manifest 由本 collector 以 `host=prometheus`、`collector=collect-prometheus`、`command=GET <masked-url>/…` 自行追加。時間窗為 `[now-window, now]`，`user:pass@` 在進入任何 artifact、manifest、errors.log、usage stderr 或 `environment.txt` 之前遮蔽為 `user:***@`；即使外部 curl 在診斷中回顯完整 request URL，也會先遮蔽再持久化。
+
+分層語意與 shell 對齊：`buildinfo` 兼作連通性探測，失敗即刪除 curl 的半寫檔、寫 `cluster/prometheus/SKIPPED.txt` 並回 partial（2）；job 列舉失敗或回應不可解析同樣 fail closed 成 SKIPPED。`targets` 失敗、metric 列舉失敗、單一 `query_range` 失敗或回應前 512 bytes 不含 `"status":"success"`、metric 名不安全與 budget 用盡，都只讓該層 partial 並保留其餘 evidence；label-values 的 `data[]` 若含非字串元素也視為 malformed，而非靜默丟棄。truncation 之後不再開始新的 job。job filter 透過 argv-safe 的 `grep -qiE --` 保留 shell 的 POSIX ERE 語意；job 名含 `"` 或 `\` 會被記錄並跳過，不會進入 PromQL matcher。job 目錄與 metric 檔名在安全化後若碰撞，後者會加上 deterministic digest suffix，避免合法 label 互相覆寫；job namespace 另預留 `buildinfo.json`、`targets.json`、`dump-info.txt`、`SKIPPED.txt` 與 scratch 名稱的 case-folded key，server label 不可能蓋掉 collector-owned artifact。metric 名必須符合 Prometheus 文法才會成為查詢與檔名（一般情況仍為 `:` 轉 `__`）。壓縮改用標準庫 gzip，不再外呼 `gzip`。`dump-info.txt`、每個 job 的 `index.txt` 與 `environment.txt` 的 `prom_url`／`prom_jobs` 都保留既有欄位。離線黑箱測試把既有的 whitelist fake curl（`tests/fixtures/bin/curl`，另加 timeout／malformed／metric-name 三個預設關閉的旋鈕）擋在 HTTP 邊界，並用 NUL-delimited ledger 無損保留 argv boundaries；fake grep（`tests/fixtures/python-prometheus/bin/grep`）則精確限制並記錄 `grep -qiE -- PATTERN`，同時轉交系統 grep 驗證 POSIX ERE 語意。測試覆蓋 P5–P7、P9–P12、P14–P18 與 O29–O32；P4／P8（工作機 python3 前置檢查）是 shell 實作細節，Python runtime 本身即滿足，P13 的 redaction 排除清單仍歸 #17。normal validation 不連網路。
+
 這仍是有明確限制的 Python candidate，不是 feature-complete Collect／Verify 契約，也不是 real-lab qualification evidence。
 
 - Direct Ceph 與 Rook slice 都尚未含 redaction；#17 移植 content safety 前，真實 lab 的 `config dump` 或 `rook-resources.yaml` 等輸出可能仍帶 key 材料而被 verifier 的 content check 攔下。
@@ -38,7 +42,7 @@ Rook 只在明確指定 `--kube-mode` 時收集，這和 #13 的 Ceph 層只在�
 - #17 的 malicious final Incident Bundle 黑箱案例負責收斂 shell/Python Verify 對 link、special member、member collision 等接受差異；#23 只處理 shell 收到 Node Evidence Archive 後、解壓前的窄幅安全邊界。
 - #17 未完成前，PR #24 的 candidate 只能作為離線 validation foundation，不能宣稱 feature-complete、observable-equivalent 或 qualification-ready；#23 的 shell boundary 完成不改變這項限制。
 
-本階段的 Python 3.11 baseline 由 Makefile 的 offline gate 在任何測試前 fail fast；#11 已完成單一 node 的 runtime negotiation 與 graceful-skip seam，#12 已完成 `/var/log` forensic evidence，#13 與 #14 已分別完成 direct Ceph 與 Rook 這兩條 cluster evidence path；Prometheus、多 node 與 multi-source orchestration 仍依後續 collector tickets 實作。
+本階段的 Python 3.11 baseline 由 Makefile 的 offline gate 在任何測試前 fail fast；#11 已完成單一 node 的 runtime negotiation 與 graceful-skip seam，#12 已完成 `/var/log` forensic evidence，#13、#14 與 #15 已分別完成 direct Ceph、Rook 與 Prometheus 這三條 cluster evidence path；多 node 與 multi-source orchestration 仍依後續 collector tickets 實作。
 
 ## Locked Design
 

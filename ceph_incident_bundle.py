@@ -17,12 +17,18 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 from ceph_incident_collectors import (
+    PROMETHEUS_DEFAULT_BUDGET_SECONDS,
+    PROMETHEUS_DEFAULT_JOB_REGEX,
     CollectionInterrupted,
+    PrometheusCollectionResult,
     collect_direct_ceph_cluster,
+    collect_prometheus_cluster,
     collect_rook_cluster,
     collect_single_node,
+    prometheus_duration_seconds,
 )
 
 
@@ -38,6 +44,11 @@ KUBE_MODES = ("local", "remote")
 SAFE_KUBE_CONTEXT = re.compile(r"[A-Za-z0-9._@:/-]*\Z")
 SAFE_NAMESPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\Z")
 SAFE_REMOTE_KUBECTL_SINCE = re.compile(r"[0-9]+[smhdw]?\Z")
+# The Prometheus base URL becomes an argv word for curl, so it must be an HTTP
+# endpoint that cannot be read as an option or carry a shell/argv surprise.
+SAFE_PROMETHEUS_URL = re.compile(r"https?://[^\s\x00-\x1f\x7f]+\Z")
+PROMETHEUS_STEP = re.compile(r"[1-9][0-9]*\Z")
+PROMETHEUS_BUDGET = re.compile(r"[0-9]+\Z")
 DEFAULT_ROOK_NAMESPACE = "rook-ceph"
 CLUSTER_LAYERS = ("ceph", "rook", "prometheus")
 
@@ -47,6 +58,8 @@ USAGE = """Usage:
     [--seed USER@HOST] [--since RANGE] [--skip-logs] [--keep-original-logs]
     [--var-log-max-bytes BYTES|unlimited]
     [--kube-mode local|remote] [--kube-context CTX]
+    [--prom-url URL] [--prom-job-regex RE] [--prom-step SECONDS]
+    [--prom-timeout SECONDS]
   ceph_incident_bundle.py verify <bundle-dir|bundle.tar.gz>"""
 REQUIRED_FILES = ("manifest.jsonl", "summary.txt", "README-FIRST.txt")
 SAFE_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -88,6 +101,10 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
         "keep_original_logs": False,
         "var_log_max_bytes": 10 * 1024**3,
         "since": "24h",
+        "prom_url": "",
+        "prom_job_regex": PROMETHEUS_DEFAULT_JOB_REGEX,
+        "prom_step": "",
+        "prom_timeout": PROMETHEUS_DEFAULT_BUDGET_SECONDS,
     }
     index = 0
     while index < len(arguments):
@@ -115,6 +132,10 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
             "--since": "since",
             "--kube-mode": "kube_mode",
             "--kube-context": "kube_context",
+            "--prom-url": "prom_url",
+            "--prom-job-regex": "prom_job_regex",
+            "--prom-step": "prom_step",
+            "--prom-timeout": "prom_timeout",
         }
         key = option_names.get(argument)
         if key is None:
@@ -143,6 +164,10 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
             if raw_value not in KUBE_MODES:
                 raise CollectUsageError(f"unsupported kube-mode: {raw_value}")
             values[key] = raw_value
+        elif key in ("prom_url", "prom_job_regex", "prom_step", "prom_timeout"):
+            # Prometheus values are validated below, and only when the layer is
+            # actually enabled, exactly as the shell contract does.
+            values[key] = raw_value
         elif key == "kube_context":
             if SAFE_KUBE_CONTEXT.fullmatch(raw_value) is None:
                 raise CollectUsageError(
@@ -163,12 +188,56 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
                 "remote Rook --since must be N, Ns, Nm, Nh, Nd, or Nw "
                 "with N greater than 0"
             )
+    if values["prom_url"]:
+        _validate_prometheus_options(values)
     if values.get("help"):
         return values
     for required in ("inventory", "ssh_key"):
         if required not in values:
             raise CollectUsageError(f"missing required option: --{required.replace('_', '-')}")
     return values
+
+
+def _validate_prometheus_options(values: dict[str, object]) -> None:
+    """Check the metrics-dump options, only ever when the dump is enabled.
+
+    The shell contract leaves these unchecked without a --prom-url, so an unused
+    value stays harmless; an enabled dump fails closed before any request.
+    """
+
+    url = str(values["prom_url"])
+    try:
+        parsed_url = urlsplit(url)
+        # Accessing .port also validates numeric syntax and the 0..65535 range.
+        _ = parsed_url.port
+    except ValueError:
+        parsed_url = None
+    if (
+        SAFE_PROMETHEUS_URL.fullmatch(url) is None
+        or parsed_url is None
+        or parsed_url.scheme not in ("http", "https")
+        or not parsed_url.netloc
+        or parsed_url.hostname is None
+        or parsed_url.query
+        or parsed_url.fragment
+        or "?" in url
+        or "#" in url
+    ):
+        # Do not echo an invalid value: it may still contain basic-auth
+        # credentials even though it cannot be used as an endpoint.
+        raise CollectUsageError("--prom-url must be an http(s) URL with a host")
+    since = str(values["since"])
+    if prometheus_duration_seconds(since) is None:
+        raise CollectUsageError(
+            f"--since must be N/Ns/Nm/Nh/Nd/Nw when using --prom-url: {since}"
+        )
+    step = str(values["prom_step"])
+    if step and PROMETHEUS_STEP.fullmatch(step) is None:
+        raise CollectUsageError(f"invalid --prom-step (positive seconds): {step}")
+    budget = str(values["prom_timeout"])
+    if PROMETHEUS_BUDGET.fullmatch(budget) is None:
+        raise CollectUsageError(f"invalid --prom-timeout (seconds): {budget}")
+    values["prom_timeout"] = int(budget)
 
 
 def _validated_ssh_target(value: str, message: str) -> str:
@@ -341,6 +410,7 @@ def _collect(arguments: Sequence[str]) -> int:
         ceph_seed = str(options.get("seed") or node.seed)
         kube_mode = str(options.get("kube_mode") or "")
         kube_context = str(options.get("kube_context") or "")
+        prom_url = str(options["prom_url"])
     except CollectUsageError as error:
         print(f"FATAL: {error}", file=sys.stderr)
         print(USAGE, file=sys.stderr)
@@ -365,7 +435,11 @@ def _collect(arguments: Sequence[str]) -> int:
     try:
         collected_layers = [
             layer
-            for layer, enabled in (("ceph", bool(ceph_seed)), ("rook", bool(kube_mode)))
+            for layer, enabled in (
+                ("ceph", bool(ceph_seed)),
+                ("rook", bool(kube_mode)),
+                ("prometheus", bool(prom_url)),
+            )
             if enabled
         ]
         _write_initial_bundle_files(workdir, collected=collected_layers)
@@ -404,6 +478,22 @@ def _collect(arguments: Sequence[str]) -> int:
             if rook_status != 0:
                 with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
                     errors.write(f"rook collection exited {rook_status}\n")
+        prometheus: PrometheusCollectionResult | None = None
+        if prom_url:
+            prometheus = collect_prometheus_cluster(
+                workdir=workdir,
+                url=prom_url,
+                since=str(options["since"]),
+                job_regex=str(options["prom_job_regex"]),
+                step=str(options["prom_step"]),
+                command_timeout=int(options["timeout"]),
+                budget=int(options["prom_timeout"]),
+            )
+            if prometheus.exit_code != 0:
+                with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
+                    errors.write(
+                        f"prometheus collection exited {prometheus.exit_code}\n"
+                    )
         node_source = (Path(__file__).resolve().parent / "ceph_incident_node.py").read_bytes()
         result = collect_single_node(
             workspace=workdir,
@@ -426,13 +516,22 @@ def _collect(arguments: Sequence[str]) -> int:
                 errors.write(f"node {host_alias} ({target}): {result.reason}\n")
         if known_hosts is not None:
             known_hosts.unlink(missing_ok=True)
+        prometheus_status = prometheus.exit_code if prometheus is not None else None
         exit_code = (
-            2 if (result.exit_code != 0 or cluster_status or rook_status) else 0
+            2
+            if (
+                result.exit_code != 0
+                or cluster_status
+                or rook_status
+                or prometheus_status
+            )
+            else 0
         )
         created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         slices = [
             *(["direct-ceph"] if ceph_seed else []),
             *(["rook"] if kube_mode else []),
+            *(["prometheus"] if prom_url else []),
             "node",
         ]
         environment = [
@@ -462,6 +561,15 @@ def _collect(arguments: Sequence[str]) -> int:
             if kube_context:
                 environment.append(f"kube_context={kube_context}")
             summary.append(f"rook_status={rook_status}")
+        if prometheus is not None:
+            if prometheus.dump_completed:
+                environment.extend(
+                    [
+                        f"prom_url={prometheus.masked_url}",
+                        f"prom_jobs={' '.join(prometheus.jobs_matched) or '<none>'}",
+                    ]
+                )
+            summary.append(f"prometheus_status={prometheus.exit_code}")
         summary.append(f"final_status={exit_code}")
         (workdir / "environment.txt").write_text(
             "".join(f"{line}\n" for line in environment), encoding="utf-8"
