@@ -164,22 +164,23 @@ op-lookup-fail；容忍前置 `--context CTX`）；inline 假 `ssh`（記 `FAKE_
 |---|---|---|---|---|
 | P1 | duration 解析：`90/45s/30m/24h/7d/2w` 正確換算；拒絕 `yesterday`、`5x`、空字串、`0`、`000`；前導零視為十進位（`010h`→36000、`008`→8，不 octal 崩潰） | 純函式 | 42–56 | 【功能等價-必移植】CLI 輸入契約 |
 | P2 | auto step：15s 下限；7d → ceil(604800/10000)=61 | 純函式 | 58–62 | 【功能等價-必移植】 |
-| P3 | URL 遮蔽：`http://u:sekrit@h` → `u:***@h`；無憑證原樣 | 純函式 | 64–67 | 【功能等價-必移植】（記錄用 URL 不洩密） |
-| P4 | 前置指令檢查：缺 python3 時失敗並點名 python3 | 縮限 PATH 只留 curl | 69–77 | 【實作細節-不移植】Python 化後 python3 即執行期 |
-| P5 | Happy path：buildinfo.json、targets.json、dump-info.txt、各 job 目錄 index.txt＋`<metric>.json.gz`；不符 regex 的 job（grafana）不建目錄；24h → `step=15`；dump-info 記錄 window 起迄相差 86400s；manifest 4 行（buildinfo/targets/2 jobs）；environment.txt 記 `prom_url`、`prom_jobs` | fixture curl 預設回應；`FAKE_CURL_LOG` | 79–106 | 【功能等價-必移植】 |
-| P6 | Prometheus 連不上 → 回 2、`SKIPPED.txt`（not reachable）、errors.log 記 skip | `FAKE_CURL_DOWN=1`（curl exit 7） | 108–114 | 【功能等價-必移植】 |
-| P7 | `--job-regex` 全不匹配 → 回 2；SKIPPED 說明 no scrape job matched 並列出看到的 job | 預設 jobs 回應 | 116–122 | 【功能等價-必移植】 |
-| P8 | 缺 python3（進入收集後）→ 回 2、SKIPPED 點名 python3 | 縮限 PATH（留 mkdir/date/dirname/curl） | 124–142 | 【實作細節-不移植】同 P4 |
-| P9 | 單一 metric query_range 失敗 → 回 2；其他 metric 照常 dump；失敗 metric **不留** .json.gz；index.txt 記 failed、errors.log 記錄 | `FAKE_CURL_FAIL_METRICS='ceph_osd_up'` | 144–153 | 【功能等價-必移植】 |
-| P10 | `--budget 0` 觸發截斷 → 回 2；index.txt 記 TRUNCATED、dump-info 記 `truncated=1`、errors.log 記錄 | 參數 | 155–162 | 【功能等價-必移植】 |
-| P11 | job 名含不安全字元（`"`）→ 回 2；errors.log 記 unsafe name；安全 job 照常收集 | `FAKE_CURL_JOBS_JSON` 覆寫 jobs 回應 | 164–171 | 【功能等價-必移植】路徑安全 |
-| P12 | 7d window → `step=61` | `FAKE_CURL_LOG` | 173–178 | 【功能等價-必移植】 |
-| P13 | redaction 排除 `cluster/prometheus/<job>/` 的 metric dump（gz 內容不動），但 dump-info.txt 仍要遮蔽；且排除規則有錨定——`nodes/.../cluster/prometheus/...` 相似路徑**仍要**遮蔽 | 手工佈局＋`redact_bundle_text` | 180–199 | 【功能等價-必移植】 |
-| P14 | targets 抓取失敗 → 回 2；不留 targets.json；buildinfo 與 metric dump 照常；errors.log 記 targets fetch failed | `FAKE_CURL_FAIL_PATHS='/api/v1/targets'`（curl exit 22、先寫入 partial 再失敗） | 201–211 | 【功能等價-必移植】 |
-| P15 | job 列表抓取失敗 → 回 2、SKIPPED 說 job listing failed | `FAKE_CURL_FAIL_PATHS='/api/v1/label/job/values'` | 213–219 | 【功能等價-必移植】 |
-| P16 | metric 名稱列表失敗 → 回 2；index.txt 記 FAILED: metric listing、errors.log 記錄 | `FAKE_CURL_FAIL_PATHS='/api/v1/label/__name__/values'` | 221–229 | 【功能等價-必移植】 |
-| P17 | `--url` 尾端斜線 → 請求 URL 不得出現 `//api` 雙斜線 | `FAKE_CURL_LOG` | 231–243 | 【功能等價-必移植】 |
-| P18 | `--job-regex '-zzz'`（dash 開頭）→ 回 2 且不得把 regex 當成 grep 選項（stderr 無 `grep:`） | 捕捉 stderr | 245–250 | 【功能等價-必移植】行為部分（rc 語意）；`grep:` 措辭斷言本身屬 shell 細節，Python `re` 天然無此坑 |
+| P3 | URL 遮蔽：`http://u:sekrit@h` → `u:***@h`；無憑證原樣 | 純函式 | 64–68 | 【功能等價-必移植】（記錄用 URL 不洩密） |
+| P4 | 前置指令檢查：缺 python3 時失敗並點名 python3 | 縮限 PATH 只留 curl | 70–78 | 【實作細節-不移植】Python 化後 python3 即執行期 |
+| P5 | Happy path：buildinfo.json、targets.json、dump-info.txt、各 job 目錄 index.txt＋`<metric>.json.gz`；不符 regex 的 job（grafana）不建目錄；24h → `step=15`；dump-info 記錄 window 起迄相差 86400s；manifest 4 行（buildinfo/targets/2 jobs）；environment.txt 記 `prom_url`、`prom_jobs` | fixture curl 預設回應；`FAKE_CURL_LOG` | 80–107 | 【功能等價-必移植】 |
+| P6 | Prometheus 連不上 → 回 2、`SKIPPED.txt`（not reachable）、errors.log 記 skip | `FAKE_CURL_DOWN=1`（curl exit 7） | 109–116 | 【功能等價-必移植】 |
+| P6a | curl 失敗診斷即使回顯含 basic-auth 的完整 URL，也不得把密碼寫入 bundle；SKIPPED 只留遮蔽 URL | `FAKE_CURL_DOWN=1`＋`FAKE_CURL_ECHO_URL_ON_ERROR=1`＋密碼含 `@` | 118–129 | 【功能等價-必移植】憑證邊界 |
+| P7 | `--job-regex` 全不匹配 → 回 2；SKIPPED 說明 no scrape job matched 並列出看到的 job | 預設 jobs 回應 | 131–137 | 【功能等價-必移植】 |
+| P8 | 缺 python3（進入收集後）→ 回 2、SKIPPED 點名 python3 | 縮限 PATH（留 mkdir/date/dirname/curl） | 139–157 | 【實作細節-不移植】同 P4 |
+| P9 | 單一 metric query_range 失敗 → 回 2；其他 metric 照常 dump；失敗 metric **不留** .json.gz；index.txt 記 failed、errors.log 記錄 | `FAKE_CURL_FAIL_METRICS='ceph_osd_up'` | 159–168 | 【功能等價-必移植】 |
+| P10 | `--budget 0` 觸發截斷 → 回 2；index.txt 記 TRUNCATED、dump-info 記 `truncated=1`、errors.log 記錄 | 參數 | 170–177 | 【功能等價-必移植】 |
+| P11 | job 名含不安全字元（`"`）→ 回 2；errors.log 記 unsafe name；安全 job 照常收集 | `FAKE_CURL_JOBS_JSON` 覆寫 jobs 回應 | 179–186 | 【功能等價-必移植】路徑安全 |
+| P12 | 7d window → `step=61` | `FAKE_CURL_LOG` | 188–193 | 【功能等價-必移植】 |
+| P13 | redaction 排除 `cluster/prometheus/<job>/` 的 metric dump（gz 內容不動），但 dump-info.txt 仍要遮蔽；且排除規則有錨定——`nodes/.../cluster/prometheus/...` 相似路徑**仍要**遮蔽 | 手工佈局＋`redact_bundle_text` | 195–214 | 【功能等價-必移植】 |
+| P14 | targets 抓取失敗 → 回 2；不留 targets.json；buildinfo 與 metric dump 照常；errors.log 記 targets fetch failed | `FAKE_CURL_FAIL_PATHS='/api/v1/targets'`（curl exit 22、先寫入 partial 再失敗） | 216–226 | 【功能等價-必移植】 |
+| P15 | job 列表抓取失敗 → 回 2、SKIPPED 說 job listing failed | `FAKE_CURL_FAIL_PATHS='/api/v1/label/job/values'` | 228–234 | 【功能等價-必移植】 |
+| P16 | metric 名稱列表失敗 → 回 2；index.txt 記 FAILED: metric listing、errors.log 記錄 | `FAKE_CURL_FAIL_PATHS='/api/v1/label/__name__/values'` | 236–244 | 【功能等價-必移植】 |
+| P17 | `--url` 尾端斜線 → 請求 URL 不得出現 `//api` 雙斜線 | `FAKE_CURL_LOG` | 246–258 | 【功能等價-必移植】 |
+| P18 | `--job-regex '-zzz'`（dash 開頭）→ 回 2 且不得把 regex 當成 grep 選項（stderr 無 `grep:`） | 捕捉 stderr | 260–265 | 【功能等價-必移植】行為部分（rc 語意）；`grep:` 措辭斷言本身屬 shell 細節，Python `grep -E` 保留此邊界 |
 
 ## 8. `tests/test-verify-bundle.sh`（verify-bundle.sh）
 
@@ -281,19 +282,24 @@ match」分派，模擬透過 ssh 在遠端跑 `ceph ...` 的回應。
 
 ### 10.2 `tests/fixtures/bin/curl`（假 Prometheus HTTP）
 
-檔案：`tests/fixtures/bin/curl`（1–94 行）。模擬 `prom_curl` 產生的 argv 形狀：
-`curl -fsS -G --connect-timeout T --max-time T -o OUT URL [--data-urlencode P]...`；
-自行解析出 `-o` 輸出檔、URL 與 `--data-urlencode` 參數（行 15–29）。
+檔案：`tests/fixtures/bin/curl`（1–147 行）。模擬 `prom_curl` 產生的 argv 形狀：
+`curl -q -fsS -G --connect-timeout T --max-time T -o OUT URL [--data-urlencode P]...`；
+自行解析出 `-o` 輸出檔、URL 與 `--data-urlencode` 參數（行 25–53）。
 
 環境變數介面：
 
 | 變數 | 行為 |
 |---|---|
-| `FAKE_CURL_LOG`（必填） | 每次呼叫 append argv 一行（行 13）。測試靠它斷言 step 參數、URL 無雙斜線等。 |
-| `FAKE_CURL_DOWN=1` | 所有請求模擬連線失敗：stderr `curl: (7) ...`、**exit 7**（行 31–34）。 |
-| `FAKE_CURL_FAIL_PATHS` | 空白分隔的 URL substring 清單；匹配的請求先把 `partial` 寫進 `-o` 輸出檔（仿真 curl 先 truncate 再失敗），stderr `curl: (22) ... 500`、**exit 22**（行 36–45）。用來測「失敗請求不得留下殘檔」。 |
-| `FAKE_CURL_FAIL_METRICS` | 空白分隔 metric 名清單；只讓對應 metric 的 `query_range` 回 500 / exit 22（行 80–85）。 |
-| `FAKE_CURL_JOBS_JSON` | 覆寫 `/api/v1/label/job/values` 回應本體（行 61–67）。用來注入不安全 job 名。 |
+| `FAKE_CURL_LOG`（必填） | 每次呼叫 append 人類可讀 argv 一行（行 19）。shell 測試靠它斷言 step 參數、URL 無雙斜線等。 |
+| `FAKE_CURL_ARGV_LOG` | 選用的 NUL-delimited lossless argv ledger（行 20–23）；Python 黑箱測試靠它精確保留含空白參數的 argument boundary。 |
+| `FAKE_CURL_DOWN=1` | 所有請求模擬連線失敗：stderr `curl: (7) ...`、**exit 7**（行 55–62）。 |
+| `FAKE_CURL_FAIL_PATHS` | 空白分隔的 URL substring 清單；匹配的請求先把 `partial` 寫進 `-o` 輸出檔（仿真 curl 先 truncate 再失敗），stderr `curl: (22) ... 500`、**exit 22**（行 64–73）。用來測「失敗請求不得留下殘檔」。 |
+| `FAKE_CURL_ECHO_URL_ON_ERROR` | 搭配 `FAKE_CURL_DOWN=1`，讓 fake curl 在 stderr 回顯完整 request URL；用來證明外部工具即使回顯含 basic-auth 的 URL，collector 也會在寫入 bundle 前遮蔽密碼。 |
+| `FAKE_CURL_FAIL_METRICS` | 空白分隔 metric 名清單；只讓對應 metric 的 `query_range` 回 500 / exit 22（行 129–137）。 |
+| `FAKE_CURL_JOBS_JSON` | 覆寫 `/api/v1/label/job/values` 回應本體（行 110–116）。用來注入不安全 job 名。 |
+| `FAKE_CURL_TIMEOUT_PATHS` | 空白分隔的 URL substring 清單；匹配的請求模擬 curl 自己觸發 `--max-time`：輸出檔清空、stderr `curl: (28) Operation timed out`、**exit 28**。Python Prometheus slice（#15）用它覆蓋 timeout 情境。 |
+| `FAKE_CURL_MALFORMED_PATHS` | 空白分隔的 URL substring 清單；匹配的請求以 **exit 0** 回一段非 Prometheus JSON 的本體（如 proxy error page）。用來覆蓋 malformed response 情境。 |
+| `FAKE_CURL_NAMES_JSON` | 覆寫 `/api/v1/label/__name__/values` 回應本體（行 117–121）。用來注入不安全、非字串或含 `:` 的 metric 名。 |
 
 端點回應（寫進 `-o` 指定檔）：
 
@@ -303,8 +309,14 @@ match」分派，模擬透過 ssh 在遠端跑 `ceph ...` 的回應。
 - `/api/v1/label/__name__/values`：依 `match[]` 參數中的 `job="..."` 回
   ceph→`[ceph_health_status, ceph_osd_up]`、node-exporter→`[node_load1]`、其他→空。
 - `/api/v1/query_range`：從 `query` 參數摳出 `__name__="..."`，回一筆 matrix，
-  時間戳用 `start` 參數（行 76–89）。
+  時間戳用 `start` 參數（行 129–142）。
 - 其他 URL：**exit 99**（白名單設計，同 ssh fixture）。
+
+Python Prometheus 黑箱案例另外把 `tests/fixtures/python-prometheus/bin/grep` 放在
+`PATH` 最前面。這個 adapter 只接受完整 argv `grep -qiE -- PATTERN`，將每次呼叫
+寫進 `FAKE_GREP_LOG`，再轉交系統 grep 執行；任何額外 option 或不同 argv 形狀都
+會 exit 99。這同時證明 collector 沒有擴張外部命令 surface，且 job filter 保留
+shell `grep -E` 的 POSIX ERE 語意。
 
 ### 10.3 Collect 共用 fixture 與各測試檔的 inline 假指令
 

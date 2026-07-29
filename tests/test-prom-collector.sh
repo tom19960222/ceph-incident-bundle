@@ -63,6 +63,7 @@ test_auto_step() {
 
 test_mask_url() {
   [[ "$(prom_mask_url 'http://u:sekrit@h:9090')" == 'http://u:***@h:9090' ]] || fail "credentials should be masked"
+  [[ "$(prom_mask_url 'http://u:s3cr@t-piece@h:9090')" == 'http://u:***@h:9090' ]] || fail "password containing @ should be fully masked"
   [[ "$(prom_mask_url 'http://h:9090/sub')" == 'http://h:9090/sub' ]] || fail "no-credential URL should pass through"
 }
 
@@ -107,10 +108,24 @@ test_happy_path() {
 
 test_unreachable() {
   local wd="$tmpdir/wd-down" rc=0
+  # shellcheck disable=SC2030,SC2031 # export intentionally scoped to subshell
   ( export FAKE_CURL_DOWN=1; run_prom "$wd" --since 24h ) || rc=$?
   [[ "$rc" == "2" ]] || fail "unreachable prometheus should return 2, got $rc"
   grep -qF 'not reachable' "$wd/cluster/prometheus/SKIPPED.txt" || fail "SKIPPED should say not reachable"
   grep -qF 'prometheus' "$wd/errors.log" || fail "errors.log should record the skip"
+}
+
+test_unreachable_masks_curl_diagnostics() {
+  local wd="$tmpdir/wd-down-secret" rc=0
+  # shellcheck disable=SC2030,SC2031 # exports intentionally scoped to subshell
+  (
+    export FAKE_CURL_DOWN=1 FAKE_CURL_ECHO_URL_ON_ERROR=1
+    run_prom "$wd" --url 'http://reader:s3cr@t-piece@prom.example:9090' --since 24h
+  ) || rc=$?
+  [[ "$rc" == "2" ]] || fail "credential failure should return 2, got $rc"
+  ! grep -R -F 's3cr@t-piece' "$wd" || fail "curl diagnostics leaked credentials"
+  grep -qF 'http://reader:***@prom.example:9090' "$wd/cluster/prometheus/SKIPPED.txt" \
+    || fail "SKIPPED should contain the masked URL"
 }
 
 test_no_matching_jobs() {
@@ -255,6 +270,7 @@ test_mask_url
 test_require_cmds
 test_happy_path
 test_unreachable
+test_unreachable_masks_curl_diagnostics
 test_no_matching_jobs
 test_missing_python3
 test_single_metric_failure

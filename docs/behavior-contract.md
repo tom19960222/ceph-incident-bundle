@@ -532,22 +532,22 @@ redaction 之後（redaction 可能改變大小）對每台 node 重算 `merged/
 
 ---
 
-## 15. Prometheus collector（lib/collect-prometheus.sh:123-327）
+## 15. Prometheus collector（lib/collect-prometheus.sh:1-356）
 
-前置：URL 去尾端 `/`；`--since` 須可解析為秒（`N[smhdw]?`，0 拒絕）否則 return 1；工作機須有 `curl` 與 `python3`，缺 → `cluster/prometheus/SKIPPED.txt`（`<cmd> not found on this workstation`）+ errors.log、return 2（:143-157）。時間窗 = `[now-window, now]`（epoch）；step 未給 → `max(15, ceil(window/10000))`；預算 deadline = `SECONDS + budget`（:160-163）。
+前置：URL 去尾端 `/`；`--since` 須可解析為秒（`N[smhdw]?`，0 拒絕）否則 return 1；工作機須有 `curl` 與 `python3`，缺 → `cluster/prometheus/SKIPPED.txt`（`<cmd> not found on this workstation`）+ errors.log、return 2（:167-188）。時間窗 = `[now-window, now]`（epoch）；step 未給 → `max(15, ceil(window/10000))`；預算 deadline = `SECONDS + budget`。
 
-URL 中 `user:pass@` 在寫入任何 artifact/錯誤訊息前遮蔽為 `user:***@`（:51-60）。curl 統一 `curl -fsS -G --connect-timeout T --max-time T -o FILE`，額外參數走 `--data-urlencode`（:82-92）。原始 JSON 直接由 curl 寫檔（**不經 run_capture**，避免 header 汙染 JSON），manifest 由本 collector 自行 `manifest_add`（host=`prometheus`，command 記 `GET <masked-url>/...`）。
+URL 中 `user:pass@` 在寫入任何 artifact/錯誤訊息前遮蔽為 `user:***@`，外部 curl 診斷也會先替換完整 raw base（:50-81）。curl 統一 `curl -q -fsS -G --connect-timeout T --max-time T -o FILE`，其中置首的 `-q` 禁止工作機 `.curlrc` 改寫 GET-only command surface，額外參數走 `--data-urlencode`（:101-117）。原始 JSON 直接由 curl 寫檔（**不經 run_capture**，避免 header 汙染 JSON），manifest 由本 collector 自行 `manifest_add`（host=`prometheus`，command 記 `GET <masked-url>/...`）。
 
 流程：
 
-1. `GET /api/v1/status/buildinfo` → `buildinfo.json`；失敗（兼作連通性探測）→ 刪檔、SKIPPED（`prometheus not reachable: <masked> (curl exit N: detail)`）、return 2（:171-180）。
-2. `GET /api/v1/targets` → `targets.json`；失敗只記 errors.log + failed=1（照樣繼續）（:182-191）。
-3. `GET /api/v1/label/job/values` 列 scrape jobs；失敗或 JSON 非 `status=success` → SKIPPED（`prometheus job listing failed ...`）、return 2。job 名過 `grep -qiE <job_regex>` 過濾；名字含 `"` 或 `\` → 記 `prometheus job skipped (unsafe name)`、failed=1、跳過；沒半個 match → SKIPPED（`no scrape job matched regex '<re>' (jobs seen: ...)`）、return 2（:196-228）。
+1. `GET /api/v1/status/buildinfo` → `buildinfo.json`；失敗（兼作連通性探測）→ 刪檔、SKIPPED（`prometheus not reachable: <masked> (curl exit N: detail)`）、return 2（:195-205）。
+2. `GET /api/v1/targets` → `targets.json`；失敗只記 errors.log + failed=1（照樣繼續）（:207-216）。
+3. `GET /api/v1/label/job/values` 列 scrape jobs；失敗或 JSON 非 `status=success` → SKIPPED（`prometheus job listing failed ...`）、return 2。job 名過 `grep -qiE <job_regex>` 過濾；名字含 `"` 或 `\` → 記 `prometheus job skipped (unsafe name)`、failed=1、跳過；沒半個 match → SKIPPED（`no scrape job matched regex '<re>' (jobs seen: ...)`）、return 2（:218-253）。
 4. 每個 matched job（目錄名 = safe 化 job 名）：
-   - `GET /api/v1/label/__name__/values match[]={job="<job>"} start end` 列 metrics；失敗 → job 的 `index.txt` 記 `FAILED: metric listing for job <job>`、manifest exit 2、跳下一個 job（:245-257）。
-   - 每個 metric：超過預算 → `index.txt` 記 `TRUNCATED: budget <s>s exceeded`、整個 dump 停止（:265-272）；metric 名不符 `^[a-zA-Z_:][a-zA-Z0-9_:]*$` → `skipped <m> unsafe-name`（:273-279）；否則 `GET /api/v1/query_range query={__name__="<m>",job="<j>"} start end step` 存 `<jobdir>/<metric（: 換成 __）>.json`，成功判定 = curl 0 且檔案前 512 bytes 含 `"status":"success"`；成功 → `gzip -f` 成 `.json.gz`、index 記 `ok <m> <file>.gz`；失敗 → 刪檔、index 記 `failed <m> -`（:281-296）。
+   - `GET /api/v1/label/__name__/values match[]={job="<job>"} start end` 列 metrics；失敗 → job 的 `index.txt` 記 `FAILED: metric listing for job <job>`、manifest exit 2、跳下一個 job（:270-283）。
+   - 每個 metric：超過預算 → `index.txt` 記 `TRUNCATED: budget <s>s exceeded`、整個 dump 停止（:288-297）；metric 名不符 `^[a-zA-Z_:][a-zA-Z0-9_:]*$` → `skipped <m> unsafe-name`（:298-304）；否則 `GET /api/v1/query_range query={__name__="<m>",job="<j>"} start end step` 存 `<jobdir>/<metric（: 換成 __）>.json`，成功判定 = curl 0 且檔案前 512 bytes 含 `"status":"success"`；成功 → `gzip -f` 成 `.json.gz`、index 記 `ok <m> <file>.gz`；失敗 → 刪檔、index 記 `failed <m> -`（:305-321）。
    - 每個 job 的 index.txt 也 manifest_add 一筆（帶 job_rc）。
-5. 寫 `dump-info.txt`（url/since/window start・end epoch+UTC/step_seconds/job_regex/jobs_seen/jobs_matched/metrics_ok/metrics_failed/truncated；:304-318），並 append `prom_url=`、`prom_jobs=` 到 `environment.txt`（:320-323）。
+5. 寫 `dump-info.txt`（url/since/window start・end epoch+UTC/step_seconds/job_regex/jobs_seen/jobs_matched/metrics_ok/metrics_failed/truncated；:329-343），並 append `prom_url=`、`prom_jobs=` 到 `environment.txt`（:345-348）。
 6. 有任何 failed → return 2，否則 0。
 
 ---

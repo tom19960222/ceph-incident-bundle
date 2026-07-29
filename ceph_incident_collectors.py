@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import uuid
 import zlib
 from collections.abc import Sequence
@@ -99,6 +101,47 @@ EMPTY_CRASH_LISTS = frozenset(
         '{"crash_ls":[]}',
     )
 )
+PROMETHEUS_COLLECTOR = "collect-prometheus"
+# The manifest host column for metrics evidence: it belongs to the Prometheus
+# server, not to the workstation that ran curl against it.
+PROMETHEUS_HOST = "prometheus"
+PROMETHEUS_DEFAULT_JOB_REGEX = "ceph|node"
+PROMETHEUS_DEFAULT_BUDGET_SECONDS = 600
+# The --since grammar the metrics dump accepts: N seconds, or N{s,m,h,d,w}.
+PROMETHEUS_DURATION = re.compile(r"([0-9]+)([smhdw]?)\Z")
+PROMETHEUS_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+# Prometheus refuses a query_range with more than 11,000 points per series, so
+# the auto step keeps every series under 10,000 points but never below 15s.
+PROMETHEUS_MAX_POINTS = 10000
+PROMETHEUS_MIN_STEP_SECONDS = 15
+# curl bounds each request with --max-time; this grace period only stops a
+# transport that ignored its own deadline from hanging the whole collect.
+PROMETHEUS_TRANSPORT_GRACE_SECONDS = 5
+PROMETHEUS_FILTER_TIMEOUT_SECONDS = 5
+PROMETHEUS_COMPONENT_MAX_LENGTH = 200
+# Server-controlled job labels share this directory with collector-owned files.
+# Reserve the full namespace up front, using the same case-folding as untrusted
+# components so behavior is safe on both case-sensitive and insensitive hosts.
+PROMETHEUS_RESERVED_TOP_LEVEL_COMPONENTS = frozenset(
+    name.casefold()
+    for name in (
+        ".jobs.json",
+        "buildinfo.json",
+        "targets.json",
+        "dump-info.txt",
+        "SKIPPED.txt",
+    )
+)
+# A metric name read back from the server becomes both a PromQL matcher and an
+# artifact filename, so anything outside Prometheus's own grammar is skipped.
+SAFE_METRIC_NAME = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*\Z")
+# A job name is interpolated into a PromQL matcher string; a quote or backslash
+# would escape it, so such a job is recorded and skipped instead.
+UNSAFE_JOB_CHARACTERS = ('"', "\\")
+# curl writes the raw JSON itself, so a success is confirmed from the response
+# body rather than from a capture header the collector would have to add.
+PROMETHEUS_SUCCESS_MARKER = b'"status":"success"'
+PROMETHEUS_SUCCESS_PROBE_BYTES = 512
 REMOTE_BOOTSTRAP = """\
 import sys
 if sys.version_info < (3, 11):
@@ -472,6 +515,10 @@ def _ssh_command(
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _epoch_utc(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _exit_code_of(returncode: int) -> int:
@@ -987,6 +1034,494 @@ def collect_rook_cluster(
     )
     _write_skip_artifact(rook_dir / "toolbox-SKIPPED.txt", ROOK_TOOLBOX_SKIP_REASON)
     return 2 if failed else 0
+
+
+@dataclass(frozen=True)
+class PrometheusCollectionResult:
+    exit_code: int
+    masked_url: str
+    jobs_matched: tuple[str, ...]
+    # False when the layer was skipped before any metric could be dumped, so
+    # the caller records the dump in environment.txt only once one happened.
+    dump_completed: bool = False
+
+
+def prometheus_duration_seconds(value: str) -> int | None:
+    """Parse the --since grammar into seconds, or None when it is unusable."""
+
+    match = PROMETHEUS_DURATION.fullmatch(value)
+    if match is None:
+        return None
+    # Base 10 explicitly: a pasted 008 is eight seconds, not an octal error.
+    amount = int(match.group(1), 10)
+    if amount <= 0:
+        return None
+    return amount * PROMETHEUS_DURATION_UNITS[match.group(2)]
+
+
+def mask_prometheus_url(url: str) -> str:
+    """Replace an embedded basic-auth password with *** for artifact use."""
+
+    match = re.match(r"([A-Za-z][A-Za-z0-9+.-]*://)", url)
+    if match is None:
+        return url
+    authority_start = match.end()
+    authority_end = len(url)
+    for delimiter in ("/", "?", "#"):
+        position = url.find(delimiter, authority_start)
+        if position >= 0:
+            authority_end = min(authority_end, position)
+    credentials_end = url.rfind("@", authority_start, authority_end)
+    if credentials_end < 0:
+        return url
+    credentials = url[authority_start:credentials_end]
+    username = credentials.split(":", 1)[0]
+    return f"{url[:authority_start]}{username}:***@{url[credentials_end + 1:]}"
+
+
+def _prometheus_auto_step(window: int) -> int:
+    step = -(-window // PROMETHEUS_MAX_POINTS)
+    return max(step, PROMETHEUS_MIN_STEP_SECONDS)
+
+
+def _prometheus_job_matches(pattern: str, job: str) -> bool:
+    """Apply the public job filter with the shell contract's POSIX ERE dialect."""
+
+    try:
+        completed = subprocess.run(
+            ["grep", "-qiE", "--", pattern],
+            input=job.encode("utf-8"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=PROMETHEUS_FILTER_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        return False
+    return completed.returncode == 0
+
+
+def _reserve_prometheus_component(
+    *, identity: str, candidate: str, fallback: str, used: set[str]
+) -> str:
+    """Reserve a safe, collision-free component for one untrusted label value."""
+
+    base = _artifact_component(candidate, fallback)[:PROMETHEUS_COMPONENT_MAX_LENGTH]
+    if base in (".", ".."):
+        base = fallback
+    collision_key = base.casefold()
+    if collision_key not in used:
+        used.add(collision_key)
+        return base
+
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    suffix = f"--{digest}"
+    shortened = base[: PROMETHEUS_COMPONENT_MAX_LENGTH - len(suffix)]
+    reserved = f"{shortened}{suffix}"
+    ordinal = 2
+    while reserved.casefold() in used:
+        numbered_suffix = f"{suffix}-{ordinal}"
+        shortened = base[: PROMETHEUS_COMPONENT_MAX_LENGTH - len(numbered_suffix)]
+        reserved = f"{shortened}{numbered_suffix}"
+        ordinal += 1
+    used.add(reserved.casefold())
+    return reserved
+
+
+def _prometheus_display_label(value: str) -> str:
+    """Escape control characters before an untrusted label enters text evidence."""
+
+    return value.encode("unicode_escape").decode("ascii")
+
+
+def _prometheus_job_is_safe(job: str) -> bool:
+    return not any(character in job for character in UNSAFE_JOB_CHARACTERS) and not any(
+        ord(character) < 32 or ord(character) == 127 for character in job
+    )
+
+
+def _prometheus_get(
+    *,
+    url: str,
+    path: str,
+    artifact: Path,
+    timeout: int,
+    parameters: Sequence[str] = (),
+) -> tuple[int, str]:
+    """GET one Prometheus endpoint straight into an artifact file.
+
+    curl writes the response body itself so no capture header can corrupt the
+    JSON, and every query parameter goes through --data-urlencode so a PromQL
+    matcher never needs manual encoding.  Returns curl's exit code and its
+    merged diagnostics.
+    """
+
+    command = [
+        "curl",
+        "-q",
+        "-fsS",
+        "-G",
+        "--connect-timeout",
+        str(timeout),
+        "--max-time",
+        str(timeout),
+        "-o",
+        str(artifact),
+        f"{url}{path}",
+    ]
+    for parameter in parameters:
+        command.extend(["--data-urlencode", parameter])
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout + PROMETHEUS_TRANSPORT_GRACE_SECONDS,
+            check=False,
+        )
+    except FileNotFoundError:
+        return 127, f"{command[0]}: command not found"
+    except subprocess.TimeoutExpired:
+        return 124, f"curl exceeded its local time budget of {timeout}s"
+    detail = _compact_error(completed.stdout.decode("utf-8", errors="replace"))
+    # curl normally omits credentials from diagnostics, but the collector must
+    # not trust an external command to preserve the bundle's secret boundary.
+    # Replace the exact request base before any caller can persist stderr.
+    detail = detail.replace(url, mask_prometheus_url(url))
+    return (
+        _exit_code_of(completed.returncode),
+        detail,
+    )
+
+
+def _prometheus_data_values(artifact: Path) -> list[str] | None:
+    """Read a label-values response's data[] strings, or None if unusable."""
+
+    try:
+        document = json.loads(artifact.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(document, dict) or document.get("status") != "success":
+        return None
+    data = document.get("data", [])
+    if not isinstance(data, list):
+        return None
+    if not all(isinstance(value, str) for value in data):
+        return None
+    return data
+
+
+def _prometheus_response_succeeded(artifact: Path) -> bool:
+    """Confirm a metric dump really is a Prometheus success response."""
+
+    try:
+        with artifact.open("rb") as stream:
+            return PROMETHEUS_SUCCESS_MARKER in stream.read(
+                PROMETHEUS_SUCCESS_PROBE_BYTES
+            )
+    except OSError:
+        return False
+
+
+def collect_prometheus_cluster(
+    *,
+    workdir: Path,
+    url: str,
+    since: str,
+    job_regex: str = PROMETHEUS_DEFAULT_JOB_REGEX,
+    step: str = "",
+    command_timeout: int = 20,
+    budget: int = PROMETHEUS_DEFAULT_BUDGET_SECONDS,
+) -> PrometheusCollectionResult:
+    """Collect metrics evidence over the Prometheus HTTP API with curl.
+
+    Every request is an explicit read-only argv array; the layer dumps each
+    metric of the scrape jobs matching ``job_regex`` over the ``since`` window
+    and returns 0 or the partial status 2, never raising on a server failure.
+    """
+
+    window = prometheus_duration_seconds(since)
+    if window is None:
+        raise ValueError(f"unusable Prometheus window: {since}")
+
+    # Operator-pasted trailing slashes would become //api in every request.
+    url = url.rstrip("/")
+    masked_url = mask_prometheus_url(url)
+    prometheus_dir = workdir / "cluster" / "prometheus"
+    manifest = workdir / "manifest.jsonl"
+    errors_log = workdir / "errors.log"
+
+    def record_error(message: str) -> None:
+        with errors_log.open("a", encoding="utf-8") as stream:
+            stream.write(f"{_utc_now()} {message}\n")
+
+    def skip(reason: str) -> PrometheusCollectionResult:
+        _write_skip_artifact(prometheus_dir / "SKIPPED.txt", reason)
+        record_error(f"prometheus dump skipped: {reason}")
+        return PrometheusCollectionResult(2, masked_url, ())
+
+    # Collecting nothing is a partial layer naming its cause, not a crash on
+    # the first request: the workstation must be able to speak HTTP at all.
+    if shutil.which("curl") is None:
+        return skip("curl not found on this workstation")
+
+    prometheus_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    end_epoch = int(datetime.now(timezone.utc).timestamp())
+    start_epoch = end_epoch - window
+    step_seconds = int(step) if step else _prometheus_auto_step(window)
+    deadline = time.monotonic() + budget
+
+    def add_manifest_entry(
+        artifact: Path, command: str, exit_code: int, started: str, ended: str
+    ) -> None:
+        _append_manifest_entry(
+            manifest,
+            host=PROMETHEUS_HOST,
+            collector=PROMETHEUS_COLLECTOR,
+            artifact=artifact,
+            command=command,
+            exit_code=exit_code,
+            started=started,
+            ended=ended,
+        )
+
+    failed = False
+
+    # buildinfo doubles as the connectivity probe for the whole layer.
+    build_info = prometheus_dir / "buildinfo.json"
+    started = _utc_now()
+    exit_code, detail = _prometheus_get(
+        url=url,
+        path="/api/v1/status/buildinfo",
+        artifact=build_info,
+        timeout=command_timeout,
+    )
+    if exit_code != 0:
+        # curl truncates its output file before failing, so the partial write
+        # must not survive as evidence of a server that never answered.
+        build_info.unlink(missing_ok=True)
+        return skip(
+            f"prometheus not reachable: {masked_url} (curl exit {exit_code}: {detail})"
+        )
+    add_manifest_entry(
+        build_info,
+        f"GET {masked_url}/api/v1/status/buildinfo",
+        exit_code,
+        started,
+        _utc_now(),
+    )
+
+    # Target health is useful context but not a reason to abandon the dump.
+    targets = prometheus_dir / "targets.json"
+    started = _utc_now()
+    exit_code, detail = _prometheus_get(
+        url=url, path="/api/v1/targets", artifact=targets, timeout=command_timeout
+    )
+    if exit_code != 0:
+        targets.unlink(missing_ok=True)
+        record_error(f"prometheus targets fetch failed (curl exit {exit_code}): {detail}")
+        failed = True
+    add_manifest_entry(
+        targets, f"GET {masked_url}/api/v1/targets", exit_code, started, _utc_now()
+    )
+
+    # The user-facing contract is "find metrics by exporter (job) name", so the
+    # filter applies to scrape-job labels rather than to metric names.
+    jobs_artifact = prometheus_dir / ".jobs.json"
+    exit_code, detail = _prometheus_get(
+        url=url,
+        path="/api/v1/label/job/values",
+        artifact=jobs_artifact,
+        timeout=command_timeout,
+    )
+    jobs_seen = _prometheus_data_values(jobs_artifact) if exit_code == 0 else None
+    jobs_artifact.unlink(missing_ok=True)
+    if jobs_seen is None:
+        return skip(
+            f"prometheus job listing failed (curl exit {exit_code}): "
+            f"{detail or 'unparseable JSON'}"
+        )
+    jobs_matched = []
+    for job in jobs_seen:
+        # grep receives the pattern after `--`, preserving the shell's
+        # case-insensitive POSIX ERE semantics without an option injection seam.
+        if not _prometheus_job_matches(job_regex, job):
+            continue
+        if not _prometheus_job_is_safe(job):
+            record_error(
+                "prometheus job skipped (unsafe name): "
+                f"{_prometheus_display_label(job)}"
+            )
+            failed = True
+            continue
+        jobs_matched.append(job)
+    if not jobs_matched:
+        return skip(
+            f"no scrape job matched regex '{job_regex}' "
+            f"(jobs seen: "
+            f"{' '.join(_prometheus_display_label(job) for job in jobs_seen) or '<none>'})"
+        )
+
+    metrics_ok = 0
+    metrics_failed = 0
+    truncated = False
+    used_job_components = set(PROMETHEUS_RESERVED_TOP_LEVEL_COMPONENTS)
+    for job in jobs_matched:
+        if truncated:
+            break
+        job_component = _reserve_prometheus_component(
+            identity=job,
+            candidate=job,
+            fallback="job",
+            used=used_job_components,
+        )
+        job_dir = prometheus_dir / job_component
+        job_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        index = job_dir / "index.txt"
+        index.write_text("", encoding="utf-8")
+        job_exit_code = 0
+        started = _utc_now()
+
+        names_artifact = job_dir / ".names.json"
+        exit_code, detail = _prometheus_get(
+            url=url,
+            path="/api/v1/label/__name__/values",
+            artifact=names_artifact,
+            timeout=command_timeout,
+            parameters=(
+                f'match[]={{job="{job}"}}',
+                f"start={start_epoch}",
+                f"end={end_epoch}",
+            ),
+        )
+        metric_names = (
+            _prometheus_data_values(names_artifact) if exit_code == 0 else None
+        )
+        names_artifact.unlink(missing_ok=True)
+        if metric_names is None:
+            with index.open("a", encoding="utf-8") as index_stream:
+                index_stream.write(f"FAILED: metric listing for job {job}\n")
+            record_error(
+                f"prometheus metric listing failed for job {job} "
+                f"(curl exit {exit_code}): {detail or 'unparseable JSON'}"
+            )
+            failed = True
+            add_manifest_entry(
+                index,
+                f"GET {masked_url}/api/v1/label/__name__/values "
+                f'match[]={{job="{job}"}}',
+                2,
+                started,
+                _utc_now(),
+            )
+            continue
+
+        used_metric_components: set[str] = set()
+        with index.open("a", encoding="utf-8") as index_stream:
+            for metric in metric_names:
+                if time.monotonic() >= deadline:
+                    truncated = True
+                    index_stream.write(f"TRUNCATED: budget {budget}s exceeded\n")
+                    record_error(
+                        f"prometheus dump truncated: budget {budget}s exceeded "
+                        f"at job {job}"
+                    )
+                    job_exit_code = 2
+                    failed = True
+                    break
+                if SAFE_METRIC_NAME.fullmatch(metric) is None:
+                    # Never a query and never a filename: it is only recorded.
+                    display_metric = _prometheus_display_label(metric)
+                    index_stream.write(f"skipped {display_metric} unsafe-name\n")
+                    record_error(
+                        "prometheus metric skipped (unsafe name) "
+                        f"job={job} metric={display_metric}"
+                    )
+                    job_exit_code = 2
+                    failed = True
+                    continue
+                metric_component = _reserve_prometheus_component(
+                    identity=metric,
+                    candidate=metric.replace(":", "__"),
+                    fallback="metric",
+                    used=used_metric_components,
+                )
+                artifact = job_dir / f"{metric_component}.json"
+                exit_code, detail = _prometheus_get(
+                    url=url,
+                    path="/api/v1/query_range",
+                    artifact=artifact,
+                    timeout=command_timeout,
+                    parameters=(
+                        f'query={{__name__="{metric}",job="{job}"}}',
+                        f"start={start_epoch}",
+                        f"end={end_epoch}",
+                        f"step={step_seconds}",
+                    ),
+                )
+                if exit_code != 0 or not _prometheus_response_succeeded(artifact):
+                    artifact.unlink(missing_ok=True)
+                    index_stream.write(f"failed {metric} -\n")
+                    record_error(
+                        f"prometheus query_range failed job={job} metric={metric} "
+                        f"(curl exit {exit_code}): {detail}"
+                    )
+                    metrics_failed += 1
+                    job_exit_code = 2
+                    failed = True
+                    continue
+                compressed = artifact.with_name(f"{artifact.name}.gz")
+                with artifact.open("rb") as source, gzip.open(
+                    compressed, "wb"
+                ) as target:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+                artifact.unlink()
+                index_stream.write(f"ok {metric} {compressed.name}\n")
+                metrics_ok += 1
+
+        add_manifest_entry(
+            index,
+            f"GET {masked_url}/api/v1/query_range "
+            f'query={{__name__="<metric>",job="{job}"}} '
+            f"start={start_epoch} end={end_epoch} step={step_seconds} "
+            f"({len(metric_names)} metrics)",
+            job_exit_code,
+            started,
+            _utc_now(),
+        )
+
+    (prometheus_dir / "dump-info.txt").write_text(
+        "".join(
+            f"{key}={value}\n"
+            for key, value in (
+                ("url", masked_url),
+                ("since", since),
+                ("window_start_epoch", start_epoch),
+                ("window_start_utc", _epoch_utc(start_epoch)),
+                ("window_end_epoch", end_epoch),
+                ("window_end_utc", _epoch_utc(end_epoch)),
+                ("step_seconds", step_seconds),
+                ("job_regex", job_regex),
+                (
+                    "jobs_seen",
+                    " ".join(_prometheus_display_label(job) for job in jobs_seen)
+                    or "<none>",
+                ),
+                (
+                    "jobs_matched",
+                    " ".join(_prometheus_display_label(job) for job in jobs_matched)
+                    or "<none>",
+                ),
+                ("metrics_ok", metrics_ok),
+                ("metrics_failed", metrics_failed),
+                ("truncated", 1 if truncated else 0),
+            )
+        ),
+        encoding="utf-8",
+    )
+    return PrometheusCollectionResult(
+        2 if failed else 0, masked_url, tuple(jobs_matched), dump_completed=True
+    )
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
