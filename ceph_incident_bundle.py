@@ -5,19 +5,314 @@ from __future__ import annotations
 
 import gzip
 import os
+import re
+import shutil
+import signal
+import subprocess
 import sys
 import tarfile
+import tempfile
 import zlib
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
+from ceph_incident_collectors import CollectionInterrupted, collect_single_node
 
-USAGE = "Usage: ceph_incident_bundle.py verify <bundle-dir|bundle.tar.gz>"
+
+USAGE = """Usage:
+  ceph_incident_bundle.py collect --inventory PATH --ssh-key PATH [options]
+  ceph_incident_bundle.py verify <bundle-dir|bundle.tar.gz>"""
 REQUIRED_FILES = ("manifest.jsonl", "summary.txt", "README-FIRST.txt")
+SAFE_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+SAFE_SSH_USER = re.compile(r"[A-Za-z0-9._%+-]+\Z")
+SAFE_SSH_TARGET = re.compile(
+    r"(?:[A-Za-z0-9._%+-]+@)?(?:\[[0-9A-Fa-f:]+\]|[A-Za-z0-9._:-]+)\Z"
+)
+SCALAR_ASSIGNMENT = re.compile(
+    r'\s*(SSH_USER|SEED_HOST|ROOK_NAMESPACE|ROOK_OPERATOR_NAMESPACE)="([^"]*)"\s*(?:#.*)?\Z'
+)
+HOST_ENTRY = re.compile(r'\s*"([^"]+)"\s*(?:#.*)?\Z')
 
 
 class VerificationError(Exception):
     """An incident bundle failed structural verification."""
+
+
+class CollectUsageError(Exception):
+    """The public collect invocation or inventory is invalid."""
+
+
+def _positive_integer(value: str, option: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise CollectUsageError(f"{option} must be a positive integer") from error
+    if parsed <= 0:
+        raise CollectUsageError(f"{option} must be a positive integer")
+    return parsed
+
+
+def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
+    values: dict[str, object] = {
+        "out": Path(__file__).resolve().parent / "results",
+        "timeout": 20,
+        "node_timeout": 300,
+        "trust_ssh_host_key": True,
+    }
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in ("--help", "-h"):
+            values["help"] = True
+            index += 1
+            continue
+        if argument in ("--trust-ssh-host-key", "--no-trust-ssh-host-key"):
+            values["trust_ssh_host_key"] = argument == "--trust-ssh-host-key"
+            index += 1
+            continue
+        option_names = {
+            "--inventory": "inventory",
+            "--ssh-key": "ssh_key",
+            "--out": "out",
+            "--timeout": "timeout",
+            "--node-timeout": "node_timeout",
+        }
+        key = option_names.get(argument)
+        if key is None:
+            raise CollectUsageError(f"unknown collect option: {argument}")
+        if index + 1 >= len(arguments):
+            raise CollectUsageError(f"missing value for {argument}")
+        raw_value = arguments[index + 1]
+        if key in ("inventory", "ssh_key", "out"):
+            values[key] = Path(raw_value)
+        else:
+            values[key] = _positive_integer(raw_value, argument)
+        index += 2
+    if values.get("help"):
+        return values
+    for required in ("inventory", "ssh_key"):
+        if required not in values:
+            raise CollectUsageError(f"missing required option: --{required.replace('_', '-')}")
+    return values
+
+
+def _read_single_node_inventory(path: Path) -> tuple[str, str]:
+    if not path.is_file():
+        raise CollectUsageError(f"missing inventory: {path}")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        raise CollectUsageError(f"cannot read inventory: {path}") from error
+    ssh_user = ""
+    hosts: list[str] = []
+    in_hosts = False
+    hosts_closed = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "$(" in line or "${" in line or "`" in line:
+            raise CollectUsageError("inventory contains forbidden shell expression")
+        if in_hosts:
+            if re.fullmatch(r"\s*\)\s*(?:#.*)?", line):
+                in_hosts = False
+                hosts_closed = True
+                continue
+            match = HOST_ENTRY.fullmatch(line)
+            if match is None:
+                raise CollectUsageError("inventory contains an invalid HOSTS entry")
+            hosts.append(match.group(1))
+            continue
+        if re.fullmatch(r"\s*HOSTS=\(\s*\)\s*(?:#.*)?", line):
+            hosts_closed = True
+            continue
+        if re.fullmatch(r"\s*HOSTS=\(\s*(?:#.*)?", line):
+            if hosts_closed:
+                raise CollectUsageError("inventory contains multiple HOSTS blocks")
+            in_hosts = True
+            continue
+        assignment = SCALAR_ASSIGNMENT.fullmatch(line)
+        if assignment is None:
+            raise CollectUsageError(
+                "inventory must contain only supported quoted assignments and HOSTS entries"
+            )
+        if assignment.group(1) == "SSH_USER":
+            ssh_user = assignment.group(2)
+    if in_hosts:
+        raise CollectUsageError("inventory HOSTS block is not closed")
+    if len(hosts) != 1:
+        raise CollectUsageError("this Python candidate requires exactly one inventory node")
+    if ssh_user and (
+        ssh_user.startswith("-") or SAFE_SSH_USER.fullmatch(ssh_user) is None
+    ):
+        raise CollectUsageError("invalid SSH_USER")
+    entry = hosts[0]
+    if "=" not in entry:
+        raise CollectUsageError("invalid HOSTS entry")
+    alias, host = entry.split("=", 1)
+    if alias in (".", "..") or SAFE_ALIAS.fullmatch(alias) is None:
+        raise CollectUsageError("invalid host alias")
+    target = host if "@" in host or not ssh_user else f"{ssh_user}@{host}"
+    if target.startswith("-") or SAFE_SSH_TARGET.fullmatch(target) is None:
+        raise CollectUsageError("invalid SSH target")
+    return alias, target
+
+
+def _write_initial_bundle_files(workdir: Path) -> None:
+    (workdir / "cluster").mkdir(mode=0o700)
+    (workdir / "nodes").mkdir(mode=0o700)
+    (workdir / "cluster" / "SKIPPED.txt").write_text(
+        "SKIPPED: cluster collectors are outside the current Python node slice\n",
+        encoding="utf-8",
+    )
+    (workdir / "README-FIRST.txt").write_text(
+        "Operationally read-only incident evidence. Review errors.log and summary.txt.\n",
+        encoding="utf-8",
+    )
+    (workdir / "manifest.jsonl").touch(mode=0o600)
+    (workdir / "errors.log").touch(mode=0o600)
+
+
+def _verify_bundle_path(target: Path) -> None:
+    if target.is_dir():
+        _verify_directory(target)
+    else:
+        files = _read_archive(target)
+        _verify_file_set(files)
+
+
+def _reserve_archive_path(output_root: Path, timestamp: str) -> Path:
+    for suffix in ("", *(f"-{index}" for index in range(1, 1000))):
+        archive = output_root / f"ceph-incident-{timestamp}{suffix}.tar.gz"
+        try:
+            descriptor = os.open(
+                archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+        except FileExistsError:
+            continue
+        os.close(descriptor)
+        return archive
+    raise OSError("cannot reserve a unique incident bundle output path")
+
+
+def _collect(arguments: Sequence[str]) -> int:
+    try:
+        options = _parse_collect_arguments(arguments)
+        if options.get("help"):
+            print(USAGE)
+            return 0
+        inventory = options["inventory"]
+        ssh_key = options["ssh_key"]
+        output_root = options["out"]
+        assert isinstance(inventory, Path)
+        assert isinstance(ssh_key, Path)
+        assert isinstance(output_root, Path)
+        if not ssh_key.is_file():
+            raise CollectUsageError(f"missing ssh key: {ssh_key}")
+        host_alias, target = _read_single_node_inventory(inventory)
+    except CollectUsageError as error:
+        print(f"FATAL: {error}", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        return 1
+
+    try:
+        output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        workdir = Path(tempfile.mkdtemp(prefix="tmp.", dir=output_root)).resolve(
+            strict=True
+        )
+    except OSError as error:
+        print(f"FATAL: cannot create collector-owned workspace: {error}", file=sys.stderr)
+        return 1
+    archive: Path | None = None
+    keep_workdir = False
+    previous_term_handler = signal.getsignal(signal.SIGTERM)
+
+    def interrupt_handler(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupt_handler)
+    try:
+        _write_initial_bundle_files(workdir)
+        known_hosts: Path | None = None
+        if options["trust_ssh_host_key"]:
+            known_hosts = workdir / ".runtime-known-hosts"
+            known_hosts.touch(mode=0o600)
+        node_source = (Path(__file__).resolve().parent / "ceph_incident_node.py").read_bytes()
+        result = collect_single_node(
+            workspace=workdir,
+            destination=workdir / "nodes" / host_alias,
+            host_alias=host_alias,
+            target=target,
+            ssh_key=ssh_key,
+            node_source=node_source,
+            connection_timeout=int(options["timeout"]),
+            node_timeout=int(options["node_timeout"]),
+            command_timeout=int(options["timeout"]),
+            known_hosts_file=known_hosts,
+        )
+        if result.reason is not None:
+            with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
+                errors.write(f"node {host_alias} ({target}): {result.reason}\n")
+        if known_hosts is not None:
+            known_hosts.unlink(missing_ok=True)
+        created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (workdir / "environment.txt").write_text(
+            f"created_utc={created}\n"
+            "mode=python-node-slice\n"
+            f"node_target={target}\n"
+            f"node_invocation_id={result.invocation_id}\n",
+            encoding="utf-8",
+        )
+        (workdir / "summary.txt").write_text(
+            f"created_utc={created}\n"
+            f"node_ok={1 if result.exit_code == 0 else 0}\n"
+            f"node_failed={1 if result.exit_code != 0 else 0}\n"
+            f"final_status={result.exit_code}\n",
+            encoding="utf-8",
+        )
+        _verify_bundle_path(workdir)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archive = _reserve_archive_path(output_root, timestamp)
+        packaged_candidate = workdir / ".incident-bundle.tar.gz"
+        packaged = subprocess.run(
+            [
+                "tar",
+                "--exclude=./.incident-bundle.tar.gz",
+                "-czf",
+                str(packaged_candidate),
+                "-C",
+                str(workdir),
+                ".",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if packaged.returncode != 0:
+            raise VerificationError(
+                f"failed to package incident bundle: {packaged.stderr.decode(errors='replace')}"
+            )
+        _verify_bundle_path(packaged_candidate)
+        os.replace(packaged_candidate, archive)
+        print(f"bundle: {archive}")
+        return result.exit_code
+    except CollectionInterrupted:
+        print("interrupted — stopping and cleaning up…", file=sys.stderr)
+        return 130
+    except KeyboardInterrupt:
+        print("interrupted — stopping and cleaning up…", file=sys.stderr)
+        return 130
+    except (OSError, VerificationError) as error:
+        keep_workdir = True
+        if archive is not None:
+            archive.unlink(missing_ok=True)
+        print(f"VERIFY FAILED: workdir kept at {workdir}: {error}", file=sys.stderr)
+        return 1
+    finally:
+        signal.signal(signal.SIGTERM, previous_term_handler)
+        if not keep_workdir:
+            shutil.rmtree(workdir)
 
 
 def _normalise_member_name(name: str) -> str:
@@ -124,6 +419,8 @@ def _verify_directory(target: Path) -> None:
 
 def main(arguments: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if arguments is None else arguments)
+    if args and args[0] == "collect":
+        return _collect(args[1:])
     if len(args) != 2 or args[0] != "verify":
         print(USAGE, file=sys.stderr)
         return 1
