@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Whitelist fake ssh for the remote kubectl runner in Rook black-box tests.
+
+Every invocation appends its full argv to ``FAKE_SSH_LOG`` as one JSON line.
+The shared SSH option vector is matched exactly and only two remote shapes are
+answered: the node bootstrap (so the public collect CLI can still collect its
+inventory node) and ``kubectl <read-only argv…>``, which is delegated verbatim
+to the fake kubectl next to this file so one whitelist governs both the local
+and the remote runner.  The bootstrap's Python source must hash to the digest
+pinned below.  Anything else exits 99.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import io
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tarfile
+
+
+# Dynamic-but-constrained argv slots: identity path, timeouts, known_hosts file
+# list and SSH target.  Everything else in the option vector is fixed text.
+IDENTITY_PATH = re.compile(r"[^-\s]\S*")
+CONNECT_TIMEOUT = re.compile(r"ConnectTimeout=[1-9][0-9]*")
+ALIVE_INTERVAL = re.compile(r"ServerAliveInterval=[1-9][0-9]*")
+KNOWN_HOSTS_FILE = re.compile(r"UserKnownHostsFile=[^\s][^\n]*")
+SSH_TARGET = re.compile(
+    r"(?:[A-Za-z0-9._%+-]+@)?(?:\[[0-9A-Fa-f:]+\]|[A-Za-z0-9._:-]+)"
+)
+ENCODED_CONFIG = re.compile(r"[A-Za-z0-9_-]+")
+
+# The one Python source this fake will ever run a bootstrap for, pinned as an
+# independent SHA-256 of the production REMOTE_BOOTSTRAP text.  The same digest
+# is pinned in tests/fixtures/python-ceph/bin/ssh; a legitimate bootstrap change
+# must be re-pinned in both by hand.  Regenerate with:
+#   python3 -c 'import hashlib, ceph_incident_collectors as c; \
+#     print(hashlib.sha256(c.REMOTE_BOOTSTRAP.encode("utf-8")).hexdigest())'
+BOOTSTRAP_SOURCE_SHA256 = (
+    "420c17c1f51ef9dd5ff069edcd9cf4620eadc4ffa3f9d584d0afe9688c75f544"
+)
+
+
+class PinnedDigest:
+    """An argv slot that accepts exactly one text, identified by its digest."""
+
+    def __init__(self, hexdigest: str) -> None:
+        self.hexdigest = hexdigest
+
+    def accepts(self, actual: str) -> bool:
+        return hmac.compare_digest(
+            hashlib.sha256(actual.encode("utf-8")).hexdigest(), self.hexdigest
+        )
+
+
+BOOTSTRAP_SOURCE = PinnedDigest(BOOTSTRAP_SOURCE_SHA256)
+
+Matcher = str | re.Pattern[str] | PinnedDigest
+
+BASE_OPTIONS: tuple[Matcher, ...] = (
+    "-i",
+    IDENTITY_PATH,
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "IdentitiesOnly=yes",
+    "-o",
+    "IdentityAgent=none",
+    "-o",
+    "LogLevel=ERROR",
+    "-o",
+    CONNECT_TIMEOUT,
+    "-o",
+    ALIVE_INTERVAL,
+    "-o",
+    "ServerAliveCountMax=1",
+)
+TRUSTED_HOST_KEY_OPTIONS: tuple[Matcher, ...] = (
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    KNOWN_HOSTS_FILE,
+)
+
+
+def matches(expected: Matcher, actual: str) -> bool:
+    if isinstance(expected, PinnedDigest):
+        return expected.accepts(actual)
+    if isinstance(expected, re.Pattern):
+        return expected.fullmatch(actual) is not None
+    return expected == actual
+
+
+def matches_all(expected: tuple[Matcher, ...], actual: list[str]) -> bool:
+    return len(actual) == len(expected) and all(
+        matches(item, actual[index]) for index, item in enumerate(expected)
+    )
+
+
+def reject(reason: str) -> None:
+    sys.stderr.write(f"unexpected ssh command ({reason}): {shlex.join(arguments)}\n")
+    raise SystemExit(99)
+
+
+def remaining_after_base_options(argv: list[str]) -> list[str]:
+    """Consume the exact shared SSH option vector and return the rest."""
+
+    if not matches_all(BASE_OPTIONS, argv[: len(BASE_OPTIONS)]):
+        reject("base SSH options")
+    rest = argv[len(BASE_OPTIONS) :]
+    if rest[:1] == ["-o"]:
+        if not matches_all(TRUSTED_HOST_KEY_OPTIONS, rest[:4]):
+            reject("host key options")
+        rest = rest[4:]
+    return rest
+
+
+def node_archive(alias: str) -> bytes:
+    entry = {
+        "host": alias,
+        "collector": "collect-node",
+        "artifact": "/tmp/ceph-incident-node.fixture/out/system/hostname.txt",
+        "command": "hostname",
+        "exit_code": 0,
+        "started": "2026-07-29T00:00:00Z",
+        "ended": "2026-07-29T00:00:01Z",
+    }
+    files = {
+        "system/hostname.txt": f"{alias}\n".encode(),
+        "manifest.jsonl": (json.dumps(entry) + "\n").encode(),
+    }
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, payload in files.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+    return buffer.getvalue()
+
+
+def serve_debug_probe(rest: list[str]) -> None:
+    if not matches_all(("-vvv", "-o", "LogLevel=DEBUG3", SSH_TARGET, "true"), rest):
+        reject("debug probe argv")
+    sys.stdout.write("debug1: fake verbose ssh probe\ndebug3: fake verbose detail\n")
+    sys.stderr.write("debug1: connection closed by fixture\n")
+    raise SystemExit(255)
+
+
+def serve_bootstrap(remote_command: str) -> None:
+    try:
+        words = shlex.split(remote_command)
+    except ValueError:
+        reject("unparseable remote command")
+    if not matches_all(("python3", "-c", BOOTSTRAP_SOURCE, ENCODED_CONFIG), words):
+        reject("node bootstrap remote command")
+    sys.stdin.buffer.read()
+    alias = os.environ.get("FAKE_NODE_ALIAS", "monitor01")
+    sys.stdout.buffer.write(node_archive(alias))
+    raise SystemExit(int(os.environ.get("FAKE_NODE_EXIT", "0")))
+
+
+def serve_remote_kubectl(words: list[str]) -> None:
+    if os.environ.get("FAKE_SSH_MISSING_KUBECTL"):
+        sys.stderr.write("bash: kubectl: command not found\n")
+        raise SystemExit(127)
+    if os.environ.get("FAKE_SSH_CONNECT_FAIL"):
+        sys.stderr.write("ssh: connect to host port 22: Connection refused\n")
+        raise SystemExit(255)
+    completed = subprocess.run(
+        [sys.executable, str(FAKE_KUBECTL), *words],
+        check=False,
+    )
+    raise SystemExit(completed.returncode)
+
+
+FAKE_KUBECTL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kubectl")
+
+arguments = sys.argv[1:]
+log_path = os.environ.get("FAKE_SSH_LOG")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as output:
+        output.write(json.dumps(arguments) + "\n")
+
+tail = remaining_after_base_options(arguments)
+
+if "-vvv" in tail:
+    serve_debug_probe(tail)
+
+if not tail or SSH_TARGET.fullmatch(tail[0]) is None:
+    reject("SSH target")
+tail = tail[1:]
+
+if len(tail) == 1:
+    serve_bootstrap(tail[0])
+
+if tail[:1] == ["kubectl"]:
+    serve_remote_kubectl(tail[1:])
+
+reject("remote command shape")

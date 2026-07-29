@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Whitelist fake kubectl for Rook cluster-evidence black-box tests.
+
+Every invocation appends its full argv to ``FAKE_KUBECTL_LOG`` as one JSON
+line, so tests can assert the external command ledger of both the local and the
+remote kubectl runner.  Only the read-only argv shapes the Rook collector is
+allowed to issue are answered, each matched in full; an optional leading
+``--context CTX`` is tolerated because that is how a kubeconfig context is
+selected.  The whitelist is decided before any failure knob applies, so a
+mutating verb, ``exec``, or an appended token exits 99 even when the test asked
+for a simulated failure — a collector that grows an unexpected command surface
+fails the suite immediately rather than silently.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import sys
+import time
+
+
+NAMESPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*")
+POD_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*")
+SINCE = re.compile(r"--since=[0-9]+[smhdw]?")
+ROOK_RESOURCES = (
+    "cephclusters.ceph.rook.io,cephblockpools.ceph.rook.io,"
+    "cephfilesystems.ceph.rook.io,cephobjectstores.ceph.rook.io"
+)
+
+Matcher = str | re.Pattern[str]
+
+# Every read-only invocation this fake will ever answer, by shape name.
+WHITELIST: tuple[tuple[str, tuple[Matcher, ...]], ...] = (
+    ("namespace-probe", ("get", "namespace", NAMESPACE)),
+    ("pods-wide", ("get", "pods", "-n", NAMESPACE, "-o", "wide")),
+    ("events", ("get", "events", "-n", NAMESPACE, "--sort-by=.lastTimestamp")),
+    ("resources", ("get", ROOK_RESOURCES, "-n", NAMESPACE, "-o", "yaml")),
+    (
+        "operator-pod",
+        ("get", "pods", "-n", NAMESPACE, "-l", "app=rook-ceph-operator", "-o", "name"),
+    ),
+    (
+        "toolbox-pod",
+        ("get", "pods", "-n", NAMESPACE, "-l", "app=rook-ceph-tools", "-o", "name"),
+    ),
+    ("operator-log", ("logs", "-n", NAMESPACE, POD_NAME, SINCE)),
+)
+
+
+def matches(expected: Matcher, actual: str) -> bool:
+    if isinstance(expected, re.Pattern):
+        return expected.fullmatch(actual) is not None
+    return expected == actual
+
+
+def matches_all(expected: tuple[Matcher, ...], actual: list[str]) -> bool:
+    return len(actual) == len(expected) and all(
+        matches(item, actual[index]) for index, item in enumerate(expected)
+    )
+
+
+def reject(reason: str) -> None:
+    sys.stderr.write(
+        f"unexpected kubectl command ({reason}): {shlex.join(arguments)}\n"
+    )
+    raise SystemExit(99)
+
+
+def emit(payload: str, code: int = 0) -> None:
+    sys.stdout.write(payload if payload.endswith("\n") else payload + "\n")
+    raise SystemExit(code)
+
+
+def fail(payload: str, code: int = 1) -> None:
+    sys.stderr.write(payload if payload.endswith("\n") else payload + "\n")
+    raise SystemExit(code)
+
+
+def shape_of(words: list[str]) -> str:
+    for name, expected in WHITELIST:
+        if matches_all(expected, words):
+            return name
+    reject("kubectl command is not whitelisted")
+    raise AssertionError("unreachable")
+
+
+def serve(shape: str, words: list[str], context: str) -> None:
+    mode = os.environ.get("FAKE_KUBECTL_MODE", "present")
+    namespace = words[2] if shape == "namespace-probe" else words[3]
+
+    if shape == "namespace-probe":
+        if mode == "missing-namespace":
+            fail(f'Error from server (NotFound): namespaces "{namespace}" not found')
+        if mode == "context-missing":
+            fail(f'error: no context exists with the name: "{context}"')
+        if mode == "connection-refused":
+            fail(
+                "The connection to the server 10.0.0.9:6443 was refused - "
+                "did you specify the right host or port?"
+            )
+        if mode == "forbidden":
+            fail(
+                f'Error from server (Forbidden): namespaces "{namespace}" is '
+                "forbidden: User cannot get resource"
+            )
+        emit(f"NAME        STATUS   AGE\n{namespace}   Active   9d")
+
+    if shape == "pods-wide":
+        # The inherited kubeconfig is echoed so tests can prove the collector
+        # selects it through the environment rather than an invented flag.
+        emit(
+            "NAME                READY   STATUS             NODE\n"
+            f"rook-ceph-mon-a     1/1     Running            node-1   # ns={namespace}\n"
+            "rook-ceph-osd-0     0/1     CrashLoopBackOff   node-2\n"
+            f"# kubeconfig={os.environ.get('KUBECONFIG', '<unset>')}"
+        )
+
+    if shape == "events":
+        emit(
+            "LAST SEEN   TYPE      REASON    OBJECT                MESSAGE\n"
+            f"4m          Warning   BackOff   pod/rook-ceph-osd-0   restarting # ns={namespace}"
+        )
+
+    if shape == "resources":
+        emit(
+            "apiVersion: v1\n"
+            "items:\n"
+            "- apiVersion: ceph.rook.io/v1\n"
+            "  kind: CephCluster\n"
+            "  metadata:\n"
+            "    name: rook-ceph\n"
+            f"    namespace: {namespace}\n"
+            "kind: List"
+        )
+
+    if shape == "operator-pod":
+        if mode == "op-lookup-fail":
+            fail("Error from server: operator pod lookup failed")
+        if mode == "op-unsafe-name":
+            emit("pod/--as=system:admin")
+        emit(f"pod/rook-ceph-operator-{namespace}-abc123")
+
+    if shape == "toolbox-pod":
+        emit(f"pod/rook-ceph-tools-{namespace}-abc123")
+
+    if shape == "operator-log":
+        pod, since = words[3], words[4].removeprefix("--since=")
+        emit(f"operator log for {pod} in {namespace} since {since}")
+
+    reject("unhandled whitelisted shape")
+
+
+arguments = sys.argv[1:]
+log_path = os.environ.get("FAKE_KUBECTL_LOG")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as output:
+        output.write(json.dumps(arguments) + "\n")
+
+selected_context = ""
+tail = arguments
+if tail[:1] == ["--context"]:
+    if len(tail) < 2 or not tail[1]:
+        reject("kubeconfig context")
+    selected_context = tail[1]
+    tail = tail[2:]
+
+matched_shape = shape_of(tail)
+
+joined = " ".join(tail)
+sleep_on = os.environ.get("FAKE_KUBECTL_SLEEP_ON")
+if sleep_on and sleep_on in joined:
+    time.sleep(float(os.environ.get("FAKE_KUBECTL_SLEEP_SECONDS", "30")))
+    raise SystemExit(0)
+
+fail_on = os.environ.get("FAKE_KUBECTL_FAIL_ON")
+if fail_on and fail_on in joined:
+    fail(f"simulated kubectl failure for {fail_on}", 17)
+
+serve(matched_shape, tail, selected_context)
