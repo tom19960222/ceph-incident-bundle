@@ -17,12 +17,21 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-from ceph_incident_collectors import CollectionInterrupted, collect_single_node
+from ceph_incident_collectors import (
+    CollectionInterrupted,
+    collect_direct_ceph_cluster,
+    collect_single_node,
+)
+
+
+# Public collect stays fixed to the direct Ceph CLI runner; choosing a runner
+# (and the source it belongs to) is multi-source orchestration work (#16).
+CEPH_RUNNER = "direct"
 
 
 USAGE = """Usage:
   ceph_incident_bundle.py collect --inventory PATH --ssh-key PATH [options]
-    [--since RANGE] [--skip-logs] [--keep-original-logs]
+    [--seed USER@HOST] [--since RANGE] [--skip-logs] [--keep-original-logs]
     [--var-log-max-bytes BYTES|unlimited]
   ceph_incident_bundle.py verify <bundle-dir|bundle.tar.gz>"""
 REQUIRED_FILES = ("manifest.jsonl", "summary.txt", "README-FIRST.txt")
@@ -85,6 +94,7 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
             "--inventory": "inventory",
             "--ssh-key": "ssh_key",
             "--out": "out",
+            "--seed": "seed",
             "--timeout": "timeout",
             "--node-timeout": "node_timeout",
             "--var-log-max-bytes": "var_log_max_bytes",
@@ -111,6 +121,8 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
             if not raw_value:
                 raise CollectUsageError("--since must not be empty")
             values[key] = raw_value
+        elif key == "seed":
+            values[key] = _validated_ssh_target(raw_value, "invalid SSH seed target")
         else:
             values[key] = _positive_integer(raw_value, argument)
         index += 2
@@ -122,7 +134,17 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
     return values
 
 
-def _read_single_node_inventory(path: Path) -> tuple[str, str]:
+def _validated_ssh_target(value: str, message: str) -> str:
+    if not value or value.startswith("-") or SAFE_SSH_TARGET.fullmatch(value) is None:
+        raise CollectUsageError(message)
+    return value
+
+
+def _ssh_target_for_host(host: str, ssh_user: str) -> str:
+    return host if "@" in host or not ssh_user else f"{ssh_user}@{host}"
+
+
+def _read_single_node_inventory(path: Path) -> tuple[str, str, str]:
     if not path.is_file():
         raise CollectUsageError(f"missing inventory: {path}")
     try:
@@ -130,6 +152,7 @@ def _read_single_node_inventory(path: Path) -> tuple[str, str]:
     except (OSError, UnicodeDecodeError) as error:
         raise CollectUsageError(f"cannot read inventory: {path}") from error
     ssh_user = ""
+    seed_host = ""
     hosts: list[str] = []
     in_hosts = False
     hosts_closed = False
@@ -164,6 +187,8 @@ def _read_single_node_inventory(path: Path) -> tuple[str, str]:
             )
         if assignment.group(1) == "SSH_USER":
             ssh_user = assignment.group(2)
+        elif assignment.group(1) == "SEED_HOST":
+            seed_host = assignment.group(2)
     if in_hosts:
         raise CollectUsageError("inventory HOSTS block is not closed")
     if len(hosts) != 1:
@@ -178,17 +203,29 @@ def _read_single_node_inventory(path: Path) -> tuple[str, str]:
     alias, host = entry.split("=", 1)
     if alias in (".", "..") or SAFE_ALIAS.fullmatch(alias) is None:
         raise CollectUsageError("invalid host alias")
-    target = host if "@" in host or not ssh_user else f"{ssh_user}@{host}"
-    if target.startswith("-") or SAFE_SSH_TARGET.fullmatch(target) is None:
-        raise CollectUsageError("invalid SSH target")
-    return alias, target
+    target = _validated_ssh_target(
+        _ssh_target_for_host(host, ssh_user), "invalid SSH target"
+    )
+    seed = (
+        _validated_ssh_target(
+            _ssh_target_for_host(seed_host, ssh_user), "invalid SSH seed target"
+        )
+        if seed_host
+        else ""
+    )
+    return alias, target, seed
 
 
-def _write_initial_bundle_files(workdir: Path) -> None:
+def _write_initial_bundle_files(workdir: Path, *, ceph_seed: str) -> None:
     (workdir / "cluster").mkdir(mode=0o700)
     (workdir / "nodes").mkdir(mode=0o700)
+    uncollected = (
+        "rook and prometheus collectors are outside the current Python slice"
+        if ceph_seed
+        else "cluster collectors are outside the current Python node slice"
+    )
     (workdir / "cluster" / "SKIPPED.txt").write_text(
-        "SKIPPED: cluster collectors are outside the current Python node slice\n",
+        f"SKIPPED: {uncollected}\n",
         encoding="utf-8",
     )
     (workdir / "README-FIRST.txt").write_text(
@@ -235,7 +272,9 @@ def _collect(arguments: Sequence[str]) -> int:
         assert isinstance(output_root, Path)
         if not ssh_key.is_file():
             raise CollectUsageError(f"missing ssh key: {ssh_key}")
-        host_alias, target = _read_single_node_inventory(inventory)
+        host_alias, target, inventory_seed = _read_single_node_inventory(inventory)
+        # --seed overrides the inventory SEED_HOST, as in the shell contract.
+        ceph_seed = str(options.get("seed") or inventory_seed)
     except CollectUsageError as error:
         print(f"FATAL: {error}", file=sys.stderr)
         print(USAGE, file=sys.stderr)
@@ -258,11 +297,25 @@ def _collect(arguments: Sequence[str]) -> int:
 
     signal.signal(signal.SIGTERM, interrupt_handler)
     try:
-        _write_initial_bundle_files(workdir)
+        _write_initial_bundle_files(workdir, ceph_seed=ceph_seed)
         known_hosts: Path | None = None
         if options["trust_ssh_host_key"]:
             known_hosts = workdir / ".runtime-known-hosts"
             known_hosts.touch(mode=0o600)
+        cluster_status: int | None = None
+        if ceph_seed:
+            cluster_status = collect_direct_ceph_cluster(
+                workdir=workdir,
+                seed=ceph_seed,
+                ssh_key=ssh_key,
+                connection_timeout=int(options["timeout"]),
+                command_timeout=int(options["timeout"]),
+                known_hosts_file=known_hosts,
+                runner=CEPH_RUNNER,
+            )
+            if cluster_status != 0:
+                with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
+                    errors.write(f"cluster collection exited {cluster_status}\n")
         node_source = (Path(__file__).resolve().parent / "ceph_incident_node.py").read_bytes()
         result = collect_single_node(
             workspace=workdir,
@@ -285,20 +338,30 @@ def _collect(arguments: Sequence[str]) -> int:
                 errors.write(f"node {host_alias} ({target}): {result.reason}\n")
         if known_hosts is not None:
             known_hosts.unlink(missing_ok=True)
+        exit_code = 2 if (result.exit_code != 0 or cluster_status) else 0
         created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        environment = [
+            f"created_utc={created}",
+            f"mode=python-{'direct-ceph' if ceph_seed else 'node'}-slice",
+            f"node_target={target}",
+            f"node_invocation_id={result.invocation_id}",
+        ]
+        summary = [
+            f"created_utc={created}",
+            f"node_ok={1 if result.exit_code == 0 else 0}",
+            f"node_failed={1 if result.exit_code != 0 else 0}",
+        ]
+        if cluster_status is not None:
+            environment.extend(
+                [f"ceph_source={ceph_seed}", f"ceph_runner={CEPH_RUNNER}"]
+            )
+            summary.append(f"cluster_status={cluster_status}")
+        summary.append(f"final_status={exit_code}")
         (workdir / "environment.txt").write_text(
-            f"created_utc={created}\n"
-            "mode=python-node-slice\n"
-            f"node_target={target}\n"
-            f"node_invocation_id={result.invocation_id}\n",
-            encoding="utf-8",
+            "".join(f"{line}\n" for line in environment), encoding="utf-8"
         )
         (workdir / "summary.txt").write_text(
-            f"created_utc={created}\n"
-            f"node_ok={1 if result.exit_code == 0 else 0}\n"
-            f"node_failed={1 if result.exit_code != 0 else 0}\n"
-            f"final_status={result.exit_code}\n",
-            encoding="utf-8",
+            "".join(f"{line}\n" for line in summary), encoding="utf-8"
         )
         _verify_bundle_path(workdir)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -326,7 +389,7 @@ def _collect(arguments: Sequence[str]) -> int:
         _verify_bundle_path(packaged_candidate)
         os.replace(packaged_candidate, archive)
         print(f"bundle: {archive}")
-        return result.exit_code
+        return exit_code
     except CollectionInterrupted:
         if archive is not None:
             archive.unlink(missing_ok=True)

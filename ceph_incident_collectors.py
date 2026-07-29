@@ -6,6 +6,7 @@ import base64
 import gzip
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -15,13 +16,71 @@ import tarfile
 import tempfile
 import uuid
 import zlib
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 
 NODE_ARCHIVE_OVERHEAD_BYTES = 1024**3
 NODE_ARCHIVE_SAFETY_CEILING_BYTES = 1024**4
 MANIFEST_MAX_BYTES = 16 * 1024 * 1024
+CEPH_COLLECTOR = "collect-cluster-cephadm"
+# The remote prefix that runs ceph on the source node, by runner token.  Both
+# runners are direct, read-only Ceph CLI invocations; `sudo -n cephadm shell`
+# can start containers, so it stays default-off and has no entry here.  Runner
+# selection and capability probing belong to multi-source orchestration (#16).
+CEPH_RUNNER_ARGV: dict[str, tuple[str, ...]] = {
+    "direct": ("ceph",),
+    "sudo": ("sudo", "-n", "ceph"),
+}
+DEFAULT_CEPH_RUNNER = "direct"
+_CEPH_JSON_QUERIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("status.json", ("status",)),
+    ("health-detail.json", ("health", "detail")),
+    ("versions.json", ("versions",)),
+    ("df-detail.json", ("df", "detail")),
+    ("osd-tree.json", ("osd", "tree")),
+    ("osd-df.json", ("osd", "df")),
+    ("osd-dump.json", ("osd", "dump")),
+    ("osd-perf.json", ("osd", "perf")),
+    ("osd-blocked-by.json", ("osd", "blocked-by")),
+    ("pg-stat.json", ("pg", "stat")),
+    ("pg-dump.json", ("pg", "dump")),
+    ("pg-dump-stuck.json", ("pg", "dump_stuck")),
+    ("mon-dump.json", ("mon", "dump")),
+    ("quorum-status.json", ("quorum_status",)),
+    ("mgr-dump.json", ("mgr", "dump")),
+    ("orch-host-ls.json", ("orch", "host", "ls")),
+    ("orch-ps.json", ("orch", "ps")),
+    ("orch-device-ls-wide.json", ("orch", "device", "ls", "--wide")),
+    ("config-dump.json", ("config", "dump")),
+    ("crash-ls.json", ("crash", "ls")),
+)
+CEPH_JSON_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
+    (artifact, (*words, "--format", "json-pretty"))
+    for artifact, words in _CEPH_JSON_QUERIES
+)
+CEPH_TEXT_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("status.txt", ("status",)),
+    ("health-detail.txt", ("health", "detail")),
+    ("osd-tree.txt", ("osd", "tree")),
+    ("orch-ps.txt", ("orch", "ps")),
+)
+CEPH_CRASH_INFO_LIMIT = 10
+# Anchored to crash_id: matching id/name too would feed unrelated nested fields
+# back into `ceph crash info`.
+CRASH_ID_PATTERN = re.compile(r'"crash_id"\s*:\s*"([^"]*)"')
+EMPTY_CRASH_LISTS = frozenset(
+    (
+        "[]",
+        "{}",
+        '{"crashes":[]}',
+        '{"items":[]}',
+        '{"entries":[]}',
+        '{"crash_ls":[]}',
+    )
+)
 REMOTE_BOOTSTRAP = """\
 import sys
 if sys.version_info < (3, 11):
@@ -335,14 +394,16 @@ def accept_node_archive(
         snapshot.close()
 
 
-def _ssh_command(
-    ssh_key: Path,
-    target: str,
-    connection_timeout: int,
-    known_hosts_file: Path | None,
-    encoded_config: str,
+def _ssh_base_options(
+    ssh_key: Path, connection_timeout: int, known_hosts_file: Path | None
 ) -> list[str]:
-    command = [
+    """The single SSH option vector every remote command shares.
+
+    LogLevel=ERROR keeps ssh's own chatter out of captured artifacts; the
+    runtime known_hosts file accepts new keys without touching the operator's.
+    """
+
+    options = [
         "ssh",
         "-i",
         str(ssh_key),
@@ -362,7 +423,7 @@ def _ssh_command(
         "ServerAliveCountMax=1",
     ]
     if known_hosts_file is not None:
-        command.extend(
+        options.extend(
             [
                 "-o",
                 "StrictHostKeyChecking=accept-new",
@@ -370,6 +431,17 @@ def _ssh_command(
                 f"UserKnownHostsFile={known_hosts_file} {Path.home() / '.ssh/known_hosts'}",
             ]
         )
+    return options
+
+
+def _ssh_command(
+    ssh_key: Path,
+    target: str,
+    connection_timeout: int,
+    known_hosts_file: Path | None,
+    encoded_config: str,
+) -> list[str]:
+    command = _ssh_base_options(ssh_key, connection_timeout, known_hosts_file)
     remote_command = (
         "python3 -c "
         + shlex.quote(REMOTE_BOOTSTRAP)
@@ -378,6 +450,287 @@ def _ssh_command(
     )
     command.extend([target, remote_command])
     return command
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _exit_code_of(returncode: int) -> int:
+    # A signalled child reports a negative returncode; the observable contract
+    # uses the shell's 128+signal convention (137 for SIGKILL).
+    return 128 - returncode if returncode < 0 else returncode
+
+
+def _append_manifest_entry(
+    manifest: Path,
+    *,
+    host: str,
+    collector: str,
+    artifact: Path,
+    command: str,
+    exit_code: int,
+    started: str,
+    ended: str,
+) -> None:
+    entry = {
+        "host": host,
+        "collector": collector,
+        "artifact": str(artifact),
+        "command": command,
+        "exit_code": exit_code,
+        "started": started,
+        "ended": ended,
+    }
+    with manifest.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(entry, separators=(",", ":")) + "\n")
+
+
+def run_capture(
+    *,
+    manifest: Path,
+    errors_log: Path | None,
+    host: str,
+    collector: str,
+    artifact: Path,
+    command: Sequence[str],
+    timeout: int,
+) -> int:
+    """Capture one external command into an artifact, manifest, and errors.log.
+
+    stdout and stderr are merged below a fixed comment header, the artifact is
+    renamed into place only once the capture finished, and the command's exit
+    code is returned so callers can apply their own required/optional policy.
+    """
+
+    artifact.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    started = _utc_now()
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=artifact.parent, prefix=f".{artifact.name}.", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    command_string = shlex.join(command)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(
+                f"# host: {host}\n"
+                f"# collector: {collector}\n"
+                f"# started: {started}\n"
+                f"# timeout: {timeout}s\n".encode()
+            )
+            stream.flush()
+            try:
+                completed = subprocess.run(
+                    list(command),
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    timeout=timeout,
+                    check=False,
+                )
+                exit_code = _exit_code_of(completed.returncode)
+            except FileNotFoundError:
+                stream.write(f"# MISSING: {command[0]}: command not found\n".encode())
+                exit_code = 127
+            except subprocess.TimeoutExpired:
+                exit_code = 124
+            if exit_code in (124, 137):
+                stream.write(
+                    f"# TRUNCATED: command timed out after {timeout}s "
+                    f"(exit {exit_code})\n".encode()
+                )
+        ended = _utc_now()
+        os.replace(temporary, artifact)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+    _append_manifest_entry(
+        manifest,
+        host=host,
+        collector=collector,
+        artifact=artifact,
+        command=command_string,
+        exit_code=exit_code,
+        started=started,
+        ended=ended,
+    )
+    if exit_code != 0 and errors_log is not None:
+        with errors_log.open("a", encoding="utf-8") as stream:
+            stream.write(
+                f"{ended} host={host} collector={collector} artifact={artifact} "
+                f"exit={exit_code} command={command_string}\n"
+            )
+    return exit_code
+
+
+def _artifact_component(value: str, fallback: str) -> str:
+    """Reduce a dynamic value to one safe artifact path component."""
+
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", value)
+    while ".." in safe:
+        safe = safe.replace("..", "__")
+    return safe or fallback
+
+
+def write_ssh_debug_log(
+    *,
+    workdir: Path,
+    label: str,
+    target: str,
+    ssh_key: Path,
+    connection_timeout: int,
+    known_hosts_file: Path | None,
+) -> None:
+    """Re-probe a failed SSH target verbosely so the bundle explains the failure."""
+
+    debug_dir = workdir / "ssh-debug"
+    debug_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    artifact = debug_dir / (
+        f"{_artifact_component(label, 'ssh')}-{_artifact_component(target, 'ssh')}.log"
+    )
+    command = [
+        *_ssh_base_options(ssh_key, connection_timeout, known_hosts_file),
+        "-vvv",
+        "-o",
+        "LogLevel=DEBUG3",
+        target,
+        "true",
+    ]
+    started = _utc_now()
+    with artifact.open("wb") as stream:
+        stream.write(
+            "# ssh debug log\n"
+            f"# target: {target}\n"
+            f"# label: {label}\n"
+            f"# started: {started}\n"
+            f"# command: {shlex.join(command)}\n".encode()
+        )
+        stream.flush()
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                timeout=connection_timeout,
+                check=False,
+            )
+            exit_code = _exit_code_of(completed.returncode)
+        except FileNotFoundError:
+            exit_code = 127
+        except subprocess.TimeoutExpired:
+            exit_code = 124
+        stream.write(
+            f"# ended: {_utc_now()}\n# exit_code: {exit_code}\n".encode()
+        )
+
+
+def _unique_crash_artifact(crash_dir: Path, stem: str) -> Path:
+    artifact = crash_dir / f"{stem}.json"
+    suffix = 2
+    while os.path.lexists(artifact):
+        artifact = crash_dir / f"{stem}-{suffix}.json"
+        suffix += 1
+    return artifact
+
+
+def _extract_crash_ids(crash_ls_artifact: Path) -> list[str] | None:
+    """Return up to ten crash ids, or None when the crash list is unparseable."""
+
+    try:
+        payload = crash_ls_artifact.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    body = "\n".join(
+        line for line in payload.splitlines() if not line.lstrip().startswith("#")
+    )
+    crash_ids = CRASH_ID_PATTERN.findall(body)[:CEPH_CRASH_INFO_LIMIT]
+    if crash_ids:
+        return crash_ids
+    if "".join(body.split()) in EMPTY_CRASH_LISTS:
+        return []
+    return None
+
+
+def collect_direct_ceph_cluster(
+    *,
+    workdir: Path,
+    seed: str,
+    ssh_key: Path,
+    connection_timeout: int,
+    command_timeout: int,
+    known_hosts_file: Path | None,
+    runner: str = DEFAULT_CEPH_RUNNER,
+) -> int:
+    """Collect cluster evidence through the direct Ceph CLI over SSH.
+
+    ``runner`` selects the remote Ceph CLI prefix — ``direct`` runs ``ceph`` and
+    ``sudo`` runs ``sudo -n ceph``; both are read-only and neither may reach
+    ``cephadm shell``.  Choosing between them (and probing for capability) is
+    the caller's job, not this collector's.
+
+    Every command runs; a failed capture keeps its output as evidence and makes
+    the layer partial (2).  An unparseable crash list is recorded as a SKIPPED
+    artifact and is not itself a failure.
+    """
+
+    try:
+        runner_argv = CEPH_RUNNER_ARGV[runner]
+    except KeyError as error:
+        raise ValueError(f"unsupported Ceph CLI runner: {runner}") from error
+
+    manifest = workdir / "manifest.jsonl"
+    errors_log = workdir / "errors.log"
+    json_dir = workdir / "cluster" / "ceph" / "json"
+    text_dir = workdir / "cluster" / "ceph" / "text"
+    json_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    text_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    base_options = _ssh_base_options(ssh_key, connection_timeout, known_hosts_file)
+
+    def capture(artifact: Path, words: Sequence[str]) -> int:
+        exit_code = run_capture(
+            manifest=manifest,
+            errors_log=errors_log,
+            host=seed,
+            collector=CEPH_COLLECTOR,
+            artifact=artifact,
+            command=[*base_options, seed, *runner_argv, *words],
+            timeout=command_timeout,
+        )
+        if exit_code in (255, 124, 137):
+            write_ssh_debug_log(
+                workdir=workdir,
+                label="cluster-ceph",
+                target=seed,
+                ssh_key=ssh_key,
+                connection_timeout=connection_timeout,
+                known_hosts_file=known_hosts_file,
+            )
+        return exit_code
+
+    failed = False
+    for artifact_name, words in CEPH_JSON_COMMANDS:
+        if capture(json_dir / artifact_name, words) != 0:
+            failed = True
+    for artifact_name, words in CEPH_TEXT_COMMANDS:
+        if capture(text_dir / artifact_name, words) != 0:
+            failed = True
+
+    crash_ids = _extract_crash_ids(json_dir / "crash-ls.json")
+    if crash_ids is None:
+        (text_dir / "crash-info-skip.txt").write_text(
+            "SKIPPED: unable to parse crash list JSON for recent crash inspection\n",
+            encoding="utf-8",
+        )
+    else:
+        crash_dir = json_dir / "crash-info"
+        for crash_id in crash_ids:
+            artifact = _unique_crash_artifact(
+                crash_dir, _artifact_component(crash_id, "crash")
+            )
+            if capture(artifact, ("crash", "info", crash_id)) != 0:
+                failed = True
+
+    return 2 if failed else 0
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
@@ -434,12 +787,20 @@ def collect_single_node(
         ssh_key, target, connection_timeout, known_hosts_file, encoded_config
     )
     with candidate.open("xb") as candidate_stream:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=candidate_stream,
-            stderr=subprocess.PIPE,
-        )
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=candidate_stream,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            # The local transport itself is missing: this node is a Skipped
+            # Node like any other unreachable one, not a fatal collect.
+            candidate.unlink(missing_ok=True)
+            reason = f"node transport is unavailable: {command[0]}: command not found"
+            _write_skipped(destination, reason)
+            return NodeCollectionResult(2, 127, False, reason, invocation_id)
         try:
             _, stderr = process.communicate(input=node_source, timeout=node_timeout)
         except subprocess.TimeoutExpired:
