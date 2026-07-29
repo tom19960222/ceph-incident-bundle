@@ -24,7 +24,7 @@ import time
 
 NAMESPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*")
 POD_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*")
-SINCE = re.compile(r"--since=[0-9]+[smhdw]?")
+SINCE = re.compile(r"--since=(?:[0-9]+[smhdw]?|yesterday)")
 ROOK_RESOURCES = (
     "cephclusters.ceph.rook.io,cephblockpools.ceph.rook.io,"
     "cephfilesystems.ceph.rook.io,cephobjectstores.ceph.rook.io"

@@ -513,6 +513,116 @@ def _ssh_command(
     return command
 
 
+CAPABILITY_PROBE = (
+    'caps=""; command -v cephadm >/dev/null 2>&1 && caps="$caps cephadm"; '
+    'command -v ceph >/dev/null 2>&1 && caps="$caps ceph"; '
+    'command -v kubectl >/dev/null 2>&1 && caps="$caps kubectl"; '
+    'printf "%s\\n" "$caps"'
+)
+
+
+def probe_node_capabilities(
+    *,
+    workdir: Path,
+    target: str,
+    ssh_key: Path,
+    connection_timeout: int,
+    known_hosts_file: Path | None,
+) -> frozenset[str]:
+    """Return the reviewed command capabilities advertised by one node.
+
+    A transport failure is evidence, not an empty successful probe: preserve a
+    bounded diagnostic and make the node ineligible as a cluster source.
+    """
+
+    command = [
+        *_ssh_base_options(ssh_key, connection_timeout, known_hosts_file),
+        target,
+        CAPABILITY_PROBE,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=connection_timeout,
+            check=False,
+            text=True,
+        )
+        exit_code = _exit_code_of(completed.returncode)
+    except FileNotFoundError:
+        exit_code = 127
+        completed = None
+    except subprocess.TimeoutExpired:
+        exit_code = 124
+        completed = None
+    if exit_code != 0:
+        with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
+            errors.write(
+                f"{_utc_now()} capability probe failed for {target} "
+                f"(ssh exit {exit_code}) — node not considered as a cluster source\n"
+            )
+        if exit_code in (255, 124, 137):
+            write_ssh_debug_log(
+                workdir=workdir,
+                label="capability-probe",
+                target=target,
+                ssh_key=ssh_key,
+                connection_timeout=connection_timeout,
+                known_hosts_file=known_hosts_file,
+            )
+        return frozenset()
+    assert completed is not None
+    advertised = frozenset(completed.stdout.split())
+    return advertised.intersection({"ceph", "cephadm", "kubectl"})
+
+
+def select_ceph_runner(
+    *,
+    workdir: Path,
+    target: str,
+    ssh_key: Path,
+    connection_timeout: int,
+    known_hosts_file: Path | None,
+) -> str | None:
+    """Select the first safe Ceph runner whose read-only probe succeeds."""
+
+    for runner, prefix in (("direct", ["ceph"]), ("sudo", ["sudo", "-n", "ceph"])):
+        command = [
+            *_ssh_base_options(ssh_key, connection_timeout, known_hosts_file),
+            target,
+            *prefix,
+            "--connect-timeout",
+            "5",
+            "-s",
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=connection_timeout,
+                check=False,
+            )
+            exit_code = _exit_code_of(completed.returncode)
+        except FileNotFoundError:
+            exit_code = 127
+        except subprocess.TimeoutExpired:
+            exit_code = 124
+        if exit_code == 0:
+            return runner
+        if exit_code in (255, 124, 137):
+            write_ssh_debug_log(
+                workdir=workdir,
+                label=f"cluster-ceph-{runner}",
+                target=target,
+                ssh_key=ssh_key,
+                connection_timeout=connection_timeout,
+                known_hosts_file=known_hosts_file,
+            )
+    return None
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 

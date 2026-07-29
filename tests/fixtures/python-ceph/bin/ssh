@@ -25,6 +25,7 @@ import shlex
 import sys
 import tarfile
 import time
+import base64
 
 
 CEPH_RESPONSES = {
@@ -107,6 +108,8 @@ class PinnedDigest:
 
 BOOTSTRAP_SOURCE = PinnedDigest(BOOTSTRAP_SOURCE_SHA256)
 
+CAPABILITY_PROBE = 'caps=""; command -v cephadm >/dev/null 2>&1 && caps="$caps cephadm"; command -v ceph >/dev/null 2>&1 && caps="$caps ceph"; command -v kubectl >/dev/null 2>&1 && caps="$caps kubectl"; printf "%s\\n" "$caps"'
+
 Matcher = str | re.Pattern[str] | PinnedDigest
 
 BASE_OPTIONS: tuple[Matcher, ...] = (
@@ -173,18 +176,32 @@ def emit(payload: str, code: int = 0) -> None:
 
 
 def node_archive(alias: str) -> bytes:
-    entry = {
-        "host": alias,
-        "collector": "collect-node",
-        "artifact": "/tmp/ceph-incident-node.fixture/out/system/hostname.txt",
-        "command": "hostname",
-        "exit_code": 0,
-        "started": "2026-07-29T00:00:00Z",
-        "ended": "2026-07-29T00:00:01Z",
-    }
+    entries = [
+        {
+            "host": alias,
+            "collector": "collect-node",
+            "artifact": "/tmp/ceph-incident-node.fixture/out/system/hostname.txt",
+            "command": "hostname",
+            "exit_code": 0,
+            "started": "2026-07-29T00:00:00Z",
+            "ended": "2026-07-29T00:00:01Z",
+        },
+        {
+            "host": alias,
+            "collector": "collect-node",
+            "artifact": "/tmp/ceph-incident-node.fixture/out/logs/var-log/INDEX.tsv",
+            "command": "safe var-log fixture",
+            "exit_code": 0,
+            "started": "2026-07-29T00:00:00Z",
+            "ended": "2026-07-29T00:00:01Z",
+        },
+    ]
     files = {
         "system/hostname.txt": f"{alias}\n".encode(),
-        "manifest.jsonl": (json.dumps(entry) + "\n").encode(),
+        "logs/var-log/INDEX.tsv": b"path\tdisposition\tdetail\n",
+        "manifest.jsonl": (
+            "".join(json.dumps(entry) + "\n" for entry in entries)
+        ).encode(),
     }
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
@@ -213,9 +230,38 @@ def serve_bootstrap(remote_command: str) -> None:
     if not matches_all(("python3", "-c", BOOTSTRAP_SOURCE, ENCODED_CONFIG), words):
         reject("node bootstrap remote command")
     sys.stdin.buffer.read()
-    alias = os.environ.get("FAKE_NODE_ALIAS", "monitor01")
+    padding = "=" * (-len(words[3]) % 4)
+    try:
+        config = json.loads(base64.urlsafe_b64decode(words[3] + padding))
+        configured_alias = str(config["host_alias"])
+    except (ValueError, KeyError, TypeError):
+        configured_alias = "monitor01"
+    alias = os.environ.get("FAKE_NODE_ALIAS", configured_alias)
     sys.stdout.buffer.write(node_archive(alias))
-    raise SystemExit(int(os.environ.get("FAKE_NODE_EXIT", "0")))
+    exit_code = int(os.environ.get("FAKE_NODE_EXIT", "0"))
+    if os.environ.get("FAKE_NODE_EXIT_ALIAS") == alias:
+        exit_code = 17
+    raise SystemExit(exit_code)
+
+
+def serve_capability_probe(words: list[str]) -> None:
+    if words != [CAPABILITY_PROBE]:
+        reject("capability probe")
+    emit(os.environ.get("FAKE_NODE_CAPS", "ceph kubectl"))
+
+
+def serve_ceph_probe(words: list[str], target: str) -> None:
+    if os.environ.get("FAKE_CEPH_PROBE_FAIL_TARGET") == target:
+        raise SystemExit(17)
+    if words == ["ceph", "--connect-timeout", "5", "-s"]:
+        if os.environ.get("FAKE_DIRECT_PROBE_FAIL"):
+            raise SystemExit(17)
+        raise SystemExit(0)
+    if words == ["sudo", "-n", "ceph", "--connect-timeout", "5", "-s"]:
+        if os.environ.get("FAKE_SUDO_PROBE_FAIL"):
+            raise SystemExit(17)
+        raise SystemExit(0)
+    reject("ceph runner probe")
 
 
 def serve_ceph(words: list[str]) -> None:
@@ -270,10 +316,16 @@ if "-vvv" in tail:
 
 if not tail or SSH_TARGET.fullmatch(tail[0]) is None:
     reject("SSH target")
+target = tail[0]
 tail = tail[1:]
 
 if len(tail) == 1:
+    if tail[0] == CAPABILITY_PROBE:
+        serve_capability_probe(tail)
     serve_bootstrap(tail[0])
+
+if tail[-3:] == ["--connect-timeout", "5", "-s"]:
+    serve_ceph_probe(tail, target)
 
 if tail[:1] == ["ceph"]:
     serve_ceph(tail[1:])

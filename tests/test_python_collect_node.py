@@ -40,6 +40,9 @@ class CollectSingleNodeCliTests(unittest.TestCase):
 
         fixture_bin = ROOT / "tests" / "fixtures" / "python-node" / "bin"
         (fake_bin / "ssh").symlink_to(fixture_bin / "ssh")
+        (fake_bin / "kubectl").symlink_to(
+            ROOT / "tests" / "fixtures" / "python-rook" / "bin" / "kubectl"
+        )
         for command in (
             "hostname",
             "uname",
@@ -126,6 +129,10 @@ class CollectSingleNodeCliTests(unittest.TestCase):
             "3",
             "--node-timeout",
             str(node_timeout),
+            "--mode",
+            "rook",
+            "--kube-mode",
+            "local",
             "--no-trust-ssh-host-key",
             *extra_arguments,
         ]
@@ -148,7 +155,7 @@ class CollectSingleNodeCliTests(unittest.TestCase):
 
             with tarfile.open(bundle, "r:gz") as archive:
                 names = {member.name.removeprefix("./") for member in archive}
-                self.assertIn("cluster/SKIPPED.txt", names)
+                self.assertIn("cluster/rook/pods-wide.txt", names)
                 self.assertIn("nodes/monitor01/manifest.jsonl", names)
                 self.assertIn("nodes/monitor01/system/hostname.txt", names)
                 hostname = archive.extractfile("./nodes/monitor01/system/hostname.txt")

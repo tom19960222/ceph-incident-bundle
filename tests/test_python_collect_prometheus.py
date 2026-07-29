@@ -38,6 +38,9 @@ class PrometheusFixture:
         (fake_bin / "curl").symlink_to(FAKE_CURL)
         (fake_bin / "ssh").symlink_to(FAKE_SSH)
         (fake_bin / "grep").symlink_to(FAKE_GREP)
+        (fake_bin / "kubectl").symlink_to(
+            ROOT / "tests" / "fixtures" / "python-rook" / "bin" / "kubectl"
+        )
         curl_ledger = root / "curl-argv.nul"
         environment = {
             **os.environ,
@@ -76,9 +79,13 @@ class PrometheusFixture:
                 str(root / "results"),
                 "--timeout",
                 "5",
-                "--node-timeout",
-                "20",
-                "--no-trust-ssh-host-key",
+            "--node-timeout",
+            "20",
+            "--mode",
+            "rook",
+            "--kube-mode",
+            "local",
+            "--no-trust-ssh-host-key",
                 *extra_arguments,
             ],
             cwd=ROOT,

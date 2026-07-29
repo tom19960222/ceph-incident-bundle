@@ -130,6 +130,8 @@ class DirectCephFixture:
             "5",
             "--node-timeout",
             "20",
+            "--mode",
+            "cephadm",
             "--no-trust-ssh-host-key",
             *extra_arguments,
         ]
@@ -528,7 +530,7 @@ class DirectCephSeedSelectionTests(DirectCephFixture, unittest.TestCase):
             self.assertIn("ceph_source=ceph@10.0.0.1\n", contents["environment.txt"])
             self.assertIn("cluster/ceph/json/status.json", contents)
 
-    def test_collect_without_a_seed_leaves_the_ceph_layer_uncollected(self) -> None:
+    def test_collect_without_a_seed_auto_selects_the_first_capable_node(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             environment, ledger = self.make_fake_environment(root)
@@ -537,12 +539,12 @@ class DirectCephSeedSelectionTests(DirectCephFixture, unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             contents = self.extract(self.bundle_of(result))
-            self.assertIn("cluster/SKIPPED.txt", contents)
-            self.assertFalse(
-                any(name.startswith("cluster/ceph/") for name in contents)
+            self.assertIn("cluster/ceph/json/status.json", contents)
+            self.assertIn(
+                "ceph_source=ceph@10.0.0.1\n", contents["environment.txt"]
             )
-            self.assertNotIn("ceph_source", contents["environment.txt"])
-            self.assertEqual(self.remote_commands(ledger), [])
+            self.assertIn("ceph_runner=direct\n", contents["environment.txt"])
+            self.assertTrue(self.remote_commands(ledger))
 
 
 class DirectCephRunnerSeamTests(DirectCephFixture, unittest.TestCase):
@@ -656,22 +658,11 @@ class MissingLocalSshTransportTests(DirectCephFixture, unittest.TestCase):
             self.assertIn("SKIPPED", skipped)
             self.assertIn("ssh: command not found", skipped)
 
-            self.assertIn(
-                "# MISSING: ssh: command not found",
-                contents["cluster/ceph/json/status.json"],
-            )
-            entries = {
-                Path(str(entry["artifact"])).name: entry
-                for entry in self.manifest_entries(contents)
-            }
-            self.assertEqual(entries["status.json"]["exit_code"], 127)
-            self.assertIn(
-                "SKIPPED", contents["cluster/ceph/text/crash-info-skip.txt"]
-            )
+            self.assertIn("SKIPPED", contents["cluster/ceph/SKIPPED.txt"])
+            self.assertNotIn("cluster/ceph/json/status.json", contents)
 
             errors = contents["errors.log"]
-            self.assertIn("exit=127", errors)
-            self.assertIn("cluster collection exited 2", errors)
+            self.assertIn("no cephadm-capable node", contents["cluster/ceph/SKIPPED.txt"])
             self.assertIn("node monitor01 (ceph@10.0.0.1):", errors)
             self.assertIn("ssh: command not found", errors)
             self.assertIn("final_status=2", contents["summary.txt"])
