@@ -20,7 +20,8 @@ setup_shell_collect_environment "$ROOT" "$tmpdir"
 # before extraction, including when the unsafe member occurs later in the table.
 archive_cases=(
   absolute empty traversal symlink hardlink device fifo socket collision
-  oversize truncated missing-manifest
+  oversize truncated tar-truncated missing-manifest malformed-manifest
+  unsafe-manifest-artifact
 )
 adversarial_inventory="$tmpdir/adversarial-inventory.env"
 {

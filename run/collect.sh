@@ -328,6 +328,7 @@ collect_remote_node() {
   fi
 
   local archive_rc=0
+  NODE_ARCHIVE_REJECTION_CLASS=
   if [[ -s "$node_tar" ]]; then
     accept_node_archive "$node_tar" "$node_dir" "$workdir" "$var_log_max_bytes" || archive_rc=$?
   else
@@ -337,7 +338,7 @@ collect_remote_node() {
     : # A valid archive is retained even when the remote collector returned partial.
   else
     ensure_dir "$node_dir"
-    if [[ $archive_rc -eq 3 ]]; then
+    if [[ "$NODE_ARCHIVE_REJECTION_CLASS" == missing-manifest ]]; then
       printf 'SKIPPED: node archive from %s is incomplete (no manifest.jsonl); treated as failure\n' "$target" >"$node_dir/SKIPPED.txt"
     else
       printf 'SKIPPED: no usable node archive returned from %s (ssh exit %s)\n' "$target" "$rc" >"$node_dir/SKIPPED.txt"

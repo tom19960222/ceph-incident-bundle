@@ -326,8 +326,8 @@ Collect 的共用環境與其他測試檔的 inline fakes 都沿用同一手法�
     `FAKE_SSH_FAIL_ALIAS`（tar 完整但 exit 2）、`FAKE_SSH_PEM_ALIAS`（夾帶 .pem 觸發
     verify 失敗）、`FAKE_SSH_SLEEP`。`FAKE_SSH_NODE_ARCHIVE_CASE`／
     `FAKE_SSH_NODE_ARCHIVE_CASES` 會委派 `make-node-archive.py`，供公開 Collect 黑箱測試產生
-    absolute／empty／traversal／link／special-member／collision／oversize／truncated／
-    missing-manifest archive；測試並確認 rejected member 未進入 node root、workspace 外 marker
+    absolute／empty／traversal／link／special-member／collision／oversize／gzip-truncated／
+    tar-truncated／missing-or-invalid-manifest archive；測試並確認 rejected member 未進入 node root、workspace 外 marker
     未被覆寫、valid archive 搭配 remote nonzero 仍保留 evidence。
   - `kubectl ...`：轉呼叫同一 helper 產生的本機假 kubectl。
 - **同一共用 helper 的假 `kubectl`**（行 13–38）：`FAKE_KUBE_NS_MISSING=1`

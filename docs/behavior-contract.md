@@ -364,7 +364,8 @@ kubectl 前綴（:146-153）：有 `--ssh-target` → `ssh <base_opts> <target> 
 5. 結果判定：
    - rc 255/124/137 → 寫 ssh-debug（label `node-<alias>`）。
    - rc 124/137（timeout 砍）→ `nodes/<alias>/SKIPPED.txt`：`node collection timed out after <s>s (exit <rc>) from <target>`，刪 tar，return 2。
-   - 非空候選檔交給 `accept_node_archive`。它先確認 candidate／destination 都在本次 owned workspace，完整消耗 gzip stream，驗證整張 tar member table、所有 regular-file payload、root `manifest.jsonl`、name normalization／collision／hierarchy，且只接受 regular file 與 directory。Payload cap 為既有 per-node `/var/log` cap 加 1 GiB；`unlimited` 仍保留 1 TiB 的 archive parser safety ceiling。
+   - 非空候選檔交給 `accept_node_archive`。它先確認 candidate／destination 都在本次 owned workspace，再把 candidate 複製到 workspace 內無 pathname 的 private snapshot；驗證與 extraction 都只讀同一 snapshot，candidate 替換或原地修改不能改變已驗收的 bytes。
+   - Receiver 完整消耗 gzip stream，驗證整張 tar member table、兩個 tar end-of-archive blocks 與其後 zero padding、所有 regular-file payload、name normalization／collision／hierarchy，且只接受 POSIX regular file 與 directory。Root `manifest.jsonl` 必須是 bounded UTF-8 JSONL；每列須符合 `host/collector/artifact/command/exit_code/started/ended` schema、node identity，且 artifact 必須位於 remote `out/` 並對應 archive 內的 regular file。Payload cap 為既有 per-node `/var/log` cap 加 1 GiB；`unlimited` 仍保留 1 TiB 的 archive parser safety ceiling。
    - 驗證全部完成後才建立 `nodes/<alias>/`；逐檔以 exclusive、nofollow 的 regular-file write 解出，目錄／檔案權限由 collector 建立，不沿用 archive ownership、mode、link 或 special member metadata。Extraction failure 只清理本次新建的 node root。
    - 缺 `manifest.jsonl` → 保留既有 incomplete SKIPPED 語意；空、損壞、不安全或超限 archive → 建立只有 `SKIPPED: no usable node archive returned ...` 的 node directory。Rejected archive 的 member 不會寫入 extraction root 或其外部。
    - 刪除候選 tar；return remote rc（node collector 自己的 2 仍會保留已驗收 evidence，只計入 node_failed）。
