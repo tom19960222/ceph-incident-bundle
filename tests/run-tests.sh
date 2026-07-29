@@ -32,11 +32,13 @@ for path in \
   "$ROOT/tests/test-var-log-collector.sh" \
   "$ROOT/tests/test-rook-collector.sh" \
   "$ROOT/tests/test-prom-collector.sh" \
-  "$ROOT/tests/test-verify-bundle.sh"; do
+  "$ROOT/tests/test-verify-bundle.sh" \
+  "$ROOT/tests/export-shell-collect-fixture.sh" \
+  "$ROOT/tests/fixtures/shell-collect-environment.sh"; do
   [[ -f "$path" ]] || fail "missing $path"
 done
 
-for path in "$ROOT/run/collect.sh" "$ROOT/lib/verify-bundle.sh"; do
+for path in "$ROOT/run/collect.sh" "$ROOT/lib/verify-bundle.sh" "$ROOT/tests/export-shell-collect-fixture.sh"; do
   [[ -x "$path" ]] || fail "not executable $path"
 done
 

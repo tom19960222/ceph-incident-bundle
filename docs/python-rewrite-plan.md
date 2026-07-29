@@ -14,6 +14,17 @@
 
 任何實作與測試若和這些來源衝突，必須先回到 parent spec #8 澄清，不能自行放寬安全或等價條件。
 
+## Current Python Candidate Boundary
+
+PR #24／#10 是 validation foundation 的第一條 vertical slice：公開 `verify` 能從 shell-produced workdir/archive 驗證必要 metadata、cluster/node evidence、archive integrity 與已納入的 traversal/link/special-member containment，但它仍是 structural-only candidate，不是最終 Verify 契約。
+
+- #17 會移植 cutover 階段仍保留的 secret path/content checks，並補齊長期 Structural Verification payload cap、雙階段驗證與相關黑箱案例。
+- #23 會先修正 shell Node Evidence Archive 的 pre-extraction acceptance boundary；完成前 shell reference 不能參與 qualification。
+- #17 的 malicious final Incident Bundle 黑箱案例負責收斂 shell/Python Verify 對 link、special member、member collision 等接受差異；#23 只處理 shell 收到 Node Evidence Archive 後、解壓前的窄幅安全邊界。
+- #17 與 #23 未完成前，PR #24 的 candidate 只能作為離線 validation foundation，不能宣稱 feature-complete、observable-equivalent 或 qualification-ready。
+
+本階段的 Python 3.11 baseline 由 Makefile 的 offline gate 在任何測試前 fail fast；它不是宣稱目前 structural-only CLI 已完成所有 workstation/node runtime negotiation。完整 supported-node graceful-skip 契約仍依 ADR 0003 與後續 collector tickets 實作。
+
 ## Locked Design
 
 - 三個 production modules：公開入口、工作機 collectors、自足 node collector。

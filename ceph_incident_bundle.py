@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Public command-line entrypoint for Ceph incident evidence collection."""
+"""Public entrypoint; the current Verify boundary is documented in the rewrite plan."""
 
 from __future__ import annotations
 
 import gzip
+import os
 import sys
 import tarfile
 import zlib
@@ -32,25 +33,26 @@ def _verify_required_files(files: set[str]) -> None:
             raise VerificationError(f"missing required file: {required}")
 
 
-def _verify_cluster_artifact(files: set[str]) -> None:
-    if not any(name.startswith("cluster/") for name in files):
-        raise VerificationError("missing cluster/ artifact")
-
-
-def _verify_nodes_artifact(files: set[str]) -> None:
-    if not any(name.startswith("nodes/") for name in files):
-        raise VerificationError("missing nodes/ artifact")
+def _verify_artifact_prefix(files: set[str], prefix: str) -> None:
+    if not any(name.startswith(f"{prefix}/") for name in files):
+        raise VerificationError(f"missing {prefix}/ artifact")
 
 
 def _verify_file_set(files: set[str]) -> None:
     _verify_required_files(files)
-    _verify_cluster_artifact(files)
-    _verify_nodes_artifact(files)
+    _verify_artifact_prefix(files, "cluster")
+    _verify_artifact_prefix(files, "nodes")
+
+
+def _raise_walk_error(error: OSError) -> None:
+    raise error
 
 
 def _read_archive(target: Path) -> set[str]:
     files: set[str] = set()
     try:
+        # Consume the gzip stream to EOF before opening the tar.  This verifies
+        # the gzip trailer/CRC even when every tar member itself is readable.
         with gzip.open(target, mode="rb") as compressed_stream:
             while compressed_stream.read(1024 * 1024):
                 pass
@@ -69,11 +71,12 @@ def _read_archive(target: Path) -> set[str]:
                 seen_names[normalised_name] = member.name
                 normalised_members.append((member, normalised_name))
                 if not (member.isfile() or member.isdir()):
-                    member_kind = (
-                        "symlink or hardlink"
-                        if member.issym() or member.islnk()
-                        else "non-file/non-directory"
-                    )
+                    if member.issym():
+                        member_kind = "symlink"
+                    elif member.islnk():
+                        member_kind = "hardlink"
+                    else:
+                        member_kind = "non-file/non-directory"
                     raise VerificationError(
                         f"archive contains {member_kind} member: {member.name}"
                     )
@@ -95,12 +98,27 @@ def _read_archive(target: Path) -> set[str]:
 
 def _verify_directory(target: Path) -> None:
     files: set[str] = set()
-    for path in target.rglob("*"):
-        relative_name = path.relative_to(target).as_posix()
-        if path.is_symlink():
-            raise VerificationError(f"symlink is not allowed in bundle: {relative_name}")
-        if path.is_file():
-            files.add(relative_name)
+    try:
+        for root, directories, filenames in os.walk(
+            target, topdown=True, onerror=_raise_walk_error
+        ):
+            for name in (*directories, *filenames):
+                path = Path(root, name)
+                relative_name = path.relative_to(target).as_posix()
+                if path.is_symlink():
+                    raise VerificationError(
+                        f"symlink is not allowed in bundle: {relative_name}"
+                    )
+                if path.is_dir():
+                    continue
+                if path.is_file():
+                    files.add(relative_name)
+                    continue
+                raise VerificationError(
+                    f"non-file/non-directory entry in bundle: {relative_name}"
+                )
+    except OSError as error:
+        raise VerificationError(f"cannot read bundle directory: {target}") from error
     _verify_file_set(files)
 
 
@@ -111,30 +129,22 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return 1
 
     target = Path(args[1])
-    if target.is_dir():
-        try:
+    try:
+        if target.is_dir():
             _verify_directory(target)
-        except VerificationError as error:
-            print(f"VERIFY FAIL: {error}", file=sys.stderr)
-            return 1
-        print(f"VERIFY PASS: {args[1]}")
-        return 0
-
-    if target.is_file() and args[1].endswith(".tar.gz"):
-        try:
+        elif target.is_file() and args[1].endswith(".tar.gz"):
             files = _read_archive(target)
             _verify_file_set(files)
-        except VerificationError as error:
-            print(f"VERIFY FAIL: {error}", file=sys.stderr)
-            return 1
-        print(f"VERIFY PASS: {args[1]}")
-        return 0
+        else:
+            raise VerificationError(
+                f"expected a directory or .tar.gz bundle: {args[1]}"
+            )
+    except VerificationError as error:
+        print(f"VERIFY FAIL: {error}", file=sys.stderr)
+        return 1
 
-    print(
-        f"VERIFY FAIL: expected a directory or .tar.gz bundle: {args[1]}",
-        file=sys.stderr,
-    )
-    return 1
+    print(f"VERIFY PASS: {args[1]}")
+    return 0
 
 
 if __name__ == "__main__":

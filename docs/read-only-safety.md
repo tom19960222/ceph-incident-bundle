@@ -17,6 +17,10 @@
 
 在上述 tickets 完成前，不得宣稱現有 shell 已滿足本文件的完整 proof obligations。#23 完成前，shell reference 不得作為 real-lab qualification evidence；非 qualification 的受控診斷執行仍必須確認 nodes 身份可信、關閉兩個 opt-ins、限制 workstation output boundary，並在執行後檢查 remote residue。
 
+## Current Python Candidate Status
+
+目前 Python candidate 的能力、限制與 #17／#23 ownership 以 `docs/python-rewrite-plan.md` 的 **Current Python Candidate Boundary** 為唯一狀態來源；該 boundary 未解除前不得作為 real-lab qualification evidence。
+
 ## Safety Boundary
 
 ### Permitted effects

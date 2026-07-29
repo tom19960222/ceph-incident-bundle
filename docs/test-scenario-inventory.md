@@ -38,13 +38,13 @@
 
 | # | 情境描述 | fixture 手法 | 行號 | 分類 |
 |---|---|---|---|---|
-| R1 | 所有實作與測試檔存在於預期路徑 | 無 | 20–37 | 【實作細節-不移植】repo 佈局檢查，Python 化後由 import / 打包取代 |
-| R2 | `run/collect.sh`、`lib/verify-bundle.sh` 具可執行位 | 無 | 39–41 | 【實作細節-不移植】打包細節（入口點形式會改變） |
-| R3 | `collect.sh` 無參數 → exit 1 且輸出含 `Usage:` | `run_and_capture`（捕捉 status+輸出） | 43–47 | 【功能等價-必移植】CLI 契約 |
-| R4 | `verify-bundle.sh` 無參數 → exit 1 且輸出含 `Usage:` | 同上 | 49–53 | 【功能等價-必移植】 |
-| R5 | `verify-bundle.sh` 指到不存在路徑 → 非 0，輸出說明失敗（`VERIFY FAIL:`/`Usage:`/`error` 擇一） | 同上 | 55–59 | 【功能等價-必移植】 |
-| R6 | `collect.sh` 帶不存在的 inventory → 非 0，輸出說明（`missing inventory` 等） | 同上 | 61–65 | 【功能等價-必移植】 |
-| R7 | 依序執行 8 個子測試檔並要求 exit 0 | 無 | 67–105 | 【實作細節-不移植】測試 harness 本身，由 unittest discovery 取代 |
+| R1 | 所有實作與測試檔存在於預期路徑 | 無 | 20–39 | 【實作細節-不移植】repo 佈局檢查，Python 化後由 import / 打包取代 |
+| R2 | `run/collect.sh`、`lib/verify-bundle.sh` 與 shell compatibility fixture exporter 具可執行位 | 無 | 41–43 | 【實作細節-不移植】打包細節（入口點形式會改變） |
+| R3 | `collect.sh` 無參數 → exit 1 且輸出含 `Usage:` | `run_and_capture`（捕捉 status+輸出） | 45–49 | 【功能等價-必移植】CLI 契約 |
+| R4 | `verify-bundle.sh` 無參數 → exit 1 且輸出含 `Usage:` | 同上 | 51–55 | 【功能等價-必移植】 |
+| R5 | `verify-bundle.sh` 指到不存在路徑 → 非 0，輸出說明失敗（`VERIFY FAIL:`/`Usage:`/`error` 擇一） | 同上 | 57–61 | 【功能等價-必移植】 |
+| R6 | `collect.sh` 帶不存在的 inventory → 非 0，輸出說明（`missing inventory` 等） | 同上 | 63–67 | 【功能等價-必移植】 |
+| R7 | 依序執行 8 個子測試檔並要求 exit 0 | 無 | 69–109 | 【實作細節-不移植】測試 harness 本身，由 unittest discovery 取代 |
 
 ## 2. `tests/test-common.sh`（common.sh / bundle.sh helpers）
 
@@ -203,49 +203,49 @@ cluster/ceph＋nodes/<host>/system）與 `make_bundle_archive`（tar.gz 化）�
 
 ## 9. `tests/test-collect.sh`（run/collect.sh 端到端編排）
 
-線性腳本。fixture：inline 能力感知假 `ssh`（見專章第 3 節）、inline 假 `kubectl`
-（`FAKE_KUBE_NS_MISSING`）、假 `timeout`（記首參數到 `FAKE_TIMEOUT_LOG`）；ceph 指令
-回應委派給 `tests/fixtures/bin/ssh`（`FIXTURE_SSH` env）。頂層先 export
-`CEPH_INCIDENT_ALLOW_CEPHADM_SHELL=1`、`CEPH_INCIDENT_ALLOW_KUBECTL_EXEC=1`。
+線性腳本。`tests/fixtures/shell-collect-environment.sh` 建立共用的能力感知假
+`ssh`、`kubectl`、`timeout` 與外部宣告式 inventory；同一 helper 也供
+`tests/export-shell-collect-fixture.sh` 產生 Python compatibility fixture。完整 shell
+情境仍在頂層明確啟用兩條 compatibility paths；compatibility fixture 則明確關閉它們。
 
 | # | 情境描述 | fixture 手法 | 行號 | 分類 |
 |---|---|---|---|---|
-| O1 | `--help` → exit 0；usage 文件化所有主要旗標（--kube-context、--no-trust-ssh-host-key、--no-redact、--prom-url、--keep-original-logs、--var-log-max-bytes、--allow-cephadm-shell、--allow-kubectl-exec） | `run_and_capture` | 58–70 | 【功能等價-必移植】CLI 契約（措辭不必逐字，旗標集合要在） |
-| O2 | inventory 不存在 → exit 1 | 同上 | 72–74 | 【功能等價-必移植】 |
-| O3 | inventory 是宣告式資料、**不得**被當 shell 執行：含 `$(touch ...)` 的 inventory → exit 1 且 marker 檔未被建立 | 惡意 inventory 檔 | 224–232 | 【功能等價-必移植】安全 |
-| O4 | host alias 含 `../` → exit 1，且未在輸出根外建立檔案 | 惡意 alias | 234–240 | 【功能等價-必移植】 |
-| O5 | SSH target 形如 `--ProxyCommand=...` → 失敗且**未曾**呼叫 ssh | `FAKE_SSH_LOG` 保持空 | 242–249 | 【功能等價-必移植】argv 注入防護 |
-| O6 | auto 模式雙層收集 happy path：cluster/ceph 來自 ceph 節點、cluster/rook 來自 kube 節點、每節點 nodes/<alias>/…；node 端 config 被 `[REDACTED]`；kubectl 帶 `--context lab` 且跑在 kube 節點；預設 `StrictHostKeyChecking=accept-new`；node wrapper 用 `--node-timeout 90`；`--keep-original-logs`/`--var-log-max-bytes 123456` 轉發到遠端；environment.txt 記 `ceph_source`/`rook_source`；CONTENTS.md 逐 artifact 列來源指令；無 `--prom-url` 時 bundle 不含 prometheus 層 | `FAKE_CEPH_TARGETS`/`FAKE_KUBE_TARGETS`＋`FAKE_SSH_LOG`/`FAKE_TIMEOUT_LOG`＋tar 檢查 | 265–296 | 【功能等價-必移植】核心編排契約 |
-| O7 | `--no-trust-ssh-host-key`：不再帶 accept-new，redaction 預設仍開（開關互相獨立） | `FAKE_SSH_LOG` | 299–308 | 【功能等價-必移植】 |
-| O8 | `--no-redact`：秘密原文保留於 bundle；host key trust 預設仍開 | tar 內容 | 310–319 | 【功能等價-必移植】 |
-| O9 | 顯式 `--trust-ssh-host-key --redact` 等同預設行為 | 同上 | 321–330 | 【功能等價-必移植】 |
-| O10 | auto、無任何 capable 節點 → exit 2；`cluster/ceph/SKIPPED.txt`＋`cluster/rook/SKIPPED.txt` 都在；nodes 層照常收集 | `FAKE_CEPH_TARGETS="" FAKE_KUBE_TARGETS=""` | 335–348 | 【功能等價-必移植】 |
-| O11 | 顯式 `--mode cephadm --seed`：只收 ceph 層，全程**不得**碰 kubectl | `FAKE_SSH_LOG` | 353–360 | 【功能等價-必移植】 |
-| O12 | 顯式 seed 但 direct/sudo runner 都不通、且 cephadm-shell fallback 未授權（unset `CEPH_INCIDENT_ALLOW_CEPHADM_SHELL`）→ exit 2＋SKIPPED，**不得**動用 cephadm shell | `FAKE_CEPH_DIRECT_OK="" FAKE_CEPH_SUDO_OK=""` | 364–381 | 【功能等價-必移植】安全預設 |
-| O13 | 兩台 cephadm 節點：cluster ceph 只從**第一台**收，不重複 | `FAKE_SSH_LOG` | 386–403 | 【功能等價-必移植】 |
-| O14 | node 回傳 tar 缺 manifest → 該節點 SKIPPED、整體 exit 2 | `FAKE_SSH_NO_MANIFEST_ALIAS=kubenode` | 415–421 | 【功能等價-必移植】 |
-| O15 | node 回傳非 tar → SKIPPED、exit 2 | `FAKE_SSH_BAD_TAR_ALIAS=kubenode` | 423–429 | 【功能等價-必移植】 |
-| O16 | 單一 host 收集失敗（remote exit 2）→ 整體 exit 2、bundle 含 errors.log | `FAKE_SSH_FAIL_ALIAS=kubenode` | 431–437 | 【功能等價-必移植】 |
-| O17 | 中途 abort → trap 清掉 workdir，`--out` 下不留 `tmp.*` | `COLLECT_TEST_ABORT_AFTER_NODES=1`（實作內建測試鉤子） | 439–449 | 【功能等價-必移植】 |
-| O18 | verify 失敗（node 夾帶 `.pem`）→ exit 1、**不產** bundle、workdir 保留一份供調查 | `FAKE_SSH_PEM_ALIAS=kubenode` | 451–463 | 【功能等價-必移植】 |
-| O19 | auto、只有 kube 節點且 namespace 不存在、無 ceph → exit 2（不得綠色 exit 0）；rook SKIPPED 的**具體原因**（namespace not found）不得被泛用 auto skip 覆寫 | `FAKE_KUBE_NS_MISSING=1` | 465–484 | 【功能等價-必移植】 |
-| O20 | 能力探測 ssh 失敗的節點 → errors.log 記 `capability probe failed for <target>`；bundle 留該 target 的 `ssh-debug/*.log`（verbose 重試輸出） | `FAKE_PROBE_FAIL_TARGETS`；假 ssh 對 `-vvv` 輸出 debug1/debug3 後 exit 255 | 486–497 | 【功能等價-必移植】 |
-| O21 | node 收集 ssh 傳輸失敗 → exit 2＋該 target 的 ssh-debug log 入 bundle | `FAKE_SSH_CONNECT_FAIL_TARGETS="10.0.0.9"` | 499–509 | 【功能等價-必移植】 |
-| O22 | cluster ceph ssh 傳輸失敗 → exit 2＋ssh-debug log（內容含 `label: cluster-ceph`） | `FAKE_SSH_CONNECT_FAIL_TARGETS="10.0.0.1"` | 511–521 | 【功能等價-必移植】 |
-| O23 | `HOSTS=()` 空清單 → exit 1＋明確訊息（HOSTS is empty） | 空 inventory | 523–530 | 【功能等價-必移植】 |
-| O24 | `--kube-context` 含 shell metacharacter（`bad;ctx`）→ exit 1＋說明；合法 EKS ARN 式 context（含 `@ : /`）要通過驗證（隨後才因 inventory 失敗） | 直接呼叫 | 532–542 | 【功能等價-必移植】 |
-| O25 | 偏好 direct runner：`ceph -s` 可直連時用純 `ceph`，不用 cephadm shell；environment.txt 記 `ceph_runner=direct` | `FAKE_CEPH_BIN_TARGETS`＋`FAKE_CEPH_DIRECT_OK` | 544–562 | 【功能等價-必移植】 |
-| O26 | direct/sudo 都不通、cephadm 通 → fallback 用 `sudo -n cephadm shell`；environment.txt 記 `ceph_runner=cephadm` | `FAKE_CEPH_DIRECT_OK="" FAKE_CEPH_SUDO_OK=""` | 564–580 | 【功能等價-必移植】 |
-| O27 | `--kube-mode local`：rook 層用本機 kubectl（不經 ssh）；environment.txt 記 `rook_source=local` | `FAKE_SSH_LOG` 無 kubectl | 582–592 | 【功能等價-必移植】 |
-| O28 | `--kube-mode bogus` → exit 1＋說明 | 直接呼叫 | 594–599 | 【功能等價-必移植】 |
-| O29 | `--prom-url`＋不可解析 `--since` → 前置檢查 exit 1＋說明 | 直接呼叫 | 601–606 | 【功能等價-必移植】 |
-| O30 | 非數字 `--prom-timeout` → exit 1 | 直接呼叫 | 608–610 | 【功能等價-必移植】 |
-| O31 | `--prom-step 0` → exit 1 | 直接呼叫 | 612–614 | 【功能等價-必移植】 |
-| O32 | `--prom-url` 端到端：prometheus dump 落在 bundle 的 `cluster/prometheus/`（dump-info、buildinfo、各 job gz）；不匹配 job 不 dump；environment.txt 記 prom_url；24h → step=15 | fixture curl＋`FAKE_CURL_LOG` | 616–635 | 【功能等價-必移植】 |
-| O33 | progress 預設開：stderr 顯示節點/探測/收集進度；stdout 只有 `bundle:` 行、且 `bundle:` 不得出現在 stderr | stdout/stderr 分流捕捉 | 637–647 | 【功能等價-必移植】 |
-| O34 | `--quiet`：stdout 仍印 `bundle:`，stderr 進度全部靜默 | 同上 | 649–656 | 【功能等價-必移植】 |
-| O35 | 中斷處理（Ctrl-C 契約）：`on_interrupt` → exit 130、announce interrupted、移除 workdir | source lib 後直呼 handler（`CLEANUP_WORKDIR`/`CLEANUP_KEEP`） | 658–680 | 【功能等價-必移植】行為契約；移植時改為對 Python 版 SIGINT handler / cleanup 函式做單元測試 |
-| O36 | `--keep-workdir` 時中斷處理保留 workdir（`CLEANUP_KEEP=1`） | 同上 | 681–695 | 【功能等價-必移植】 |
+| O1 | `--help` → exit 0；usage 文件化所有主要旗標（--kube-context、--no-trust-ssh-host-key、--no-redact、--prom-url、--keep-original-logs、--var-log-max-bytes、--allow-cephadm-shell、--allow-kubectl-exec） | `run_and_capture` | 59-71 | 【功能等價-必移植】CLI 契約（措辭不必逐字，旗標集合要在） |
+| O2 | inventory 不存在 → exit 1 | 同上 | 73-75 | 【功能等價-必移植】 |
+| O3 | inventory 是宣告式資料、**不得**被當 shell 執行：含 `$(touch ...)` 的 inventory → exit 1 且 marker 檔未被建立 | 惡意 inventory 檔 | 83-93 | 【功能等價-必移植】安全 |
+| O4 | host alias 含 `../` → exit 1，且未在輸出根外建立檔案 | 惡意 alias | 95-103 | 【功能等價-必移植】 |
+| O5 | SSH target 形如 `--ProxyCommand=...` → 失敗且**未曾**呼叫 ssh | `FAKE_SSH_LOG` 保持空 | 105-113 | 【功能等價-必移植】argv 注入防護 |
+| O6 | auto 模式雙層收集 happy path：cluster/ceph 來自 ceph 節點、cluster/rook 來自 kube 節點、每節點 nodes/<alias>/…；node 端 config 被 `[REDACTED]`；kubectl 帶 `--context lab` 且跑在 kube 節點；預設 `StrictHostKeyChecking=accept-new`；node wrapper 用 `--node-timeout 90`；`--keep-original-logs`/`--var-log-max-bytes 123456` 轉發到遠端；environment.txt 記 `ceph_source`/`rook_source`；CONTENTS.md 逐 artifact 列來源指令；無 `--prom-url` 時 bundle 不含 prometheus 層；成功且未指定 `--keep-workdir` 時不殘留 `tmp.*` | `FAKE_CEPH_TARGETS`/`FAKE_KUBE_TARGETS`＋`FAKE_SSH_LOG`/`FAKE_TIMEOUT_LOG`＋tar 檢查 | 118-151 | 【功能等價-必移植】核心編排契約 |
+| O7 | `--no-trust-ssh-host-key`：不再帶 accept-new，redaction 預設仍開（開關互相獨立） | `FAKE_SSH_LOG` | 153-163 | 【功能等價-必移植】 |
+| O8 | `--no-redact`：秘密原文保留於 bundle；host key trust 預設仍開 | tar 內容 | 165-174 | 【功能等價-必移植】 |
+| O9 | 顯式 `--trust-ssh-host-key --redact` 等同預設行為 | 同上 | 176-185 | 【功能等價-必移植】 |
+| O10 | auto、無任何 capable 節點 → exit 2；`cluster/ceph/SKIPPED.txt`＋`cluster/rook/SKIPPED.txt` 都在；nodes 層照常收集 | `FAKE_CEPH_TARGETS="" FAKE_KUBE_TARGETS=""` | 187-203 | 【功能等價-必移植】 |
+| O11 | 顯式 `--mode cephadm --seed`：只收 ceph 層，全程**不得**碰 kubectl | `FAKE_SSH_LOG` | 205-215 | 【功能等價-必移植】 |
+| O12 | 顯式 seed 但 direct/sudo runner 都不通、且 cephadm-shell fallback 未授權（unset `CEPH_INCIDENT_ALLOW_CEPHADM_SHELL`）→ exit 2＋SKIPPED，**不得**動用 cephadm shell | `FAKE_CEPH_DIRECT_OK="" FAKE_CEPH_SUDO_OK=""` | 217-236 | 【功能等價-必移植】安全預設 |
+| O13 | 兩台 cephadm 節點：cluster ceph 只從**第一台**收，不重複 | `FAKE_SSH_LOG` | 238-258 | 【功能等價-必移植】 |
+| O14 | node 回傳 tar 缺 manifest → 該節點 SKIPPED、整體 exit 2 | `FAKE_SSH_NO_MANIFEST_ALIAS=kubenode` | 270-276 | 【功能等價-必移植】 |
+| O15 | node 回傳非 tar → SKIPPED、exit 2 | `FAKE_SSH_BAD_TAR_ALIAS=kubenode` | 278-284 | 【功能等價-必移植】 |
+| O16 | 單一 host 收集失敗（remote exit 2）→ 整體 exit 2、bundle 含 errors.log | `FAKE_SSH_FAIL_ALIAS=kubenode` | 286-292 | 【功能等價-必移植】 |
+| O17 | 中途 abort → trap 清掉 workdir，`--out` 下不留 `tmp.*` | `COLLECT_TEST_ABORT_AFTER_NODES=1`（實作內建測試鉤子） | 294-304 | 【功能等價-必移植】 |
+| O18 | verify 失敗（node 夾帶 `.pem`）→ exit 1、**不產** bundle、workdir 保留一份供調查 | `FAKE_SSH_PEM_ALIAS=kubenode` | 306-318 | 【功能等價-必移植】 |
+| O19 | auto、只有 kube 節點且 namespace 不存在、無 ceph → exit 2（不得綠色 exit 0）；rook SKIPPED 的**具體原因**（namespace not found）不得被泛用 auto skip 覆寫 | `FAKE_KUBE_NS_MISSING=1` | 320-339 | 【功能等價-必移植】 |
+| O20 | 能力探測 ssh 失敗的節點 → errors.log 記 `capability probe failed for <target>`；bundle 留該 target 的 `ssh-debug/*.log`（verbose 重試輸出） | `FAKE_PROBE_FAIL_TARGETS`；假 ssh 對 `-vvv` 輸出 debug1/debug3 後 exit 255 | 341-352 | 【功能等價-必移植】 |
+| O21 | node 收集 ssh 傳輸失敗 → exit 2＋該 target 的 ssh-debug log 入 bundle | `FAKE_SSH_CONNECT_FAIL_TARGETS="10.0.0.9"` | 354-364 | 【功能等價-必移植】 |
+| O22 | cluster ceph ssh 傳輸失敗 → exit 2＋ssh-debug log（內容含 `label: cluster-ceph`） | `FAKE_SSH_CONNECT_FAIL_TARGETS="10.0.0.1"` | 366-376 | 【功能等價-必移植】 |
+| O23 | `HOSTS=()` 空清單 → exit 1＋明確訊息（HOSTS is empty） | 空 inventory | 378-385 | 【功能等價-必移植】 |
+| O24 | `--kube-context` 含 shell metacharacter（`bad;ctx`）→ exit 1＋說明；合法 EKS ARN 式 context（含 `@ : /`）要通過驗證（隨後才因 inventory 失敗） | 直接呼叫 | 387-397 | 【功能等價-必移植】 |
+| O25 | 偏好 direct runner：`ceph -s` 可直連時用純 `ceph`，不用 cephadm shell；environment.txt 記 `ceph_runner=direct` | `FAKE_CEPH_BIN_TARGETS`＋`FAKE_CEPH_DIRECT_OK` | 399-417 | 【功能等價-必移植】 |
+| O26 | direct/sudo 都不通、cephadm 通 → fallback 用 `sudo -n cephadm shell`；environment.txt 記 `ceph_runner=cephadm` | `FAKE_CEPH_DIRECT_OK="" FAKE_CEPH_SUDO_OK=""` | 419-435 | 【功能等價-必移植】 |
+| O27 | `--kube-mode local`：rook 層用本機 kubectl（不經 ssh）；environment.txt 記 `rook_source=local` | `FAKE_SSH_LOG` 無 kubectl | 437-447 | 【功能等價-必移植】 |
+| O28 | `--kube-mode bogus` → exit 1＋說明 | 直接呼叫 | 449-454 | 【功能等價-必移植】 |
+| O29 | `--prom-url`＋不可解析 `--since` → 前置檢查 exit 1＋說明 | 直接呼叫 | 456-461 | 【功能等價-必移植】 |
+| O30 | 非數字 `--prom-timeout` → exit 1 | 直接呼叫 | 463-465 | 【功能等價-必移植】 |
+| O31 | `--prom-step 0` → exit 1 | 直接呼叫 | 467-469 | 【功能等價-必移植】 |
+| O32 | `--prom-url` 端到端：prometheus dump 落在 bundle 的 `cluster/prometheus/`（dump-info、buildinfo、各 job gz）；不匹配 job 不 dump；environment.txt 記 prom_url；24h → step=15 | fixture curl＋`FAKE_CURL_LOG` | 471-490 | 【功能等價-必移植】 |
+| O33 | progress 預設開：stderr 顯示節點/探測/收集進度；stdout 只有 `bundle:` 行、且 `bundle:` 不得出現在 stderr | stdout/stderr 分流捕捉 | 492-502 | 【功能等價-必移植】 |
+| O34 | `--quiet`：stdout 仍印 `bundle:`，stderr 進度全部靜默 | 同上 | 504-511 | 【功能等價-必移植】 |
+| O35 | 中斷處理（Ctrl-C 契約）：`on_interrupt` → exit 130、announce interrupted、移除 workdir | source lib 後直呼 handler（`CLEANUP_WORKDIR`/`CLEANUP_KEEP`） | 513-535 | 【功能等價-必移植】行為契約；移植時改為對 Python 版 SIGINT handler / cleanup 函式做單元測試 |
+| O36 | `--keep-workdir` 時中斷處理保留 workdir（`CLEANUP_KEEP=1`） | 同上 | 536-550 | 【功能等價-必移植】 |
 
 ---
 
@@ -306,11 +306,13 @@ match」分派，模擬透過 ssh 在遠端跑 `ceph ...` 的回應。
   時間戳用 `start` 參數（行 76–89）。
 - 其他 URL：**exit 99**（白名單設計，同 ssh fixture）。
 
-### 10.3 各測試檔的 inline 假指令（移植時需一併重建）
+### 10.3 Collect 共用 fixture 與各測試檔的 inline 假指令
 
-這些不是共用 fixture，但屬同一手法（heredoc 產生假 bin → `chmod +x` → 塞 PATH 最前）：
+Collect 的共用環境與其他測試檔的 inline fakes 都沿用同一手法：heredoc 產生假 bin、
+`chmod +x`，再放到 PATH 最前。移植時必須保留下列介面：
 
-- **`test-collect.sh` 的能力感知假 `ssh`**（行 118–213）：核心 fixture。依遠端指令分派：
+- **`tests/fixtures/shell-collect-environment.sh` 的能力感知假 `ssh`**（行 47–139）：
+  `test-collect.sh` 與 shell→Python compatibility exporter 共用的核心 fixture。依遠端指令分派：
   - `-vvv`：輸出 `debug1:`/`debug3:` 假 verbose log 後 exit 255（ssh-debug log 情境）。
   - `FAKE_SSH_CONNECT_FAIL_TARGETS`（substring 清單）：模擬 TCP 連線拒絕、exit 255。
   - `--connect-timeout 5 -s`（runner 連通性探測）：依 `FAKE_CEPH_DIRECT_OK` /
@@ -323,11 +325,15 @@ match」分派，模擬透過 ssh 在遠端跑 `ceph ...` 的回應。
     `FAKE_SSH_BAD_TAR_ALIAS`（回非 tar）、`FAKE_SSH_NO_MANIFEST_ALIAS`（tar 缺 manifest）、
     `FAKE_SSH_FAIL_ALIAS`（tar 完整但 exit 2）、`FAKE_SSH_PEM_ALIAS`（夾帶 .pem 觸發
     verify 失敗）、`FAKE_SSH_SLEEP`。
-  - `kubectl ...`：轉呼叫本機假 kubectl。
-- **`test-collect.sh` 假 `kubectl`**（行 88–109）：`FAKE_KUBE_NS_MISSING=1` 模擬
-  namespace 不存在；容忍前置 `--context CTX`。
-- **`test-collect.sh` / `test-common.sh` 假 `timeout`**：記第一個參數（秒數）到
-  `FAKE_TIMEOUT_LOG` / `TIMEOUT_LOG` 後透傳執行。
+  - `kubectl ...`：轉呼叫同一 helper 產生的本機假 kubectl。
+- **同一共用 helper 的假 `kubectl`**（行 13–38）：`FAKE_KUBE_NS_MISSING=1`
+  模擬 namespace 不存在；`FAKE_KUBE_TOOLS_POD=1` 讓 tools Pod 可被發現，用來證明
+  default-off compatibility fixture 不會偷偷執行 `kubectl exec`；容忍前置 `--context CTX`。
+- **同一共用 helper 的假 `timeout`**（行 40–45）：記第一個參數（秒數）到
+  `FAKE_TIMEOUT_LOG` 後透傳執行。`test-common.sh` 另有同介面的 inline fake，寫入
+  `TIMEOUT_LOG`。
+- 共用假 `kubectl` 與 `ssh` 對未列入介面的命令一律輸出 `unexpected ...` 並 exit 99；
+  這個白名單 fallback 是 fixture 偵測新增 command surface 的主要防回歸機制。
 - **`test-rook-collector.sh` 假 `kubectl`**（行 74–148）：`FAKE_KUBECTL_LOG` 記 argv；
   `FAKE_KUBECTL_MODE` ∈ present / missing-namespace / context-missing /
   connection-refused / with-toolbox / op-lookup-fail；假 `ssh`（行 233–245）把

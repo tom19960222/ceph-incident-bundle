@@ -51,6 +51,7 @@ assert_archive_has_debug_log_for() {
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
+results_before="$(find "$ROOT/results" -mindepth 1 -print 2>/dev/null | sort || true)"
 
 # ---------------------------------------------------------------------------
 # usage / arg validation
@@ -73,151 +74,11 @@ missing_result="$(run_and_capture "$ROOT/run/collect.sh" --inventory "$tmpdir/mi
 missing_status="${missing_result%%$'\n'*}"
 [[ "$missing_status" == "1" ]] || fail "missing inventory should exit 1, got $missing_status"
 
-# ---------------------------------------------------------------------------
-# fake bins: capability-aware ssh, fake kubectl, passthrough timeout
-#   ssh dispatches by the remote command:
-#     - "command -v cephadm" (capability probe) -> emit caps based on target
-#     - "cephadm shell -- ceph"                 -> delegate to the ceph fixture ssh
-#     - "kubectl"                               -> forward to the fake kubectl
-#     - "collect-node.sh"                       -> fabricate a node bundle tar
-#   Caps per target come from FAKE_CEPH_TARGETS / FAKE_KUBE_TARGETS (substrings).
-# ---------------------------------------------------------------------------
-fakebin="$tmpdir/fakebin"
-mkdir -p "$fakebin"
-
-cat >"$fakebin/kubectl" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-[[ "${1:-}" == "--context" ]] && shift 2
-cmd="$*"
-case "$cmd" in
-  "get namespace rook-ceph")
-    if [[ "${FAKE_KUBE_NS_MISSING:-}" == "1" ]]; then
-      printf 'Error from server (NotFound): namespaces "rook-ceph" not found\n' >&2
-      exit 1
-    fi
-    printf 'rook-ceph\n'
-    ;;
-  "get pods -n rook-ceph -o wide") printf 'NAME READY STATUS\nrook-ceph-operator-0 1/1 Running\n' ;;
-  "get events -n rook-ceph --sort-by=.lastTimestamp") printf 'LAST SEEN TYPE\n1m Normal\n' ;;
-  *"-n rook-ceph -o yaml") printf 'apiVersion: v1\nitems:\n- kind: CephCluster\n' ;;
-  "get pods -n rook-ceph -l app=rook-ceph-operator -o name") printf 'pod/rook-ceph-operator-0\n' ;;
-  "logs -n rook-ceph rook-ceph-operator-0 --since="*) printf 'operator log line\n' ;;
-  "get pods -n rook-ceph -l app=rook-ceph-tools -o name") exit 0 ;;
-  *) printf 'unexpected kubectl: %s\n' "$cmd" >&2; exit 99 ;;
-esac
-EOF
-
-cat >"$fakebin/timeout" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$1" >>"${FAKE_TIMEOUT_LOG:?}"
-shift
-exec "$@"
-EOF
-
-cat >"$fakebin/ssh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >>"${FAKE_SSH_LOG:?}"
-whole="$*"
-args=("$@")
-n=${#args[@]}
-
-# target = first arg after the -i KEY / -o OPT option pairs
-target=''; j=0
-while [[ $j -lt $n ]]; do
-  case "${args[$j]}" in
-    -i|-o) j=$((j + 2)) ;;
-    *) target="${args[$j]}"; break ;;
-  esac
-done
-
-# Order matters: the capability-probe script also contains "kubectl", and the
-# runner connectivity probe ("--connect-timeout 5 -s") must be matched before the
-# generic ceph/cephadm command branches.
-if [[ "$whole" == *"-vvv"* ]]; then
-  printf 'debug1: fake ssh verbose log for %s\n' "$target" >&2
-  printf 'debug3: fake ssh argv %s\n' "$whole" >&2
-  exit 255
-fi
-for t in ${FAKE_SSH_CONNECT_FAIL_TARGETS:-}; do
-  [[ "$target" == *"$t"* ]] && { printf 'ssh: connect to host %s port 22: Connection refused\n' "$target" >&2; exit 255; }
-done
-
-case "$whole" in
-  *"--connect-timeout 5 -s"*)
-    # ceph runner connectivity probe; succeed per method+target env
-    case "$whole" in
-      *"cephadm shell"*) method=cephadm ;;
-      *"sudo -n ceph"*) method=sudo ;;
-      *) method=direct ;;
-    esac
-    ok=0
-    case "$method" in
-      direct) for t in ${FAKE_CEPH_DIRECT_OK:-}; do [[ "$target" == *"$t"* ]] && ok=1; done ;;
-      sudo) for t in ${FAKE_CEPH_SUDO_OK:-}; do [[ "$target" == *"$t"* ]] && ok=1; done ;;
-      cephadm) for t in ${FAKE_CEPHADM_OK:-${FAKE_CEPH_TARGETS:-}}; do [[ "$target" == *"$t"* ]] && ok=1; done ;;
-    esac
-    exit $(( ok == 1 ? 0 : 1 ))
-    ;;
-  *"command -v cephadm"*)
-    for t in ${FAKE_PROBE_FAIL_TARGETS:-}; do [[ "$target" == *"$t"* ]] && exit 255; done
-    caps=""
-    for t in ${FAKE_CEPH_TARGETS:-}; do [[ "$target" == *"$t"* ]] && caps="$caps cephadm"; done
-    for t in ${FAKE_CEPH_BIN_TARGETS:-}; do [[ "$target" == *"$t"* ]] && caps="$caps ceph"; done
-    for t in ${FAKE_KUBE_TARGETS:-}; do [[ "$target" == *"$t"* ]] && caps="$caps kubectl"; done
-    printf '%s\n' "$caps"
-    exit 0
-    ;;
-  *"cephadm shell -- ceph"*)
-    exec "$FIXTURE_SSH" "$@"
-    ;;
-  *collect-node.sh*)
-    alias_name="$(printf '%s\n' "$whole" | sed -n "s/.*--host-alias '\\([^']*\\)'.*/\\1/p")"
-    cat >/dev/null
-    [[ -n "$alias_name" ]] || { printf 'no alias\n' >&2; exit 99; }
-    if [[ "${FAKE_SSH_BAD_TAR_ALIAS:-}" == "$alias_name" ]]; then
-      printf 'not a tar archive\n'; exit 0
-    fi
-    sleep "${FAKE_SSH_SLEEP:-0}"
-    t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT
-    mkdir -p "$t/system"
-    mkdir -p "$t/cephadm/var-lib-ceph-configs/fsid/mon.a"
-    printf 'node %s\n' "$alias_name" >"$t/system/hostname.txt"
-    printf 'secret = should-redact\n' >"$t/cephadm/var-lib-ceph-configs/fsid/mon.a/config"
-    if [[ "${FAKE_SSH_NO_MANIFEST_ALIAS:-}" != "$alias_name" ]]; then
-      printf '{"host":"%s","collector":"collect-node","artifact":"/rmt/out/system/hostname.txt","command":"hostname","exit_code":0,"started":"t0","ended":"t1"}\n' "$alias_name" >"$t/manifest.jsonl"
-    fi
-    [[ "${FAKE_SSH_PEM_ALIAS:-}" == "$alias_name" ]] && printf 'cert\n' >"$t/system/leak.pem"
-    tar -czf - -C "$t" .
-    [[ "${FAKE_SSH_FAIL_ALIAS:-}" == "$alias_name" ]] && exit 2
-    exit 0
-    ;;
-  *kubectl*)
-    seen=0; kargs=()
-    for a in "$@"; do
-      if [[ $seen -eq 1 ]]; then kargs+=("$a"); continue; fi
-      [[ "$a" == "kubectl" ]] && seen=1
-    done
-    exec kubectl "${kargs[@]}"
-    ;;
-  *" ceph "*)
-    # direct/sudo `ceph <args>` cluster commands — same responses as cephadm shell
-    exec "$FIXTURE_SSH" "$@"
-    ;;
-  *)
-    printf 'unexpected ssh remote: %s\n' "$whole" >&2
-    exit 99
-    ;;
-esac
-EOF
-chmod +x "$fakebin/kubectl" "$fakebin/ssh" "$fakebin/timeout"
-
-ssh_key="$tmpdir/id_ed25519"
-printf 'fake key\n' >"$ssh_key"
-export FAKE_SSH_LOG="$tmpdir/ssh.log"
-export FAKE_TIMEOUT_LOG="$tmpdir/timeout.log"
-export FIXTURE_SSH="$ROOT/tests/fixtures/bin/ssh"
+# Shared by the full shell suite and the focused Python compatibility fixture.
+fakebin='' ssh_key='' inventory=''
+# shellcheck disable=SC1091
+source "$ROOT/tests/fixtures/shell-collect-environment.sh"
+setup_shell_collect_environment "$ROOT" "$tmpdir"
 
 # Inventory is declarative input, never executable shell.
 inventory_marker="$tmpdir/inventory-command-ran"
@@ -234,30 +95,22 @@ malicious_status="${malicious_result%%$'\n'*}"
 unsafe_alias_inventory="$tmpdir/inv-unsafe-alias.env"
 printf 'SSH_USER="tester"\nHOSTS=(\n  "../escape=10.0.0.1"\n)\n' >"$unsafe_alias_inventory"
 unsafe_alias_result="$(run_and_capture "$ROOT/run/collect.sh" \
-  --inventory "$unsafe_alias_inventory" --ssh-key "$ssh_key" --mode cephadm)"
+  --inventory "$unsafe_alias_inventory" --ssh-key "$ssh_key" --mode cephadm \
+  --out "$tmpdir/out-unsafe-alias")"
 unsafe_alias_status="${unsafe_alias_result%%$'\n'*}"
 [[ "$unsafe_alias_status" == "1" ]] || fail "unsafe alias should fail before collection"
-[[ ! -e "$tmpdir/escape" ]] || fail "unsafe alias escaped the output root"
+unsafe_alias_escape="$(find "$tmpdir" -name escape -print -quit 2>/dev/null || true)"
+[[ -z "$unsafe_alias_escape" ]] || fail "unsafe alias escaped its output root: $unsafe_alias_escape"
 
 unsafe_target_inventory="$tmpdir/inv-unsafe-target.env"
 printf 'SSH_USER="tester"\nHOSTS=(\n  "node=--ProxyCommand=touch-bad"\n)\n' >"$unsafe_target_inventory"
 : >"$FAKE_SSH_LOG"
 unsafe_target_result="$(PATH="$fakebin:$PATH" run_and_capture "$ROOT/run/collect.sh" \
-  --inventory "$unsafe_target_inventory" --ssh-key "$ssh_key" --mode cephadm)"
+  --inventory "$unsafe_target_inventory" --ssh-key "$ssh_key" --mode cephadm \
+  --out "$tmpdir/out-unsafe-target")"
 unsafe_target_status="${unsafe_target_result%%$'\n'*}"
 [[ "$unsafe_target_status" != "0" ]] || fail "unsafe SSH target should fail collection"
 [[ ! -s "$FAKE_SSH_LOG" ]] || fail "unsafe SSH target reached ssh"
-
-# external topology: a ceph node + a kube node
-inventory="$tmpdir/inv-external.env"
-cat >"$inventory" <<'EOF'
-SSH_USER="tester"
-ROOK_NAMESPACE="rook-ceph"
-HOSTS=(
-  "cephnode=10.0.0.1"
-  "kubenode=10.0.0.9"
-)
-EOF
 
 # ---------------------------------------------------------------------------
 # auto: dual-layer collection (ceph from cephnode, rook from kubenode), --context
@@ -270,6 +123,8 @@ PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
   --mode auto --kube-context lab --out "$out_auto" --since 24h --timeout 5 --node-timeout 90 \
   --keep-original-logs --var-log-max-bytes 123456
 bundle_auto="$(find_bundle "$out_auto")"
+auto_workdirs="$(find "$out_auto" -maxdepth 1 -type d -name 'tmp.*' -print | wc -l | tr -d '[:space:]')"
+[[ "$auto_workdirs" == "0" ]] || fail "successful default Collect left $auto_workdirs workdir(s)"
 assert_archive_contains "$bundle_auto" "cluster/ceph/json/status.json"
 assert_archive_contains "$bundle_auto" "cluster/rook/pods-wide.txt"
 assert_archive_contains "$bundle_auto" "nodes/cephnode/system/hostname.txt"
@@ -523,7 +378,7 @@ assert_archive_has_debug_log_for "$(find_bundle "$out_cluster_sshfail")" "tester
 # A5: empty HOSTS=() -> exit 1 with a clear message (no bash-3.2 unbound error)
 inv_empty="$tmpdir/inv-empty.env"
 printf 'SSH_USER="t"\nHOSTS=()\n' >"$inv_empty"
-empty_result="$(run_and_capture "$ROOT/run/collect.sh" --inventory "$inv_empty" --ssh-key "$ssh_key" --mode cephadm --seed t@1.2.3.4)"
+empty_result="$(run_and_capture "$ROOT/run/collect.sh" --inventory "$inv_empty" --ssh-key "$ssh_key" --mode cephadm --seed t@1.2.3.4 --out "$tmpdir/out-empty")"
 empty_status="${empty_result%%$'\n'*}"
 empty_output="${empty_result#*$'\n'}"
 [[ "$empty_status" == "1" ]] || fail "empty HOSTS should exit 1, got $empty_status"
@@ -687,11 +542,14 @@ mkdir -p "$int_wd2"
   # shellcheck disable=SC1091
   source "$ROOT/lib/bundle.sh"
   # Used by the sourced on_interrupt/cleanup_workdir trap helpers.
-  # shellcheck disable=SC2030
+  # shellcheck disable=SC2030,SC2034
   CLEANUP_WORKDIR="$int_wd2"
-  # shellcheck disable=SC2030
+  # shellcheck disable=SC2030,SC2034
   CLEANUP_KEEP=1
   on_interrupt ) >/dev/null 2>&1 || true
 [[ -d "$int_wd2" ]] || fail "on_interrupt must honor CLEANUP_KEEP=1"
+
+results_after="$(find "$ROOT/results" -mindepth 1 -print 2>/dev/null | sort || true)"
+[[ "$results_after" == "$results_before" ]] || fail "test-collect.sh changed repository results/"
 
 printf 'ok: collect orchestration\n'

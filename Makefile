@@ -1,14 +1,17 @@
-.PHONY: test test-python shellcheck validate
+.PHONY: test check-python test-python shellcheck validate
 
 PYTHON ?= python3
 
-test:
+test: check-python
 	bash tests/run-tests.sh
 
-test-python:
+check-python:
+	@$(PYTHON) -c 'import sys; sys.exit("Python 3.11 or newer is required") if sys.version_info < (3, 11) else None'
+
+test-python: check-python
 	$(PYTHON) -m unittest discover -s tests -p 'test_python_*.py' -v
 
 shellcheck:
-	shellcheck lib/*.sh run/*.sh tests/*.sh
+	shellcheck lib/*.sh run/*.sh tests/*.sh tests/fixtures/*.sh
 
-validate: test test-python shellcheck
+validate: check-python test test-python shellcheck

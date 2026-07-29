@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import io
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -17,11 +18,14 @@ ENTRYPOINT = ROOT / "ceph_incident_bundle.py"
 
 class VerifyCliTests(unittest.TestCase):
     def run_cli(
-        self, *arguments: str, environment: dict[str, str] | None = None
+        self,
+        *arguments: str,
+        environment: dict[str, str] | None = None,
+        working_directory: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(ENTRYPOINT), *arguments],
-            cwd=ROOT,
+            cwd=working_directory or ROOT,
             env={**os.environ, **(environment or {})},
             text=True,
             capture_output=True,
@@ -47,6 +51,29 @@ class VerifyCliTests(unittest.TestCase):
         with tarfile.open(archive, "w:gz") as tar:
             tar.add(source, arcname=".")
 
+    def assert_rejected_after_removing(
+        self, relative_path: Path, expected_error: str
+    ) -> None:
+        for target_kind in ("directory", "archive"):
+            with self.subTest(
+                relative_path=relative_path, target_kind=target_kind
+            ):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    temporary_root = Path(temporary_directory)
+                    bundle = temporary_root / "incident"
+                    self.make_valid_bundle_dir(bundle)
+                    (bundle / relative_path).unlink()
+                    target = bundle
+                    if target_kind == "archive":
+                        target = temporary_root / "incident.tar.gz"
+                        self.make_bundle_archive(bundle, target)
+
+                    result = self.run_cli("verify", str(target))
+
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(expected_error, result.stderr)
+
     def test_wrong_invocation_prints_usage_to_stderr(self) -> None:
         result = self.run_cli("verify")
 
@@ -54,7 +81,54 @@ class VerifyCliTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("Usage:", result.stderr)
 
-    def test_valid_shell_compatible_directory_passes(self) -> None:
+    def test_extra_argument_prints_usage_to_stderr(self) -> None:
+        result = self.run_cli("verify", "bundle.tar.gz", "extra")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("Usage:", result.stderr)
+
+    def test_invalid_command_and_targets_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            wrong_suffix = temporary_root / "bundle.tgz"
+            wrong_suffix.write_bytes(b"not a supported bundle\n")
+            cases = (
+                (("collect", "anything"), "Usage:"),
+                (("verify", str(temporary_root / "missing")), "expected a directory"),
+                (("verify", str(wrong_suffix)), "expected a directory"),
+            )
+            for arguments, expected_error in cases:
+                with self.subTest(arguments=arguments):
+                    result = self.run_cli(*arguments)
+
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(expected_error, result.stderr)
+
+    def test_shell_public_collect_workdir_and_archive_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory) / "shell-fixture"
+            collect = subprocess.run(
+                [
+                    str(ROOT / "tests" / "export-shell-collect-fixture.sh"),
+                    str(fixture_root),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(collect.returncode, 0, collect.stderr)
+
+            for target in (fixture_root / "workdir", fixture_root / "bundle.tar.gz"):
+                with self.subTest(target=target.name):
+                    result = self.run_cli("verify", str(target))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, f"VERIFY PASS: {target}\n")
+                    self.assertEqual(result.stderr, "")
+
+    def test_valid_minimal_directory_passes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             bundle = Path(temporary_directory) / "incident"
             self.make_valid_bundle_dir(bundle)
@@ -65,7 +139,7 @@ class VerifyCliTests(unittest.TestCase):
         self.assertEqual(result.stdout, f"VERIFY PASS: {bundle}\n")
         self.assertEqual(result.stderr, "")
 
-    def test_valid_shell_compatible_archive_passes(self) -> None:
+    def test_valid_minimal_archive_passes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
             bundle = temporary_root / "incident"
@@ -79,65 +153,16 @@ class VerifyCliTests(unittest.TestCase):
         self.assertEqual(result.stdout, f"VERIFY PASS: {archive}\n")
         self.assertEqual(result.stderr, "")
 
-    def test_missing_required_metadata_is_rejected_for_directory_and_archive(self) -> None:
-        for missing_name in ("README-FIRST.txt", "summary.txt", "manifest.jsonl"):
-            for target_kind in ("directory", "archive"):
-                with self.subTest(missing_name=missing_name, target_kind=target_kind):
-                    with tempfile.TemporaryDirectory() as temporary_directory:
-                        temporary_root = Path(temporary_directory)
-                        bundle = temporary_root / "incident"
-                        self.make_valid_bundle_dir(bundle)
-                        (bundle / missing_name).unlink()
-                        target = bundle
-                        if target_kind == "archive":
-                            target = temporary_root / "incident.tar.gz"
-                            self.make_bundle_archive(bundle, target)
-
-                        result = self.run_cli("verify", str(target))
-
-                    self.assertEqual(result.returncode, 1)
-                    self.assertEqual(result.stdout, "")
-                    self.assertIn(missing_name, result.stderr)
-
-    def test_missing_cluster_evidence_is_rejected_for_directory_and_archive(self) -> None:
-        for target_kind in ("directory", "archive"):
-            with self.subTest(target_kind=target_kind):
-                with tempfile.TemporaryDirectory() as temporary_directory:
-                    temporary_root = Path(temporary_directory)
-                    bundle = temporary_root / "incident"
-                    self.make_valid_bundle_dir(bundle)
-                    (bundle / "cluster" / "ceph" / "status.txt").unlink()
-                    target = bundle
-                    if target_kind == "archive":
-                        target = temporary_root / "incident.tar.gz"
-                        self.make_bundle_archive(bundle, target)
-
-                    result = self.run_cli("verify", str(target))
-
-                self.assertEqual(result.returncode, 1)
-                self.assertEqual(result.stdout, "")
-                self.assertIn("cluster/ artifact", result.stderr)
-
-    def test_missing_nodes_evidence_is_rejected_for_directory_and_archive(self) -> None:
-        for target_kind in ("directory", "archive"):
-            with self.subTest(target_kind=target_kind):
-                with tempfile.TemporaryDirectory() as temporary_directory:
-                    temporary_root = Path(temporary_directory)
-                    bundle = temporary_root / "incident"
-                    self.make_valid_bundle_dir(bundle)
-                    (
-                        bundle / "nodes" / "monitor01" / "system" / "hostname.txt"
-                    ).unlink()
-                    target = bundle
-                    if target_kind == "archive":
-                        target = temporary_root / "incident.tar.gz"
-                        self.make_bundle_archive(bundle, target)
-
-                    result = self.run_cli("verify", str(target))
-
-                self.assertEqual(result.returncode, 1)
-                self.assertEqual(result.stdout, "")
-                self.assertIn("nodes/ artifact", result.stderr)
+    def test_missing_required_content_is_rejected_for_directory_and_archive(self) -> None:
+        cases = (
+            (Path("README-FIRST.txt"), "README-FIRST.txt"),
+            (Path("summary.txt"), "summary.txt"),
+            (Path("manifest.jsonl"), "manifest.jsonl"),
+            (Path("cluster/ceph/status.txt"), "cluster/ artifact"),
+            (Path("nodes/monitor01/system/hostname.txt"), "nodes/ artifact"),
+        )
+        for missing_path, expected_error in cases:
+            self.assert_rejected_after_removing(missing_path, expected_error)
 
     def test_corrupt_and_truncated_archives_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -208,6 +233,8 @@ class VerifyCliTests(unittest.TestCase):
             bundle = temporary_root / "incident"
             verifier_tmp = temporary_root / "verifier-tmp"
             verifier_tmp.mkdir()
+            process_cwd = temporary_root / "process-cwd"
+            process_cwd.mkdir()
             self.make_valid_bundle_dir(bundle)
 
             absolute_escape = temporary_root / "absolute-escape.txt"
@@ -219,8 +246,18 @@ class VerifyCliTests(unittest.TestCase):
                     tarfile.REGTYPE,
                     "unsafe archive member",
                 ),
-                ("symlink", "nodes/link", tarfile.SYMTYPE, "symlink"),
-                ("hardlink", "nodes/hardlink", tarfile.LNKTYPE, "hardlink"),
+                (
+                    "symlink",
+                    "nodes/link",
+                    tarfile.SYMTYPE,
+                    "archive contains symlink member",
+                ),
+                (
+                    "hardlink",
+                    "nodes/hardlink",
+                    tarfile.LNKTYPE,
+                    "archive contains hardlink member",
+                ),
                 (
                     "fifo",
                     "nodes/monitor01/system/pipe",
@@ -266,7 +303,10 @@ class VerifyCliTests(unittest.TestCase):
                             output.addfile(member)
 
                     result = self.run_cli(
-                        "verify", str(archive), environment={"TMPDIR": str(verifier_tmp)}
+                        "verify",
+                        str(archive),
+                        environment={"TMPDIR": str(verifier_tmp)},
+                        working_directory=process_cwd,
                     )
 
                     self.assertEqual(result.returncode, 1)
@@ -274,6 +314,8 @@ class VerifyCliTests(unittest.TestCase):
                     self.assertIn(expected_error, result.stderr)
                     self.assertFalse((temporary_root / "escape.txt").exists())
                     self.assertFalse(absolute_escape.exists())
+                    self.assertEqual(list(verifier_tmp.iterdir()), [])
+                    self.assertEqual(list(process_cwd.iterdir()), [])
 
     def test_directory_symlink_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -289,12 +331,40 @@ class VerifyCliTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("symlink", result.stderr)
 
+    def test_directory_special_file_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            bundle = Path(temporary_directory) / "incident"
+            self.make_valid_bundle_dir(bundle)
+            os.mkfifo(bundle / "nodes" / "monitor01" / "system" / "pipe")
+
+            result = self.run_cli("verify", str(bundle))
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("non-file/non-directory", result.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root can read mode-000 directories")
+    def test_unreadable_directory_is_rejected_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            bundle = Path(temporary_directory) / "incident"
+            self.make_valid_bundle_dir(bundle)
+            unreadable = bundle / "nodes" / "monitor01" / "unreadable"
+            unreadable.mkdir()
+            unreadable.chmod(0)
+            try:
+                result = self.run_cli("verify", str(bundle))
+            finally:
+                unreadable.chmod(0o700)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("cannot read bundle directory", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
 
 class ProductionModuleBoundaryTests(unittest.TestCase):
-    def test_runtime_is_exactly_three_cohesive_modules(self) -> None:
-        production_modules = sorted(
-            path.name for path in ROOT.glob("ceph_incident_*.py")
-        )
+    def test_runtime_has_exactly_three_top_level_modules(self) -> None:
+        production_modules = sorted(path.name for path in ROOT.glob("*.py"))
 
         self.assertEqual(
             production_modules,
@@ -303,7 +373,101 @@ class ProductionModuleBoundaryTests(unittest.TestCase):
                 "ceph_incident_collectors.py",
                 "ceph_incident_node.py",
             ],
+            "ADR 0001 requires exactly three top-level production Python modules",
         )
+
+
+class RepositoryGateTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("git"), "git is required for repository gates")
+    def test_local_connection_note_and_agent_worktrees_are_repo_ignored(self) -> None:
+        paths = ".claude/worktrees/review/\nCEPH-LAB-CONNECTION.md\n"
+        result = subprocess.run(
+            ["git", "check-ignore", "-v", "--stdin"],
+            cwd=ROOT,
+            input=paths,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ignored = result.stdout.splitlines()
+        self.assertEqual(len(ignored), 2, result.stdout)
+        self.assertTrue(
+            all(line.startswith(".gitignore:") for line in ignored), result.stdout
+        )
+        self.assertTrue(ignored[0].endswith("\t.claude/worktrees/review/"))
+        self.assertTrue(ignored[1].endswith("\tCEPH-LAB-CONNECTION.md"))
+
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", ".claude/worktrees", "CEPH-LAB-CONNECTION.md"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(tracked.returncode, 0, tracked.stderr)
+        self.assertEqual(tracked.stdout, "")
+
+    @unittest.skipUnless(shutil.which("make"), "make is required for repository gates")
+    def test_python_gate_rejects_an_interpreter_below_311(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fake_python = Path(temporary_directory) / "python-below-311"
+            fake_python.write_text(
+                f"#!{sys.executable}\n"
+                "import os\n"
+                "import sys\n"
+                "if len(sys.argv) != 3 or sys.argv[1] != '-c':\n"
+                "    raise SystemExit('expected Python -c invocation')\n"
+                "real_python = os.environ['REAL_PYTHON']\n"
+                "spoof = \"import sys; sys.version_info = (3, 10, 0, 'final', 0); \"\n"
+                "os.execv(real_python, [real_python, '-c', spoof + sys.argv[2]])\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+
+            result = subprocess.run(
+                ["make", "check-python", f"PYTHON={fake_python}"],
+                cwd=ROOT,
+                env={**os.environ, "REAL_PYTHON": sys.executable},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Python 3.11", result.stdout + result.stderr)
+
+        supported = subprocess.run(
+            ["make", "check-python", f"PYTHON={sys.executable}"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(supported.returncode, 0, supported.stderr)
+
+        test_python_dry_run = subprocess.run(
+            ["make", "-n", "test-python", f"PYTHON={sys.executable}"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(test_python_dry_run.returncode, 0, test_python_dry_run.stderr)
+        self.assertIn("version_info < (3, 11)", test_python_dry_run.stdout)
+        self.assertIn("-m unittest discover", test_python_dry_run.stdout)
+
+        validate_dry_run = subprocess.run(
+            ["make", "-n", "-j4", "validate", f"PYTHON={sys.executable}"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(validate_dry_run.returncode, 0, validate_dry_run.stderr)
+        first_command = validate_dry_run.stdout.splitlines()[0]
+        self.assertIn("version_info < (3, 11)", first_command)
 
 
 if __name__ == "__main__":
