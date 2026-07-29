@@ -100,6 +100,7 @@ def _validate_node_manifest(
     if not lines:
         raise ArchiveRejected("manifest.jsonl is empty")
     string_fields = ("host", "collector", "artifact", "command", "started", "ended")
+    mapped_artifacts: set[str] = set()
     for line_number, line in enumerate(lines, start=1):
         if not line.strip():
             raise ArchiveRejected(f"manifest.jsonl line {line_number} is empty")
@@ -140,6 +141,14 @@ def _validate_node_manifest(
             raise ArchiveRejected(
                 f"manifest.jsonl line {line_number} references a missing artifact"
             )
+        if relative in mapped_artifacts:
+            raise ArchiveRejected(
+                f"manifest.jsonl line {line_number} duplicates an artifact mapping"
+            )
+        mapped_artifacts.add(relative)
+    evidence_files = files - {"manifest.jsonl", "errors.log"}
+    if mapped_artifacts != evidence_files:
+        raise ArchiveRejected("archive contains evidence without a manifest mapping")
 
 
 def accept_node_archive(
@@ -170,7 +179,11 @@ def accept_node_archive(
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(candidate, flags)
-    snapshot = tempfile.TemporaryFile(mode="w+b", dir=workspace)
+    try:
+        snapshot = tempfile.TemporaryFile(mode="w+b", dir=workspace)
+    except OSError:
+        os.close(descriptor)
+        raise
     members: list[tuple[tarfile.TarInfo, str]] = []
     files: dict[str, tarfile.TarInfo] = {}
     directories: set[str] = set()
@@ -313,6 +326,10 @@ def accept_node_archive(
             shutil.rmtree(destination)
         raise
     finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
         snapshot.close()
 
 

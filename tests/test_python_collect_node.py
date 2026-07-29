@@ -25,11 +25,14 @@ class CollectSingleNodeCliTests(unittest.TestCase):
         payload_log = root / "ssh-stdin.py"
         remote_tmp = root / "remote-tmp"
         remote_tmp.mkdir()
+        remote_bin = root / "remote-bin"
+        remote_bin.mkdir()
 
         fixture_bin = ROOT / "tests" / "fixtures" / "python-node" / "bin"
         (fake_bin / "ssh").symlink_to(fixture_bin / "ssh")
         for command in ("hostname", "uname", "uptime", "free", "df", "ip", "systemctl"):
             (fake_bin / command).symlink_to(fixture_bin / "node-command")
+        (remote_bin / "tar").symlink_to(fixture_bin / "node-command")
 
         environment = {
             **os.environ,
@@ -37,6 +40,7 @@ class CollectSingleNodeCliTests(unittest.TestCase):
             "TMPDIR": str(remote_tmp),
             "FAKE_SSH_LOG": str(ssh_log),
             "FAKE_SSH_PAYLOAD": str(payload_log),
+            "FAKE_REMOTE_BIN": str(remote_bin),
         }
         return environment, ssh_log, payload_log
 
@@ -151,7 +155,15 @@ class CollectSingleNodeCliTests(unittest.TestCase):
                 self.assertNotIn("./nodes/monitor01/SKIPPED.txt", names)
                 network = archive.extractfile("./nodes/monitor01/network/ip-addr.txt")
                 self.assertIsNotNone(network)
-                self.assertIn(b"simulated failure for ip", network.read())
+                network_payload = network.read()
+                self.assertIn(b"# host: monitor01\n", network_payload)
+                self.assertIn(b"# collector: collect-node\n", network_payload)
+                self.assertIn(b"# started: ", network_payload)
+                self.assertIn(b"# timeout: ", network_payload)
+                self.assertNotIn(b"# ended:", network_payload)
+                self.assertNotIn(b"# exit_code:", network_payload)
+                self.assertNotIn(b"# command:", network_payload)
+                self.assertIn(b"simulated failure for ip", network_payload)
                 manifest = archive.extractfile("./nodes/monitor01/manifest.jsonl")
                 self.assertIsNotNone(manifest)
                 entries = [json.loads(line) for line in manifest.read().splitlines()]
@@ -159,6 +171,9 @@ class CollectSingleNodeCliTests(unittest.TestCase):
                     entry for entry in entries if entry["command"] == "ip addr show"
                 )
                 self.assertEqual(ip_entry["exit_code"], 17)
+                errors = archive.extractfile("./nodes/monitor01/errors.log")
+                self.assertIsNotNone(errors)
+                self.assertIn(b"command=ip addr show", errors.read())
             self.assertEqual(list((root / "remote-tmp").iterdir()), [])
 
     def test_untrusted_node_archives_are_rejected_before_extraction(self) -> None:
@@ -167,6 +182,8 @@ class CollectSingleNodeCliTests(unittest.TestCase):
             "truncated": "invalid or unreadable archive",
             "missing-manifest": "missing manifest",
             "unsafe": "unsafe archive member",
+            "unmanifested": "archive contains evidence without a manifest mapping",
+            "duplicate-manifest": "duplicates an artifact mapping",
         }
         for mode, expected_reason in expected_reasons.items():
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary_directory:
@@ -192,6 +209,40 @@ class CollectSingleNodeCliTests(unittest.TestCase):
                 self.assertFalse((root / "escape.txt").exists())
                 self.assertFalse((root / "results" / "escape.txt").exists())
                 self.assertEqual(list((root / "remote-tmp").iterdir()), [])
+
+    def test_remote_fatal_failure_cleans_workspace_and_returns_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            environment["FAKE_SSH_MODE"] = "remote-failure"
+
+            result = self.run_collect(root, environment)
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            bundle = Path(result.stdout.removeprefix("bundle: ").strip())
+            with tarfile.open(bundle, "r:gz") as archive:
+                skipped = archive.extractfile("./nodes/monitor01/SKIPPED.txt")
+                self.assertIsNotNone(skipped)
+                self.assertIn(b"exit 74", skipped.read())
+            self.assertIn("simulated archive failure", result.stderr)
+            self.assertEqual(list((root / "remote-tmp").iterdir()), [])
+
+    def test_disconnect_signal_cleans_remote_workspace_and_returns_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            environment["FAKE_NODE_SIGNAL_PARENT"] = "HUP"
+
+            result = self.run_collect(root, environment)
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            bundle = Path(result.stdout.removeprefix("bundle: ").strip())
+            with tarfile.open(bundle, "r:gz") as archive:
+                skipped = archive.extractfile("./nodes/monitor01/SKIPPED.txt")
+                self.assertIsNotNone(skipped)
+                self.assertIn(b"no usable node archive", skipped.read())
+            self.assertIn("node collector interrupted", result.stderr)
+            self.assertEqual(list((root / "remote-tmp").iterdir()), [])
 
     def test_timeout_cleans_remote_workspace_and_returns_partial(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -229,6 +280,39 @@ class CollectSingleNodeCliTests(unittest.TestCase):
             while not list((root / "remote-tmp").iterdir()):
                 if process.poll() is not None or time.monotonic() >= deadline:
                     self.fail("node collector did not create its owned workspace")
+                time.sleep(0.05)
+
+            process.send_signal(signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=10)
+
+            self.assertEqual(process.returncode, 130, stderr)
+            self.assertEqual(stdout, "")
+            self.assertIn("interrupted", stderr)
+            self.assertEqual(list((root / "remote-tmp").iterdir()), [])
+            results = root / "results"
+            self.assertEqual(list(results.glob("tmp.*")), [])
+            self.assertEqual(list(results.glob("*.tar.gz")), [])
+
+    def test_packaging_interruption_removes_reserved_archive_and_workdir(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            fixture_bin = ROOT / "tests" / "fixtures" / "python-node" / "bin"
+            (root / "bin" / "tar").symlink_to(fixture_bin / "tar-wrapper")
+            marker = root / "packaging-started"
+            environment["FAKE_LOCAL_TAR_MARKER"] = str(marker)
+            process = subprocess.Popen(
+                self.prepare_collect(root, node_timeout=30),
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 15
+            while not marker.exists():
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    self.fail("collector did not reach final bundle packaging")
                 time.sleep(0.05)
 
             process.send_signal(signal.SIGINT)

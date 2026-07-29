@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import shlex
 import shutil
@@ -99,13 +100,14 @@ def _write_artifact(
         f"# host: {host_alias}\n"
         "# collector: collect-node\n"
         f"# started: {started}\n"
-        f"# ended: {ended}\n"
-        f"# exit_code: {exit_code}\n"
         f"# timeout: {timeout}s\n"
-        f"# command: {shlex.join(command)}\n"
-        "\n"
     ).encode()
-    artifact.write_bytes(header + stdout + stderr)
+    timeout_marker = b""
+    if exit_code in (124, 137):
+        timeout_marker = (
+            f"# TRUNCATED: command timed out after {timeout}s (exit {exit_code})\n"
+        ).encode()
+    artifact.write_bytes(header + stdout + stderr + timeout_marker)
     entry = {
         "host": host_alias,
         "collector": "collect-node",
@@ -117,6 +119,13 @@ def _write_artifact(
     }
     with manifest.open("a", encoding="utf-8") as output_stream:
         output_stream.write(json.dumps(entry, sort_keys=True) + "\n")
+    if exit_code != 0:
+        with (manifest.parent / "errors.log").open("a", encoding="utf-8") as errors:
+            errors.write(
+                f"{ended} host={host_alias} collector=collect-node "
+                f"artifact={artifact} exit={exit_code} "
+                f"command={shlex.join(command)}\n"
+            )
     return exit_code == 0
 
 
@@ -126,6 +135,7 @@ def _write_archive(output: Path, workspace: Path) -> bool:
         ["tar", "-cf", str(uncompressed), "-C", str(output), "."],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
+        env={**os.environ, "COPYFILE_DISABLE": "1"},
         check=False,
     )
     if tar_result.returncode != 0:
@@ -161,7 +171,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
     workspace: Path | None = None
     previous_handlers: dict[int, object] = {}
-    for signal_number in (signal.SIGINT, signal.SIGTERM):
+    handled_signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        handled_signals.append(signal.SIGHUP)
+    for signal_number in handled_signals:
         previous_handlers[signal_number] = signal.signal(
             signal_number, _raise_interrupted
         )

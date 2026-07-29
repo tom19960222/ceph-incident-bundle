@@ -39,23 +39,48 @@ if mode == "missing-python":
 if mode == "corrupt":
     sys.stdout.buffer.write(b"not a gzip stream\n")
     raise SystemExit(0)
-if mode in ("missing-manifest", "unsafe"):
+if mode in ("missing-manifest", "unsafe", "unmanifested", "duplicate-manifest"):
     archive_buffer = io.BytesIO()
     with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
-        member = tarfile.TarInfo(
-            "system/hostname.txt" if mode == "missing-manifest" else "../escape.txt"
-        )
-        member_payload = b"must not escape\n"
-        member.size = len(member_payload)
-        archive.addfile(member, io.BytesIO(member_payload))
+        files = {
+            "system/hostname.txt": b"monitor01\n",
+        }
+        if mode == "unsafe":
+            files = {"../escape.txt": b"must not escape\n"}
+        if mode == "unmanifested":
+            files["system/uname.txt"] = b"unmanifested\n"
+        if mode != "missing-manifest" and mode != "unsafe":
+            entry = {
+                "host": "monitor01",
+                "collector": "collect-node",
+                "artifact": "/tmp/owned/out/system/hostname.txt",
+                "command": "hostname",
+                "exit_code": 0,
+                "started": "2026-07-29T00:00:00Z",
+                "ended": "2026-07-29T00:00:01Z",
+            }
+            manifest_lines = [json.dumps(entry)]
+            if mode == "duplicate-manifest":
+                manifest_lines.append(json.dumps(entry))
+            files["manifest.jsonl"] = ("\n".join(manifest_lines) + "\n").encode()
+        for name, member_payload in files.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(member_payload)
+            archive.addfile(member, io.BytesIO(member_payload))
     sys.stdout.buffer.write(archive_buffer.getvalue())
     raise SystemExit(0)
 
+child_environment = os.environ.copy()
+if mode == "remote-failure":
+    child_environment["PATH"] = (
+        os.environ["FAKE_REMOTE_BIN"] + os.pathsep + child_environment["PATH"]
+    )
 result = subprocess.run(
     ["/bin/sh", "-c", "exec " + remote_command],
     input=payload,
     stdout=subprocess.PIPE,
     stderr=sys.stderr.buffer,
+    env=child_environment,
     check=False,
 )
 archive_payload = result.stdout

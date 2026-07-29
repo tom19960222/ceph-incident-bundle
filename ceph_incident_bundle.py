@@ -287,6 +287,7 @@ def _collect(arguments: Sequence[str]) -> int:
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            env={**os.environ, "COPYFILE_DISABLE": "1"},
             check=False,
         )
         if packaged.returncode != 0:
@@ -298,9 +299,13 @@ def _collect(arguments: Sequence[str]) -> int:
         print(f"bundle: {archive}")
         return result.exit_code
     except CollectionInterrupted:
+        if archive is not None:
+            archive.unlink(missing_ok=True)
         print("interrupted — stopping and cleaning up…", file=sys.stderr)
         return 130
     except KeyboardInterrupt:
+        if archive is not None:
+            archive.unlink(missing_ok=True)
         print("interrupted — stopping and cleaning up…", file=sys.stderr)
         return 130
     except (OSError, VerificationError) as error:
@@ -427,15 +432,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
     target = Path(args[1])
     try:
-        if target.is_dir():
-            _verify_directory(target)
-        elif target.is_file() and args[1].endswith(".tar.gz"):
-            files = _read_archive(target)
-            _verify_file_set(files)
-        else:
+        if not target.is_dir() and not (
+            target.is_file() and args[1].endswith(".tar.gz")
+        ):
             raise VerificationError(
                 f"expected a directory or .tar.gz bundle: {args[1]}"
             )
+        _verify_bundle_path(target)
     except VerificationError as error:
         print(f"VERIFY FAIL: {error}", file=sys.stderr)
         return 1
