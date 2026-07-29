@@ -74,6 +74,29 @@ class VerifyCliTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
                 self.assertIn(expected_error, result.stderr)
 
+    def assert_content_rejected_for_directory_and_archive(
+        self, relative_path: Path, payload: bytes, expected_error: str
+    ) -> None:
+        for target_kind in ("directory", "archive"):
+            with self.subTest(path=relative_path, target_kind=target_kind):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    temporary_root = Path(temporary_directory)
+                    bundle = temporary_root / "incident"
+                    self.make_valid_bundle_dir(bundle)
+                    destination = bundle / relative_path
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(payload)
+                    target = bundle
+                    if target_kind == "archive":
+                        target = temporary_root / "incident.tar.gz"
+                        self.make_bundle_archive(bundle, target)
+
+                    result = self.run_cli("verify", str(target))
+
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(expected_error, result.stderr)
+
     def test_wrong_invocation_prints_usage_to_stderr(self) -> None:
         result = self.run_cli("verify")
 
@@ -316,6 +339,123 @@ class VerifyCliTests(unittest.TestCase):
                     self.assertFalse(absolute_escape.exists())
                     self.assertEqual(list(verifier_tmp.iterdir()), [])
                     self.assertEqual(list(process_cwd.iterdir()), [])
+
+    def test_secret_paths_are_rejected_for_directory_and_archive(self) -> None:
+        for relative_path in (
+            Path("nodes/monitor01/keyring"),
+            Path("nodes/monitor01/.ssh/config"),
+            Path("nodes/monitor01/id_ed25519"),
+            Path("nodes/monitor01/private_key"),
+            Path("nodes/monitor01/client.pem"),
+        ):
+            self.assert_content_rejected_for_directory_and_archive(
+                relative_path, b"not secret by content\n", "forbidden path"
+            )
+
+    def test_private_key_and_ceph_key_content_are_rejected(self) -> None:
+        for payload in (
+            b"-----BEGIN OPENSSH PRIVATE KEY-----\nmaterial\n",
+            b"key = AQB12345678901234567890==\n",
+        ):
+            self.assert_content_rejected_for_directory_and_archive(
+                Path("nodes/monitor01/system/leak.txt"),
+                payload,
+                "unredacted PRIVATE KEY / key material",
+            )
+
+    def test_structural_payload_cap_bounds_directory_and_archive_expansion(
+        self,
+    ) -> None:
+        for target_kind in ("directory", "archive"):
+            with self.subTest(target_kind=target_kind):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    temporary_root = Path(temporary_directory)
+                    bundle = temporary_root / "incident"
+                    self.make_valid_bundle_dir(bundle)
+                    (bundle / "nodes/monitor01/system/large.txt").write_bytes(
+                        b"x" * (64 * 1024)
+                    )
+                    target = bundle
+                    if target_kind == "archive":
+                        target = temporary_root / "incident.tar.gz"
+                        self.make_bundle_archive(bundle, target)
+
+                    result = self.run_cli(
+                        "verify",
+                        str(target),
+                        environment={
+                            "CEPH_INCIDENT_TEST_BUNDLE_SAFETY_CAP_BYTES": "32768"
+                        },
+                    )
+
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("structural payload cap", result.stderr)
+
+    def test_archive_missing_tar_end_markers_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            bundle = temporary_root / "incident"
+            complete = temporary_root / "complete.tar.gz"
+            truncated = temporary_root / "missing-eoa.tar.gz"
+            self.make_valid_bundle_dir(bundle)
+            self.make_bundle_archive(bundle, complete)
+            tar_payload = gzip.decompress(complete.read_bytes())
+            blocks = [
+                tar_payload[index : index + 512]
+                for index in range(0, len(tar_payload), 512)
+            ]
+            last_nonzero = max(index for index, block in enumerate(blocks) if any(block))
+            truncated.write_bytes(
+                gzip.compress(
+                    b"".join(blocks[: last_nonzero + 1]) + b"\0" * 512,
+                    mtime=0,
+                )
+            )
+
+            result = self.run_cli("verify", str(truncated))
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("missing tar end markers", result.stderr)
+
+    def test_archive_file_ancestor_collision_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            bundle = temporary_root / "incident"
+            archive_path = temporary_root / "hierarchy.tar.gz"
+            self.make_valid_bundle_dir(bundle)
+            with tarfile.open(archive_path, "w:gz") as archive:
+                archive.add(bundle, arcname=".")
+                for name in ("rogue", "rogue/child"):
+                    member = tarfile.TarInfo(name)
+                    member.size = 1
+                    archive.addfile(member, io.BytesIO(b"x"))
+
+            result = self.run_cli("verify", str(archive_path))
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("hierarchy collision", result.stderr)
+
+    def test_archive_regular_root_member_is_rejected_as_a_file_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            bundle = temporary_root / "incident"
+            archive_path = temporary_root / "file-root.tar.gz"
+            self.make_valid_bundle_dir(bundle)
+            with tarfile.open(archive_path, "w:gz") as archive:
+                root_member = tarfile.TarInfo(".")
+                root_member.size = 0
+                archive.addfile(root_member, io.BytesIO())
+                for path in sorted(bundle.rglob("*")):
+                    archive.add(
+                        path,
+                        arcname=path.relative_to(bundle).as_posix(),
+                        recursive=False,
+                    )
+
+            result = self.run_cli("verify", str(archive_path))
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("hierarchy collision", result.stderr)
 
     def test_directory_symlink_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

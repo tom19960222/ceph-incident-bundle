@@ -36,15 +36,16 @@ Rook 只在明確指定 `--kube-mode` 時收集，這和 #13 的 Ceph 層只在�
 
 #16 將以上 slices 組成一個公開 Collect：inventory 現在可包含多個有效 node，`--mode auto|cephadm|rook` 預設為 `auto`，cluster capability probe 依序選擇第一個可用來源，Ceph runner 只在安全的 direct 與 `sudo -n` 之間 fallback，explicit `--seed` 則釘住來源、不因 probe 失敗改選 inventory node。Rook 依 `--kube-mode local|remote` 選工作機或第一個有 kubectl 能力的 node；Prometheus 仍只由 `--prom-url` 啟用。單次 invocation 會串行組合所有已選 cluster evidence 與每個有效 inventory node，valid-partial Node Evidence Archive 和其他成功 evidence 都會保留，summary、exit code、雙階段 Verify、packaging、success/failure/interrupt cleanup 與 `--keep-workdir` 維持 public lifecycle。Offline mixed black-box case 以同一 fake environment 一次涵蓋 Ceph、Rook、Prometheus、兩個 nodes 與 `/var/log`。Capability 與 runner probes 只使用明確 argv 和既有 SSH option vector；`cephadm shell`、`kubectl exec` 仍不可到達。
 
+#17 在公開入口加入單一、可獨立移除的 Content Safety seam，忠實保留 `--redact`／`--no-redact` 的預設與後出現者生效語意、text 與 gz／xz／bz2／zst 壓縮 evidence 的行級遮蔽、permission mode、解壓／重壓失敗 disposition、Prometheus metric dump 與 node raw opaque evidence 排除，以及 redaction 後的 per-node log cap。`Verify` 仍把長期 Structural Verification 與暫時的 secret path／content scan 分開：目錄與封存檔都檢查必要 metadata、cluster/node evidence、路徑與 member type／collision／hierarchy、payload ceiling、gzip／tar 完整性及 tar end markers；封存檔先以 no-follow、有限大小的私有 snapshot 固定輸入，再由兩種檢查讀取同一份 bytes。公開 `collect` 在 packaging 前驗 workdir、packaging 後驗 archive；任一驗證失敗都保留可診斷 workdir、把 final status 改為 fatal，並移除或不發布 archive。離線黑箱案例覆蓋 redaction modes、所有支援 codec 與失敗處置、opaque／Prometheus exclusion、post-redaction cap、secret path／content、malicious／truncated archive 與雙階段驗證失敗。
+
 這仍是有明確限制的 Python candidate，不是 feature-complete Collect／Verify 契約，也不是 real-lab qualification evidence。
 
-- Direct Ceph 與 Rook slice 都尚未含 redaction；#17 移植 content safety 前，真實 lab 的 `config dump` 或 `rook-resources.yaml` 等輸出可能仍帶 key 材料而被 verifier 的 content check 攔下。
-- #17 會移植 cutover 階段仍保留的 secret path/content checks，並補齊長期 Structural Verification payload cap、雙階段驗證與相關黑箱案例。
+- #17 已完成 Content Safety 與完整 Structural Verification 的 Python candidate；Content Safety 尚未移除，任何移除仍須在 Python cutover 完成後另立變更。
 - #23 已修正 shell Node Evidence Archive 的 pre-extraction acceptance boundary；shell reference 仍須通過 #19／#20 的其餘 qualification gates。
-- #17 的 malicious final Incident Bundle 黑箱案例負責收斂 shell/Python Verify 對 link、special member、member collision 等接受差異；#23 只處理 shell 收到 Node Evidence Archive 後、解壓前的窄幅安全邊界。
-- #17 未完成前，PR #24 的 candidate 只能作為離線 validation foundation，不能宣稱 feature-complete、observable-equivalent 或 qualification-ready；#23 的 shell boundary 完成不改變這項限制。
+- #17 的 malicious final Incident Bundle 黑箱案例已收斂 Python Verify 對 link、special member、member collision、hierarchy、truncation 與 tar end markers 的接受邊界；#23 只處理 shell 收到 Node Evidence Archive 後、解壓前的窄幅安全邊界。
+- #18 的 offline observable-contract equivalence gate 與 #19／#20 real-lab gates 尚未完成，因此目前仍不能宣稱 feature-complete、observable-equivalent 或 qualification-ready。
 
-本階段的 Python 3.11 baseline 由 Makefile 的 offline gate 在任何測試前 fail fast；#11 已完成 node runtime negotiation 與 graceful-skip seam，#12 已完成 `/var/log` forensic evidence，#13、#14 與 #15 已分別完成 direct Ceph、Rook 與 Prometheus cluster evidence，#16 已完成多 node、source/runner selection 與 multi-source orchestration。下一個 implementation blocker 是 #17 的 Content Safety 與完整 Structural Verification；在 #17、offline differential gate 與 real-lab gates 完成前，本 candidate 仍不可宣稱 feature-complete、observable-equivalent 或 qualification-ready。
+本階段的 Python 3.11 baseline 由 Makefile 的 offline gate 在任何測試前 fail fast；#11 已完成 node runtime negotiation 與 graceful-skip seam，#12 已完成 `/var/log` forensic evidence，#13、#14 與 #15 已分別完成 direct Ceph、Rook 與 Prometheus cluster evidence，#16 已完成多 node、source/runner selection 與 multi-source orchestration，#17 已完成 Content Safety 與完整 Structural Verification。下一個 implementation blocker 是 #18 的 offline observable-contract equivalence gate；在 offline differential gate 與 real-lab gates 完成前，本 candidate 仍不可宣稱 feature-complete、observable-equivalent 或 qualification-ready。
 
 ## Locked Design
 
