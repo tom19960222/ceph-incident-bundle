@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import io
+import json
+import os
+import subprocess
+import sys
+import tarfile
+
+
+arguments = sys.argv[1:]
+remote_command = arguments[-1]
+mode = os.environ.get("FAKE_SSH_MODE", "execute")
+log_path = os.environ.get("FAKE_SSH_LOG")
+if log_path:
+    with open(log_path, "w", encoding="utf-8") as output:
+        json.dump(arguments, output)
+
+if mode == "timeout":
+    os.execve(
+        "/bin/sh",
+        ["sh", "-c", "exec " + remote_command],
+        os.environ,
+    )
+
+payload = sys.stdin.buffer.read()
+payload_path = os.environ.get("FAKE_SSH_PAYLOAD")
+if payload_path:
+    with open(payload_path, "wb") as output:
+        output.write(payload)
+
+if mode == "unsupported":
+    print("SKIPPED: Python 3.11 or newer is required", file=sys.stderr)
+    raise SystemExit(75)
+if mode == "missing-python":
+    print("python3: command not found", file=sys.stderr)
+    raise SystemExit(127)
+if mode == "corrupt":
+    sys.stdout.buffer.write(b"not a gzip stream\n")
+    raise SystemExit(0)
+if mode in ("missing-manifest", "unsafe", "unmanifested", "duplicate-manifest"):
+    archive_buffer = io.BytesIO()
+    with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
+        files = {
+            "system/hostname.txt": b"monitor01\n",
+        }
+        if mode == "unsafe":
+            files = {"../escape.txt": b"must not escape\n"}
+        if mode == "unmanifested":
+            files["system/uname.txt"] = b"unmanifested\n"
+        if mode != "missing-manifest" and mode != "unsafe":
+            entry = {
+                "host": "monitor01",
+                "collector": "collect-node",
+                "artifact": "/tmp/owned/out/system/hostname.txt",
+                "command": "hostname",
+                "exit_code": 0,
+                "started": "2026-07-29T00:00:00Z",
+                "ended": "2026-07-29T00:00:01Z",
+            }
+            manifest_lines = [json.dumps(entry)]
+            if mode == "duplicate-manifest":
+                manifest_lines.append(json.dumps(entry))
+            files["manifest.jsonl"] = ("\n".join(manifest_lines) + "\n").encode()
+        for name, member_payload in files.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(member_payload)
+            archive.addfile(member, io.BytesIO(member_payload))
+    sys.stdout.buffer.write(archive_buffer.getvalue())
+    raise SystemExit(0)
+
+child_environment = os.environ.copy()
+if mode == "remote-failure":
+    child_environment["PATH"] = (
+        os.environ["FAKE_REMOTE_BIN"] + os.pathsep + child_environment["PATH"]
+    )
+result = subprocess.run(
+    ["/bin/sh", "-c", "exec " + remote_command],
+    input=payload,
+    stdout=subprocess.PIPE,
+    stderr=sys.stderr.buffer,
+    env=child_environment,
+    check=False,
+)
+archive_payload = result.stdout
+if mode == "truncated" and archive_payload:
+    archive_payload = archive_payload[:-8]
+sys.stdout.buffer.write(archive_payload)
+raise SystemExit(result.returncode)

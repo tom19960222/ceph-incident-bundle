@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+command_name=${0##*/}
+if [ "${FAKE_NODE_SIGNAL_PARENT:-}" = "HUP" ]; then
+  kill -HUP "$PPID"
+  sleep 60
+fi
+if [ "${FAKE_NODE_SLEEP_COMMAND:-}" = "$command_name" ]; then
+  sleep 60
+fi
+if [ "${FAKE_NODE_FAIL_COMMAND:-}" = "$command_name" ]; then
+  printf 'simulated failure for %s\n' "$command_name" >&2
+  exit 17
+fi
+
+case "$command_name" in
+  hostname) printf 'monitor01\n' ;;
+  uname) printf 'Linux monitor01 test-kernel\n' ;;
+  uptime) printf 'up 10 days\n' ;;
+  free) printf 'Mem: 1024 512 512\n' ;;
+  df) printf '/dev/vda ext4 10G 1G 9G 10%% /\n' ;;
+  ip) printf '1: lo: <LOOPBACK>\n' ;;
+  systemctl) printf '0 loaded units listed\n' ;;
+  tar) printf 'simulated archive failure\n' >&2; exit 17 ;;
+  *) printf 'unexpected fake node command: %s\n' "$command_name" >&2; exit 64 ;;
+esac

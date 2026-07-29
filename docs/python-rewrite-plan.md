@@ -16,14 +16,18 @@
 
 ## Current Python Candidate Boundary
 
-PR #24／#10 是 validation foundation 的第一條 vertical slice：公開 `verify` 能從 shell-produced workdir/archive 驗證必要 metadata、cluster/node evidence、archive integrity 與已納入的 traversal/link/special-member containment，但它仍是 structural-only candidate，不是最終 Verify 契約。
+PR #24／#10 建立 validation foundation 的第一條 vertical slice：公開 `verify` 能從 shell-produced workdir/archive 驗證必要 metadata、cluster/node evidence、archive integrity 與已納入的 traversal/link/special-member containment。Issue #11 再加入單一 inventory node 的公開 `collect` slice：工作機以一次 SSH process 將自足 `ceph_incident_node.py` 經 stdin 傳送，固定 bootstrap 在同一連線檢查 Python 3.11、以穩定 source name compile／exec，node 以 stdout 回傳 Node Evidence Archive 並只以 stderr 輸出 diagnostics。
+
+#11 目前只收集 shell contract 的七個 basic node commands，不包含 `/var/log`、Ceph、Rook、Prometheus、多 node orchestration、完整 content safety 或最終 cutover CLI surface。工作機先把 SSH stdout 寫進 invocation-owned candidate，完整驗證 gzip/tar/member payload、manifest 一對一 mapping、payload cap、member type/name/collision/hierarchy 後才手工解出；missing/old Python 會成為 Skipped Node，valid archive 搭配 remote nonzero 會保留為 partial，corrupt/truncated/missing-manifest/unsafe archive 則在 extraction write 前原子拒絕。每次 node invocation identifier 會記在 `environment.txt`；success、valid-partial、fatal archive failure、timeout、SIGINT 與模擬 SSH 斷線的 SIGHUP cleanup 都有 fake-SSH offline proof。macOS 上的 tar 也明確停用 AppleDouble metadata，避免 archive 出現 collector 未宣告的 evidence members。
+
+這仍是有明確限制的 Python candidate，不是 feature-complete Collect／Verify 契約，也不是 real-lab qualification evidence。
 
 - #17 會移植 cutover 階段仍保留的 secret path/content checks，並補齊長期 Structural Verification payload cap、雙階段驗證與相關黑箱案例。
 - #23 已修正 shell Node Evidence Archive 的 pre-extraction acceptance boundary；shell reference 仍須通過 #19／#20 的其餘 qualification gates。
 - #17 的 malicious final Incident Bundle 黑箱案例負責收斂 shell/Python Verify 對 link、special member、member collision 等接受差異；#23 只處理 shell 收到 Node Evidence Archive 後、解壓前的窄幅安全邊界。
 - #17 未完成前，PR #24 的 candidate 只能作為離線 validation foundation，不能宣稱 feature-complete、observable-equivalent 或 qualification-ready；#23 的 shell boundary 完成不改變這項限制。
 
-本階段的 Python 3.11 baseline 由 Makefile 的 offline gate 在任何測試前 fail fast；它不是宣稱目前 structural-only CLI 已完成所有 workstation/node runtime negotiation。完整 supported-node graceful-skip 契約仍依 ADR 0003 與後續 collector tickets 實作。
+本階段的 Python 3.11 baseline 由 Makefile 的 offline gate 在任何測試前 fail fast；#11 已完成單一 node 的 runtime negotiation 與 graceful-skip seam，但 `/var/log`、多 node 與 multi-source orchestration 仍依後續 collector tickets 實作。
 
 ## Locked Design
 
