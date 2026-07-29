@@ -19,7 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 
-NODE_ARCHIVE_MAX_BYTES = 1024**3
+NODE_ARCHIVE_OVERHEAD_BYTES = 1024**3
+NODE_ARCHIVE_SAFETY_CEILING_BYTES = 1024**4
 MANIFEST_MAX_BYTES = 16 * 1024 * 1024
 REMOTE_BOOTSTRAP = """\
 import sys
@@ -156,6 +157,7 @@ def accept_node_archive(
     destination_argument: Path,
     workspace_argument: Path,
     expected_host: str,
+    max_archive_bytes: int = NODE_ARCHIVE_OVERHEAD_BYTES,
 ) -> None:
     """Validate all archive bytes and metadata before creating destination."""
 
@@ -194,14 +196,14 @@ def accept_node_archive(
         candidate_stat = os.fstat(descriptor)
         if (
             not stat.S_ISREG(candidate_stat.st_mode)
-            or candidate_stat.st_size > NODE_ARCHIVE_MAX_BYTES
+            or candidate_stat.st_size > max_archive_bytes
         ):
             raise ArchiveRejected("compressed archive exceeds payload cap")
         compressed_bytes = 0
         with os.fdopen(descriptor, "rb", closefd=True) as source:
             while chunk := source.read(1024 * 1024):
                 compressed_bytes += len(chunk)
-                if compressed_bytes > NODE_ARCHIVE_MAX_BYTES:
+                if compressed_bytes > max_archive_bytes:
                     raise ArchiveRejected("compressed archive exceeds payload cap")
                 snapshot.write(chunk)
         snapshot.flush()
@@ -211,7 +213,7 @@ def accept_node_archive(
         with gzip.GzipFile(fileobj=snapshot, mode="rb") as compressed:
             while chunk := compressed.read(1024 * 1024):
                 expanded_bytes += len(chunk)
-                if expanded_bytes > NODE_ARCHIVE_MAX_BYTES:
+                if expanded_bytes > max_archive_bytes:
                     raise ArchiveRejected("expanded archive exceeds payload cap")
 
         snapshot.seek(0)
@@ -258,7 +260,7 @@ def accept_node_archive(
                 if member.isdir():
                     continue
                 declared_payload += member.size
-                if declared_payload > NODE_ARCHIVE_MAX_BYTES:
+                if declared_payload > max_archive_bytes:
                     raise ArchiveRejected("archive file payload exceeds payload cap")
                 source = archive.extractfile(member)
                 if source is None:
@@ -406,6 +408,10 @@ def collect_single_node(
     node_timeout: int,
     command_timeout: int,
     known_hosts_file: Path | None,
+    skip_logs: bool,
+    keep_original_logs: bool,
+    var_log_max_bytes: int | str,
+    since: str,
 ) -> NodeCollectionResult:
     """Collect one node through the fixed stdin/archive SSH process contract."""
 
@@ -415,6 +421,10 @@ def collect_single_node(
             "host_alias": host_alias,
             "invocation_id": invocation_id,
             "command_timeout": command_timeout,
+            "skip_logs": skip_logs,
+            "keep_original_logs": keep_original_logs,
+            "var_log_max_bytes": var_log_max_bytes,
+            "since": since,
         },
         separators=(",", ":"),
     ).encode()
@@ -462,7 +472,20 @@ def collect_single_node(
                 2, remote_exit_code, False, reason, invocation_id
             )
         try:
-            accept_node_archive(candidate, destination, workspace, host_alias)
+            if isinstance(var_log_max_bytes, int):
+                archive_cap = min(
+                    var_log_max_bytes + NODE_ARCHIVE_OVERHEAD_BYTES,
+                    NODE_ARCHIVE_SAFETY_CEILING_BYTES,
+                )
+            else:
+                archive_cap = NODE_ARCHIVE_SAFETY_CEILING_BYTES
+            accept_node_archive(
+                candidate,
+                destination,
+                workspace,
+                host_alias,
+                max_archive_bytes=archive_cap,
+            )
         except ManifestMissing:
             reason = f"incomplete node archive returned from {target}: missing manifest"
             _write_skipped(destination, reason)

@@ -22,6 +22,8 @@ from ceph_incident_collectors import CollectionInterrupted, collect_single_node
 
 USAGE = """Usage:
   ceph_incident_bundle.py collect --inventory PATH --ssh-key PATH [options]
+    [--since RANGE] [--skip-logs] [--keep-original-logs]
+    [--var-log-max-bytes BYTES|unlimited]
   ceph_incident_bundle.py verify <bundle-dir|bundle.tar.gz>"""
 REQUIRED_FILES = ("manifest.jsonl", "summary.txt", "README-FIRST.txt")
 SAFE_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -59,6 +61,10 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
         "timeout": 20,
         "node_timeout": 300,
         "trust_ssh_host_key": True,
+        "skip_logs": False,
+        "keep_original_logs": False,
+        "var_log_max_bytes": 10 * 1024**3,
+        "since": "24h",
     }
     index = 0
     while index < len(arguments):
@@ -71,12 +77,18 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
             values["trust_ssh_host_key"] = argument == "--trust-ssh-host-key"
             index += 1
             continue
+        if argument in ("--skip-logs", "--keep-original-logs"):
+            values[argument.removeprefix("--").replace("-", "_")] = True
+            index += 1
+            continue
         option_names = {
             "--inventory": "inventory",
             "--ssh-key": "ssh_key",
             "--out": "out",
             "--timeout": "timeout",
             "--node-timeout": "node_timeout",
+            "--var-log-max-bytes": "var_log_max_bytes",
+            "--since": "since",
         }
         key = option_names.get(argument)
         if key is None:
@@ -86,6 +98,19 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
         raw_value = arguments[index + 1]
         if key in ("inventory", "ssh_key", "out"):
             values[key] = Path(raw_value)
+        elif key == "var_log_max_bytes":
+            if raw_value == "unlimited":
+                values[key] = raw_value
+            elif raw_value.isdecimal():
+                values[key] = int(raw_value)
+            else:
+                raise CollectUsageError(
+                    "--var-log-max-bytes must be a non-negative integer or unlimited"
+                )
+        elif key == "since":
+            if not raw_value:
+                raise CollectUsageError("--since must not be empty")
+            values[key] = raw_value
         else:
             values[key] = _positive_integer(raw_value, argument)
         index += 2
@@ -250,6 +275,10 @@ def _collect(arguments: Sequence[str]) -> int:
             node_timeout=int(options["node_timeout"]),
             command_timeout=int(options["timeout"]),
             known_hosts_file=known_hosts,
+            skip_logs=bool(options["skip_logs"]),
+            keep_original_logs=bool(options["keep_original_logs"]),
+            var_log_max_bytes=options["var_log_max_bytes"],
+            since=str(options["since"]),
         )
         if result.reason is not None:
             with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
