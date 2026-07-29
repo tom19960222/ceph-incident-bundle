@@ -38,6 +38,25 @@ class CollectContentSafetyTests(DirectCephFixture, unittest.TestCase):
                 contents["redactions.log"],
             )
 
+    def test_redaction_handles_ascii_whitespace_and_a_long_single_line(self) -> None:
+        cases = (
+            ("FAKE_CEPH_WHITESPACE_SECRET", "whitespace-must-redact"),
+            ("FAKE_CEPH_LONG_GAP_SECRET", "long-gap-must-redact"),
+        )
+        for knob, secret in cases:
+            with self.subTest(knob=knob):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    root = Path(temporary_directory)
+                    environment, _ = self.make_fake_environment(root, **{knob: "1"})
+
+                    result = self.run_collect(root, environment)
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    contents = self.extract(self.bundle_of(result))
+                    config_dump = contents["cluster/ceph/json/config-dump.json"]
+                    self.assertEqual(config_dump.splitlines()[-1], "[REDACTED]")
+                    self.assertNotIn(secret, config_dump)
+
     def test_no_redact_keeps_sensitive_text_and_still_writes_the_log(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -196,6 +215,42 @@ class CollectContentSafetyTests(DirectCephFixture, unittest.TestCase):
             self.assertIn("decompress failed", redaction_log)
             self.assertIn("NOT redacted", redaction_log)
 
+    def test_compressed_expansion_over_safety_cap_is_preserved_and_partial(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _ = self.make_fake_environment(
+                root, FAKE_NODE_COMPRESSED_BOMB="1"
+            )
+            environment["CEPH_INCIDENT_TEST_REDACTION_DECODE_CAP_BYTES"] = "4096"
+            expected = gzip.compress(
+                b"safe evidence\n"
+                + b"x" * (64 * 1024)
+                + b"\nsecret = must-not-leak\n",
+                mtime=0,
+            )
+
+            result = self.run_collect(root, environment)
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            contents = self.extract(self.bundle_of(result))
+            with tarfile.open(self.bundle_of(result), "r:gz") as archive:
+                compressed = archive.extractfile(
+                    "./nodes/monitor01/logs/var-log/merged/tree/files/bomb.log.gz"
+                )
+                self.assertIsNotNone(compressed)
+                preserved = compressed.read()
+            self.assertEqual(
+                hashlib.sha256(preserved).digest(), hashlib.sha256(expected).digest()
+            )
+            self.assertIn("decompressed payload exceeds safety cap", contents["redactions.log"])
+            self.assertIn("NOT redacted", contents["redactions.log"])
+            self.assertIn(
+                "redaction failed; original collected artifact was preserved",
+                contents["errors.log"],
+            )
+
     def test_recompress_failure_preserves_original_and_continues_other_redactions(
         self,
     ) -> None:
@@ -313,6 +368,25 @@ class CollectContentSafetyTests(DirectCephFixture, unittest.TestCase):
             marker = contents["nodes/monitor01/logs/var-log/OVER-LIMIT.txt"]
             self.assertIn("status=not-collected-post-redaction-cap", marker)
             self.assertIn("node monitor01 log payload exceeded cap", contents["errors.log"])
+
+    def test_post_redaction_cap_counts_a_regular_payload_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _ = self.make_fake_environment(
+                root, FAKE_NODE_PAYLOAD_ROOT_FILE="1"
+            )
+
+            result = self.run_collect(
+                root,
+                environment,
+                extra_arguments=("--var-log-max-bytes", "8"),
+            )
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            contents = self.extract(self.bundle_of(result))
+            self.assertNotIn("nodes/monitor01/logs/var-log/merged", contents)
+            marker = contents["nodes/monitor01/logs/var-log/OVER-LIMIT.txt"]
+            self.assertIn("actual_payload_bytes=10", marker)
 
     def test_post_redaction_payload_accounting_updates_below_cap_and_skips_unlimited(
         self,

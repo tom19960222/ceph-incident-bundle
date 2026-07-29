@@ -198,6 +198,11 @@ def node_archive(alias: str, *, skip_logs: bool) -> bytes:
         files["logs/var-log/raw/opaque.tar.gz"] = gzip.compress(
             b"secret = intentionally opaque\n", mtime=0
         )
+    if os.environ.get("FAKE_NODE_COMPRESSED_BOMB"):
+        files["logs/var-log/merged/tree/files/bomb.log.gz"] = gzip.compress(
+            b"safe evidence\n" + b"x" * (64 * 1024) + b"\nsecret = must-not-leak\n",
+            mtime=0,
+        )
     if os.environ.get("FAKE_NODE_ALL_CODECS_SECRET"):
         codec_payload = b"safe evidence\nsecret = must-not-leak\n"
         files["logs/var-log/merged/tree/files/ceph.log.gz"] = gzip.compress(
@@ -219,6 +224,9 @@ def node_archive(alias: str, *, skip_logs: bool) -> bytes:
     if os.environ.get("FAKE_NODE_POST_REDACTION_CAP"):
         files["logs/var-log/merged/tree/files/ceph.merged"] = b"key=x\n"
         files["logs/var-log/PAYLOAD-BYTES.txt"] = b"6\n"
+    if os.environ.get("FAKE_NODE_PAYLOAD_ROOT_FILE"):
+        files["logs/var-log/merged"] = b"123456789\n"
+        files["logs/var-log/PAYLOAD-BYTES.txt"] = b"0\n"
     if os.environ.get("FAKE_NODE_CORRUPT_GZIP"):
         files["logs/var-log/merged/tree/files/corrupt.log.gz"] = (
             b"not a gzip stream\n"
@@ -347,6 +355,14 @@ def serve_ceph(words: list[str]) -> None:
         "FAKE_CEPH_PRIVATE_KEY_CONFIG"
     ):
         emit("-----BEGIN OPENSSH PRIVATE KEY-----\nkey material")
+    if remote == "config dump --format json-pretty" and os.environ.get(
+        "FAKE_CEPH_WHITESPACE_SECRET"
+    ):
+        emit("private\vkey: whitespace-must-redact")
+    if remote == "config dump --format json-pretty" and os.environ.get(
+        "FAKE_CEPH_LONG_GAP_SECRET"
+    ):
+        emit("private" + " " * (128 * 1024) + "key: long-gap-must-redact")
     if remote in CEPH_RESPONSES:
         emit(CEPH_RESPONSES[remote])
 

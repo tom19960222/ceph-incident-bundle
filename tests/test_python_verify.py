@@ -356,6 +356,13 @@ class VerifyCliTests(unittest.TestCase):
         for payload in (
             b"-----BEGIN OPENSSH PRIVATE KEY-----\nmaterial\n",
             b"key = AQB12345678901234567890==\n",
+            b"key\v=\vAQB12345678901234567890==\n",
+            b"key"
+            + b" " * (1024 * 1024 + 1024)
+            + b"=AQB12345678901234567890==\n",
+            b"-----BEGIN"
+            + b"A" * (1024 * 1024 + 1024)
+            + b"PRIVATE KEY-----\n",
         ):
             self.assert_content_rejected_for_directory_and_archive(
                 Path("nodes/monitor01/system/leak.txt"),

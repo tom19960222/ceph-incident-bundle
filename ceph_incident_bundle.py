@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import gzip
+import mmap
 import os
 import re
 import shutil
@@ -81,20 +82,29 @@ COMPRESSED_CODECS = {
     ".bz2": (("bzip2", "-dc", "--"), ("bzip2", "-c", "--")),
     ".zst": (("zstd", "-qdc", "--"), ("zstd", "-q", "-c", "--")),
 }
-PEM_BEGIN = re.compile(rb"-----BEGIN[ \t]+.*PRIVATE[ \t]+KEY-----", re.IGNORECASE)
-PEM_END = re.compile(rb"-----END[ \t]+.*PRIVATE[ \t]+KEY-----", re.IGNORECASE)
-SENSITIVE_LINE = re.compile(
-    rb"password|secret|token|keyring|private(?:[ \t_-]+)?key", re.IGNORECASE
+PEM_BEGIN = re.compile(
+    rb"-----BEGIN[\t\v\f\r ]+.*PRIVATE[\t\v\f\r ]+KEY-----", re.IGNORECASE
 )
-CEPH_KEY_LABEL = re.compile(rb"(?:^|[^A-Za-z0-9])key[ \t]*[:=]", re.IGNORECASE)
+PEM_END = re.compile(
+    rb"-----END[\t\v\f\r ]+.*PRIVATE[\t\v\f\r ]+KEY-----", re.IGNORECASE
+)
+SENSITIVE_LINE = re.compile(
+    rb"password|secret|token|keyring|private(?:[\t\v\f\r _-]+)?key",
+    re.IGNORECASE,
+)
+CEPH_KEY_LABEL = re.compile(
+    rb"(?:^|[^A-Za-z0-9])key[\t\v\f\r ]*[:=]", re.IGNORECASE
+)
 BASE64_SECRET = re.compile(rb"[A-Za-z0-9+/]{38,}={1,2}")
 PRIVATE_KEY_CONTENT = re.compile(
     rb"-----BEGIN[ A-Za-z]*PRIVATE KEY-----"
 )
 CEPH_KEY_CONTENT = re.compile(
-    rb"^[ \t]*key[ \t]*=[ \t]*[A-Za-z0-9+/]{20,}={0,2}"
+    rb"(?:^|\n)[\t\v\f\r ]*key[\t\v\f\r ]*=[\t\v\f\r ]*"
+    rb"[A-Za-z0-9+/]{20,}={0,2}"
 )
 FINAL_BUNDLE_SAFETY_CEILING_BYTES = 1024**4
+REDACTION_DECODE_SAFETY_CEILING_BYTES = 10 * 1024**3
 SAFE_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 SAFE_SSH_USER = re.compile(r"[A-Za-z0-9._%+-]+\Z")
 SAFE_SSH_TARGET = re.compile(
@@ -119,6 +129,17 @@ def _structural_payload_cap() -> int:
     if test_cap.isdecimal():
         return min(FINAL_BUNDLE_SAFETY_CEILING_BYTES, int(test_cap))
     return FINAL_BUNDLE_SAFETY_CEILING_BYTES
+
+
+def _redaction_decode_cap(source: Path) -> int:
+    test_cap = os.environ.get("CEPH_INCIDENT_TEST_REDACTION_DECODE_CAP_BYTES", "")
+    policy_cap = REDACTION_DECODE_SAFETY_CEILING_BYTES
+    if test_cap.isdecimal():
+        policy_cap = min(policy_cap, int(test_cap))
+    # Decoding, the atomic redaction rewrite, and recompression can each need
+    # one file-sized allocation in sequence.  Keep headroom for the rewrite.
+    available_cap = shutil.disk_usage(source.parent).free // 3
+    return min(policy_cap, available_cap)
 
 
 def _positive_integer(value: str, option: str) -> int:
@@ -487,25 +508,41 @@ def _redact_plain_file(
     in_pem = False
     try:
         with os.fdopen(descriptor, "wb") as output, source.open("rb") as input_file:
-            for line in input_file:
-                redact_line = False
-                if PEM_BEGIN.search(line):
-                    in_pem = True
-                if in_pem:
-                    redact_line = True
-                    if PEM_END.search(line):
-                        in_pem = False
-                elif (
-                    SENSITIVE_LINE.search(line)
-                    or CEPH_KEY_LABEL.search(line)
-                    or BASE64_SECRET.search(line)
-                ):
-                    redact_line = True
-                if redact_line:
-                    output.write(b"[REDACTED]\n")
-                    count += 1
-                else:
-                    output.write(line if line.endswith(b"\n") else line + b"\n")
+            size = os.fstat(input_file.fileno()).st_size
+            if size:
+                with mmap.mmap(
+                    input_file.fileno(), length=0, access=mmap.ACCESS_READ
+                ) as mapped:
+                    start = 0
+                    while start < size:
+                        newline = mapped.find(b"\n", start)
+                        content_end = size if newline < 0 else newline
+                        line_end = size if newline < 0 else newline + 1
+                        redact_line = False
+                        if PEM_BEGIN.search(mapped, start, content_end):
+                            in_pem = True
+                        if in_pem:
+                            redact_line = True
+                            if PEM_END.search(mapped, start, content_end):
+                                in_pem = False
+                        elif (
+                            SENSITIVE_LINE.search(mapped, start, content_end)
+                            or CEPH_KEY_LABEL.search(mapped, start, content_end)
+                            or BASE64_SECRET.search(mapped, start, content_end)
+                        ):
+                            redact_line = True
+                        if redact_line:
+                            output.write(b"[REDACTED]\n")
+                            count += 1
+                        else:
+                            offset = start
+                            while offset < line_end:
+                                chunk_end = min(offset + 64 * 1024, line_end)
+                                output.write(mapped[offset:chunk_end])
+                                offset = chunk_end
+                            if newline < 0:
+                                output.write(b"\n")
+                        start = line_end
         os.chmod(temporary, mode)
         os.replace(temporary, source)
     finally:
@@ -528,17 +565,49 @@ def _redact_compressed_file(source: Path, redaction_log: Path) -> bool:
     plain = Path(plain_name)
     encoded = Path(encoded_name)
     try:
+        decoded_returncode: int | None = None
+        decode_over_cap = False
+        decoder_process: subprocess.Popen[bytes] | None = None
+        decode_cap = _redaction_decode_cap(source)
         try:
             with plain.open("wb") as output:
-                decoded = subprocess.run(
+                decoder_process = subprocess.Popen(
                     [*decoder, str(source)],
-                    stdout=output,
+                    stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
-                    check=False,
                 )
+                if decoder_process.stdout is None:
+                    raise OSError("decoder stdout pipe was not created")
+                decoded_bytes = 0
+                while True:
+                    chunk = decoder_process.stdout.read(64 * 1024)
+                    if not chunk:
+                        break
+                    decoded_bytes += len(chunk)
+                    if decoded_bytes > decode_cap:
+                        decode_over_cap = True
+                        decoder_process.kill()
+                        break
+                    output.write(chunk)
+                decoder_process.stdout.close()
+                decoded_returncode = decoder_process.wait()
         except OSError:
-            decoded = None
-        if decoded is None or decoded.returncode != 0:
+            decoded_returncode = None
+        finally:
+            if decoder_process is not None:
+                if decoder_process.stdout is not None:
+                    decoder_process.stdout.close()
+                if decoder_process.poll() is None:
+                    decoder_process.kill()
+                    decoder_process.wait()
+        if decode_over_cap:
+            with redaction_log.open("a", encoding="utf-8") as output:
+                output.write(
+                    f"{source}: decompressed payload exceeds safety cap, "
+                    "original left as-is (NOT redacted)\n"
+                )
+            return False
+        if decoded_returncode is None or decoded_returncode != 0:
             with redaction_log.open("a", encoding="utf-8") as output:
                 output.write(
                     f"{source}: {source.suffix.removeprefix('.')} decompress failed, "
@@ -601,19 +670,153 @@ def _forbidden_content_path(name: str) -> bool:
     )
 
 
+def _scan_ceph_key_prefix(
+    chunk: bytes, state: int, base64_count: int
+) -> tuple[int, int, bool]:
+    """Scan the line-anchored Ceph key regex without buffering whole lines."""
+
+    whitespace = b" \t\v\f\r"
+    base64_alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    position = 0
+    while position < len(chunk):
+        if state < 0:
+            newline = chunk.find(b"\n", position)
+            if newline < 0:
+                break
+            state = 0
+            base64_count = 0
+            position = newline + 1
+            continue
+        byte = chunk[position]
+        position += 1
+        if byte == ord("\n"):
+            state = 0
+            base64_count = 0
+        elif state == 0:
+            if byte in whitespace:
+                continue
+            state = 1 if byte == ord("k") else -1
+        elif state == 1:
+            state = 2 if byte == ord("e") else -1
+        elif state == 2:
+            state = 3 if byte == ord("y") else -1
+        elif state == 3:
+            if byte in whitespace:
+                continue
+            state = 4 if byte == ord("=") else -1
+        elif state == 4:
+            if byte in whitespace:
+                continue
+            if byte in base64_alphabet:
+                state = 5
+                base64_count = 1
+            else:
+                state = -1
+        else:
+            if byte not in base64_alphabet:
+                state = -1
+                continue
+            base64_count += 1
+            if base64_count >= 20:
+                return state, base64_count, True
+    return state, base64_count, False
+
+
+def _scan_private_key_marker(
+    chunk: bytes, active: bool, begin_tail: bytes, target_progress: int
+) -> tuple[bool, bytes, int, bool]:
+    """Scan the unbounded shell private-key regex with bounded state."""
+
+    begin = b"-----BEGIN"
+    target = b"PRIVATE KEY-----"
+    allowed = b" ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    position = 0
+    while position < len(chunk):
+        newline = chunk.find(b"\n", position)
+        line_end = len(chunk) if newline < 0 else newline
+        while position < line_end:
+            if active:
+                byte = chunk[position]
+                position += 1
+                if byte == target[target_progress]:
+                    target_progress += 1
+                    if target_progress == len(target):
+                        return active, begin_tail, target_progress, True
+                elif byte == target[0]:
+                    target_progress = 1
+                else:
+                    target_progress = 0
+                if byte not in allowed and not (
+                    byte == ord("-") and target_progress > 0
+                ):
+                    active = False
+                    begin_tail = b"-" if byte == ord("-") else b""
+                continue
+
+            if begin_tail:
+                boundary_end = min(line_end, position + len(begin))
+                boundary = begin_tail + chunk[position:boundary_end]
+                boundary_match = boundary.find(begin)
+                if 0 <= boundary_match < len(begin_tail):
+                    consumed = boundary_match + len(begin) - len(begin_tail)
+                    position += consumed
+                    active = True
+                    begin_tail = b""
+                    target_progress = 0
+                    continue
+            begin_at = chunk.find(begin, position, line_end)
+            if begin_at < 0:
+                begin_tail = (begin_tail + chunk[position:line_end])[-(len(begin) - 1) :]
+                position = line_end
+                break
+            position = begin_at + len(begin)
+            active = True
+            begin_tail = b""
+            target_progress = 0
+
+        if newline < 0:
+            break
+        active = False
+        begin_tail = b""
+        target_progress = 0
+        position = newline + 1
+    return active, begin_tail, target_progress, False
+
+
 def _scan_secret_stream(evidence: object, name: str) -> None:
     tail = b""
     secret_found = False
     binary = False
+    ceph_state = 0
+    ceph_base64_count = 0
+    private_active = False
+    private_begin_tail = b""
+    private_target_progress = 0
     while True:
         chunk = evidence.read(1024 * 1024)
         if not chunk:
             break
         binary = binary or b"\0" in chunk
         window = tail + chunk
-        if PRIVATE_KEY_CONTENT.search(window) or re.search(
-            rb"(?:^|\n)[ \t]*key[ \t]*=[ \t]*[A-Za-z0-9+/]{20,}={0,2}",
-            window,
+        ceph_state, ceph_base64_count, ceph_key_found = _scan_ceph_key_prefix(
+            chunk, ceph_state, ceph_base64_count
+        )
+        (
+            private_active,
+            private_begin_tail,
+            private_target_progress,
+            private_key_found,
+        ) = _scan_private_key_marker(
+            chunk,
+            private_active,
+            private_begin_tail,
+            private_target_progress,
+        )
+        if (
+            PRIVATE_KEY_CONTENT.search(window)
+            or CEPH_KEY_CONTENT.search(window)
+            or ceph_key_found
+            or private_key_found
         ):
             secret_found = True
         tail = window[-512:]
@@ -693,6 +896,15 @@ def _enforce_node_log_caps(workdir: Path, max_bytes: int | str) -> bool:
             root = var_log / payload_root
             if not root.exists():
                 continue
+            if root.is_symlink():
+                raise VerificationError("symlink is not allowed in node log payload")
+            if root.is_file():
+                total += root.stat().st_size
+                continue
+            if not root.is_dir():
+                raise VerificationError(
+                    "non-regular node log payload is not allowed"
+                )
             for current_root, directories, filenames in os.walk(root):
                 for directory in directories:
                     if Path(current_root, directory).is_symlink():
@@ -725,6 +937,12 @@ def _enforce_node_log_caps(workdir: Path, max_bytes: int | str) -> bool:
                     )
                 if path.is_dir():
                     shutil.rmtree(path)
+                elif path.is_file():
+                    path.unlink()
+                elif path.exists():
+                    raise VerificationError(
+                        "non-regular node log payload is not allowed"
+                    )
             journal.write_text(
                 "SKIPPED: not collected because post-redaction node log payload "
                 "exceeded the per-node cap\n",
