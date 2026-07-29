@@ -188,7 +188,10 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
         else:
             values[key] = _positive_integer(raw_value, argument)
         index += 2
-    if values.get("kube_mode") == "remote":
+    if (
+        values.get("mode") in ("auto", "rook")
+        and values.get("kube_mode") == "remote"
+    ):
         since = str(values["since"])
         duration = since[:-1] if since[-1:] in "smhdw" else since
         if (
@@ -423,6 +426,26 @@ def _reserve_archive_path(output_root: Path, timestamp: str) -> Path:
     raise OSError("cannot reserve a unique incident bundle output path")
 
 
+def _rewrite_summary_final_status(workdir: Path, final_status: int) -> None:
+    """Make a retained summary describe the fatal workstation result."""
+
+    summary = workdir / "summary.txt"
+    if not summary.is_file():
+        return
+    lines = summary.read_text(encoding="utf-8").splitlines()
+    replacement = f"final_status={final_status}"
+    rewritten = [
+        replacement if line.startswith("final_status=") else line for line in lines
+    ]
+    if not any(line.startswith("final_status=") for line in lines):
+        rewritten.append(replacement)
+    temporary = workdir / ".summary.txt.tmp"
+    temporary.write_text(
+        "".join(f"{line}\n" for line in rewritten), encoding="utf-8"
+    )
+    os.replace(temporary, summary)
+
+
 def _collect(arguments: Sequence[str]) -> int:
     try:
         options = _parse_collect_arguments(arguments)
@@ -458,8 +481,12 @@ def _collect(arguments: Sequence[str]) -> int:
         print(f"FATAL: cannot create collector-owned workspace: {error}", file=sys.stderr)
         return 1
     archive: Path | None = None
-    retain_workdir = False
+    retain_workdir = bool(options["keep_workdir"])
     previous_term_handler = signal.getsignal(signal.SIGTERM)
+
+    def progress(message: str) -> None:
+        if not options["quiet"]:
+            print(message, file=sys.stderr)
 
     def interrupt_handler(_signum: int, _frame: object) -> None:
         raise KeyboardInterrupt
@@ -467,6 +494,7 @@ def _collect(arguments: Sequence[str]) -> int:
     signal.signal(signal.SIGTERM, interrupt_handler)
     try:
         _write_initial_bundle_files(workdir)
+        progress(f"starting: mode={mode}, {len(inventory_data.nodes)} hosts")
         for rejection in inventory_data.rejected_entries:
             with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
                 errors.write(f"{rejection}\n")
@@ -481,6 +509,7 @@ def _collect(arguments: Sequence[str]) -> int:
         rook_source = "local" if want_rook and kube_mode == "local" else ""
 
         if want_ceph and ceph_source:
+            progress(f"probing Ceph runner on {ceph_source}")
             ceph_runner = select_ceph_runner(
                 workdir=workdir,
                 target=ceph_source,
@@ -493,6 +522,9 @@ def _collect(arguments: Sequence[str]) -> int:
             want_rook and kube_mode == "remote"
         )
         if need_capabilities:
+            progress(
+                f"probing {len(inventory_data.nodes)} nodes for cluster capabilities"
+            )
             for inventory_node in inventory_data.nodes:
                 capabilities = probe_node_capabilities(
                     workdir=workdir,
@@ -526,10 +558,11 @@ def _collect(arguments: Sequence[str]) -> int:
                 ):
                     break
 
-        cluster_status: int | None = None
+        ceph_status: int | None = None
         ceph_done = False
         if want_ceph and ceph_source and ceph_runner:
-            cluster_status = collect_direct_ceph_cluster(
+            progress(f"collecting Ceph cluster from {ceph_source} via {ceph_runner}")
+            ceph_status = collect_direct_ceph_cluster(
                 workdir=workdir,
                 seed=ceph_source,
                 ssh_key=ssh_key,
@@ -539,12 +572,13 @@ def _collect(arguments: Sequence[str]) -> int:
                 runner=ceph_runner,
             )
             ceph_done = True
-            if cluster_status != 0:
+            if ceph_status != 0:
                 with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
-                    errors.write(f"cluster collection exited {cluster_status}\n")
+                    errors.write(f"cluster collection exited {ceph_status}\n")
         rook_status: int | None = None
         rook_done = False
         if want_rook and rook_source:
+            progress(f"collecting Rook cluster through {rook_source}")
             rook_status = collect_rook_cluster(
                 workdir=workdir,
                 namespace=inventory_data.rook_namespace,
@@ -556,6 +590,7 @@ def _collect(arguments: Sequence[str]) -> int:
                 ssh_key=ssh_key,
                 connection_timeout=int(options["timeout"]),
                 known_hosts_file=known_hosts,
+                allow_skip=mode == "auto",
             )
             rook_done = (workdir / "cluster" / "rook" / "pods-wide.txt").is_file()
             if rook_status != 0:
@@ -587,6 +622,7 @@ def _collect(arguments: Sequence[str]) -> int:
 
         prometheus: PrometheusCollectionResult | None = None
         if prom_url:
+            progress("collecting Prometheus evidence")
             prometheus = collect_prometheus_cluster(
                 workdir=workdir,
                 url=prom_url,
@@ -605,7 +641,11 @@ def _collect(arguments: Sequence[str]) -> int:
             Path(__file__).resolve().parent / "ceph_incident_node.py"
         ).read_bytes()
         node_results = []
-        for inventory_node in inventory_data.nodes:
+        for index, inventory_node in enumerate(inventory_data.nodes, start=1):
+            progress(
+                f"[{index}/{len(inventory_data.nodes)}] collecting node "
+                f"{inventory_node.host_alias}"
+            )
             result = collect_single_node(
                 workspace=workdir,
                 destination=workdir / "nodes" / inventory_node.host_alias,
@@ -635,14 +675,14 @@ def _collect(arguments: Sequence[str]) -> int:
         node_ok = sum(result.exit_code == 0 for _, result in node_results)
         node_failed = len(node_results) - node_ok
         cluster_exit_code = (
-            2 if cluster_status or rook_status or missing_cluster_source else 0
+            2 if ceph_status or rook_status or missing_cluster_source else 0
         )
         exit_code = (
             2
             if (
                 bool(inventory_data.rejected_entries)
                 or node_failed
-                or cluster_status
+                or ceph_status
                 or rook_status
                 or prometheus_status
                 or missing_cluster_source
@@ -699,10 +739,12 @@ def _collect(arguments: Sequence[str]) -> int:
         (workdir / "summary.txt").write_text(
             "".join(f"{line}\n" for line in summary), encoding="utf-8"
         )
+        progress("verifying collected evidence")
         _verify_bundle_path(workdir)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         archive = _reserve_archive_path(output_root, timestamp)
         packaged_candidate = workdir / ".incident-bundle.tar.gz"
+        progress("packaging incident bundle")
         packaged = subprocess.run(
             [
                 "tar",
@@ -725,24 +767,37 @@ def _collect(arguments: Sequence[str]) -> int:
         _verify_bundle_path(packaged_candidate)
         os.replace(packaged_candidate, archive)
         print(f"bundle: {archive}")
-        retain_workdir = bool(options["keep_workdir"])
         if retain_workdir:
             print(f"kept workdir: {workdir}", file=sys.stderr)
         return exit_code
     except CollectionInterrupted:
         if archive is not None:
             archive.unlink(missing_ok=True)
-        print("interrupted — stopping and cleaning up…", file=sys.stderr)
+        print(
+            f"interrupted — workdir kept at {workdir}"
+            if retain_workdir
+            else "interrupted — stopping and cleaning up…",
+            file=sys.stderr,
+        )
         return 130
     except KeyboardInterrupt:
         if archive is not None:
             archive.unlink(missing_ok=True)
-        print("interrupted — stopping and cleaning up…", file=sys.stderr)
+        print(
+            f"interrupted — workdir kept at {workdir}"
+            if retain_workdir
+            else "interrupted — stopping and cleaning up…",
+            file=sys.stderr,
+        )
         return 130
     except (OSError, VerificationError) as error:
         retain_workdir = True
         if archive is not None:
             archive.unlink(missing_ok=True)
+        try:
+            _rewrite_summary_final_status(workdir, 1)
+        except OSError:
+            pass
         print(f"VERIFY FAILED: workdir kept at {workdir}: {error}", file=sys.stderr)
         return 1
     finally:

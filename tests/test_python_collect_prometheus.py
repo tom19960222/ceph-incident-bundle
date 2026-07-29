@@ -24,6 +24,9 @@ SHELL_VERIFIER = ROOT / "lib" / "verify-bundle.sh"
 FAKE_CURL = ROOT / "tests" / "fixtures" / "bin" / "curl"
 FAKE_SSH = ROOT / "tests" / "fixtures" / "python-prometheus" / "bin" / "ssh"
 FAKE_GREP = ROOT / "tests" / "fixtures" / "python-prometheus" / "bin" / "grep"
+FAKE_KUBECTL = (
+    ROOT / "tests" / "fixtures" / "python-prometheus" / "bin" / "kubectl"
+)
 PROM_URL = "http://prom.example:9090"
 
 
@@ -38,9 +41,7 @@ class PrometheusFixture:
         (fake_bin / "curl").symlink_to(FAKE_CURL)
         (fake_bin / "ssh").symlink_to(FAKE_SSH)
         (fake_bin / "grep").symlink_to(FAKE_GREP)
-        (fake_bin / "kubectl").symlink_to(
-            ROOT / "tests" / "fixtures" / "python-rook" / "bin" / "kubectl"
-        )
+        (fake_bin / "kubectl").symlink_to(FAKE_KUBECTL)
         curl_ledger = root / "curl-argv.nul"
         environment = {
             **os.environ,

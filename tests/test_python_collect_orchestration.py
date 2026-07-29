@@ -51,6 +51,7 @@ class MultiSourceOrchestrationTests(unittest.TestCase):
                 "FAKE_CURL_LOG": str(root / "curl.log"),
                 "FAKE_CURL_ARGV_LOG": str(root / "curl-argv.nul"),
                 "FAKE_GREP_LOG": str(root / "grep-argv.jsonl"),
+                "FAKE_NODE_CONFIG_LOG": str(root / "node-config.jsonl"),
             }
             result = subprocess.run(
                 [
@@ -67,7 +68,6 @@ class MultiSourceOrchestrationTests(unittest.TestCase):
                     "local",
                     "--prom-url",
                     "http://prom.example:9090",
-                    "--skip-logs",
                     "--timeout",
                     "5",
                     "--node-timeout",
@@ -105,9 +105,38 @@ class MultiSourceOrchestrationTests(unittest.TestCase):
             self.assertIn("node_ok=2\n", summary)
             self.assertIn("node_failed=0\n", summary)
             self.assertIn("final_status=0\n", summary)
+            configs = [
+                json.loads(line)
+                for line in (root / "node-config.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertEqual(
+                {config["host_alias"] for config in configs},
+                {"monitor01", "storage01"},
+            )
+            self.assertTrue(all(config["skip_logs"] is False for config in configs))
 
 
 class CephRunnerSelectionTests(DirectCephFixture, unittest.TestCase):
+    def test_quiet_suppresses_default_progress_messages(self) -> None:
+        for extra_arguments, expect_progress in (((), True), (("--quiet",), False)):
+            with self.subTest(extra_arguments=extra_arguments):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    root = Path(temporary_directory)
+                    environment, _ = self.make_fake_environment(root)
+
+                    result = self.run_collect(
+                        root, environment, extra_arguments=extra_arguments
+                    )
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual("starting:" in result.stderr, expect_progress)
+                    self.assertEqual(
+                        "packaging incident bundle" in result.stderr,
+                        expect_progress,
+                    )
+
     def test_ceph_source_falls_back_from_direct_to_noninteractive_sudo(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -174,6 +203,47 @@ class CephRunnerSelectionTests(DirectCephFixture, unittest.TestCase):
             self.assertNotIn("cluster/ceph/json/status.json", contents)
             self.assertIn(f"ceph_source={explicit_seed}\n", contents["environment.txt"])
             self.assertIn("ceph_runner=<none>\n", contents["environment.txt"])
+
+    def test_auto_mode_tolerates_an_unavailable_rook_layer_when_ceph_succeeds(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _ = self.make_fake_environment(root)
+            fake_bin = root / "bin"
+            (fake_bin / "kubectl").symlink_to(
+                ROOT / "tests" / "fixtures" / "python-rook" / "bin" / "kubectl"
+            )
+            environment["FAKE_KUBECTL_MODE"] = "missing-namespace"
+            environment["FAKE_KUBECTL_LOG"] = str(root / "kubectl-argv.jsonl")
+
+            result = self.run_collect(
+                root,
+                environment,
+                seed=None,
+                extra_arguments=("--mode", "auto", "--kube-mode", "local"),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            contents = self.extract(self.bundle_of(result))
+            self.assertIn("cluster/ceph/json/status.json", contents)
+            self.assertIn("cluster/rook/SKIPPED.txt", contents)
+            self.assertIn("cluster_status=0\n", contents["summary.txt"])
+
+    def test_ceph_only_mode_does_not_validate_remote_rook_since(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _ = self.make_fake_environment(root)
+
+            result = self.run_collect(
+                root, environment, extra_arguments=("--since", "yesterday")
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "cluster/ceph/json/status.json",
+                self.extract(self.bundle_of(result)),
+            )
 
 
 if __name__ == "__main__":

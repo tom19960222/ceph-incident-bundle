@@ -175,7 +175,10 @@ def emit(payload: str, code: int = 0) -> None:
     raise SystemExit(code)
 
 
-def node_archive(alias: str) -> bytes:
+def node_archive(alias: str, *, skip_logs: bool) -> bytes:
+    log_artifact = (
+        "logs/var-log/SKIPPED.txt" if skip_logs else "logs/var-log/INDEX.tsv"
+    )
     entries = [
         {
             "host": alias,
@@ -189,8 +192,10 @@ def node_archive(alias: str) -> bytes:
         {
             "host": alias,
             "collector": "collect-node",
-            "artifact": "/tmp/ceph-incident-node.fixture/out/logs/var-log/INDEX.tsv",
-            "command": "safe var-log fixture",
+            "artifact": f"/tmp/ceph-incident-node.fixture/out/{log_artifact}",
+            "command": (
+                "skip var-log fixture" if skip_logs else "safe var-log fixture"
+            ),
             "exit_code": 0,
             "started": "2026-07-29T00:00:00Z",
             "ended": "2026-07-29T00:00:01Z",
@@ -198,7 +203,11 @@ def node_archive(alias: str) -> bytes:
     ]
     files = {
         "system/hostname.txt": f"{alias}\n".encode(),
-        "logs/var-log/INDEX.tsv": b"path\tdisposition\tdetail\n",
+        log_artifact: (
+            b"SKIPPED: --skip-logs\n"
+            if skip_logs
+            else b"path\tdisposition\tdetail\n"
+        ),
         "manifest.jsonl": (
             "".join(json.dumps(entry) + "\n" for entry in entries)
         ).encode(),
@@ -231,13 +240,23 @@ def serve_bootstrap(remote_command: str) -> None:
         reject("node bootstrap remote command")
     sys.stdin.buffer.read()
     padding = "=" * (-len(words[3]) % 4)
+    config: dict[str, object] = {}
     try:
-        config = json.loads(base64.urlsafe_b64decode(words[3] + padding))
+        decoded = json.loads(base64.urlsafe_b64decode(words[3] + padding))
+        if not isinstance(decoded, dict):
+            raise TypeError
+        config = decoded
         configured_alias = str(config["host_alias"])
     except (ValueError, KeyError, TypeError):
         configured_alias = "monitor01"
     alias = os.environ.get("FAKE_NODE_ALIAS", configured_alias)
-    sys.stdout.buffer.write(node_archive(alias))
+    config_log = os.environ.get("FAKE_NODE_CONFIG_LOG")
+    if config_log:
+        with open(config_log, "a", encoding="utf-8") as output:
+            output.write(json.dumps(config) + "\n")
+    sys.stdout.buffer.write(
+        node_archive(alias, skip_logs=bool(config.get("skip_logs")))
+    )
     exit_code = int(os.environ.get("FAKE_NODE_EXIT", "0"))
     if os.environ.get("FAKE_NODE_EXIT_ALIAS") == alias:
         exit_code = 17

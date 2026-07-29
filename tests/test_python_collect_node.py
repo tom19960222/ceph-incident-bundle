@@ -1096,6 +1096,54 @@ class CollectSingleNodeCliTests(unittest.TestCase):
             self.assertEqual(list(results.glob("tmp.*")), [])
             self.assertEqual(list(results.glob("*.tar.gz")), [])
 
+    def test_keep_workdir_preserves_the_workstation_workspace_on_interrupt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            environment["FAKE_SSH_MODE"] = "timeout"
+            environment["FAKE_NODE_SLEEP_COMMAND"] = "hostname"
+            process = subprocess.Popen(
+                self.prepare_collect(
+                    root,
+                    node_timeout=30,
+                    extra_arguments=("--keep-workdir",),
+                ),
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 10
+            while not list((root / "remote-tmp").iterdir()):
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    self.fail("node collector did not create its owned workspace")
+                time.sleep(0.05)
+
+            process.send_signal(signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=10)
+
+            self.assertEqual(process.returncode, 130, stderr)
+            self.assertEqual(stdout, "")
+            self.assertEqual(list((root / "remote-tmp").iterdir()), [])
+            self.assertEqual(len(list((root / "results").glob("tmp.*"))), 1)
+
+    def test_packaging_failure_rewrites_retained_summary_to_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            (root / "bin" / "tar").symlink_to("/usr/bin/false")
+
+            result = self.run_collect(root, environment)
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            workdirs = list((root / "results").glob("tmp.*"))
+            self.assertEqual(len(workdirs), 1)
+            summary = (workdirs[0] / "summary.txt").read_text(encoding="utf-8")
+            self.assertIn("final_status=1\n", summary)
+
     def test_packaging_interruption_removes_reserved_archive_and_workdir(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

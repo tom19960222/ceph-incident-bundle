@@ -521,6 +521,27 @@ CAPABILITY_PROBE = (
 )
 
 
+def _run_ssh_probe_command(
+    command: Sequence[str], *, timeout: int, capture_output: bool = False
+) -> tuple[int, str]:
+    """Run one bounded SSH probe and normalize transport failures."""
+
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+            text=True,
+        )
+    except FileNotFoundError:
+        return 127, ""
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    return _exit_code_of(completed.returncode), completed.stdout or ""
+
+
 def probe_node_capabilities(
     *,
     workdir: Path,
@@ -540,22 +561,9 @@ def probe_node_capabilities(
         target,
         CAPABILITY_PROBE,
     ]
-    try:
-        completed = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=connection_timeout,
-            check=False,
-            text=True,
-        )
-        exit_code = _exit_code_of(completed.returncode)
-    except FileNotFoundError:
-        exit_code = 127
-        completed = None
-    except subprocess.TimeoutExpired:
-        exit_code = 124
-        completed = None
+    exit_code, output = _run_ssh_probe_command(
+        command, timeout=connection_timeout, capture_output=True
+    )
     if exit_code != 0:
         with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
             errors.write(
@@ -572,8 +580,7 @@ def probe_node_capabilities(
                 known_hosts_file=known_hosts_file,
             )
         return frozenset()
-    assert completed is not None
-    advertised = frozenset(completed.stdout.split())
+    advertised = frozenset(output.split())
     return advertised.intersection({"ceph", "cephadm", "kubectl"})
 
 
@@ -596,19 +603,9 @@ def select_ceph_runner(
             "5",
             "-s",
         ]
-        try:
-            completed = subprocess.run(
-                command,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=connection_timeout,
-                check=False,
-            )
-            exit_code = _exit_code_of(completed.returncode)
-        except FileNotFoundError:
-            exit_code = 127
-        except subprocess.TimeoutExpired:
-            exit_code = 124
+        exit_code, _ = _run_ssh_probe_command(
+            command, timeout=connection_timeout
+        )
         if exit_code == 0:
             return runner
         if exit_code in (255, 124, 137):
@@ -1022,6 +1019,7 @@ def collect_rook_cluster(
     ssh_key: Path | None = None,
     connection_timeout: int = 20,
     known_hosts_file: Path | None = None,
+    allow_skip: bool = False,
 ) -> int:
     """Collect Rook cluster evidence through read-only kubectl operations.
 
@@ -1032,8 +1030,8 @@ def collect_rook_cluster(
     array of read-only verbs; nothing here can create a process inside a Pod.
 
     Returns 0 when every required artifact was captured and 2 when the layer is
-    partial — including when no evidence could be collected at all, which is
-    recorded as a SKIPPED artifact naming the classified cause.
+    partial.  When ``allow_skip`` is true, an unavailable Rook preflight is a
+    successful optional-layer skip; required captures still fail as partial.
     """
 
     rook_dir = workdir / "cluster" / "rook"
@@ -1061,7 +1059,7 @@ def collect_rook_cluster(
     # the namespace probe, which classifies it by the same rules.
     if ssh_target is None and shutil.which("kubectl") is None:
         _write_skip_artifact(rook_dir / "SKIPPED.txt", "kubectl command not found")
-        return 2
+        return 0 if allow_skip else 2
 
     probe_exit, probe_detail = _run_probe(
         [*kubectl, "get", "namespace", namespace], command_timeout
@@ -1071,7 +1069,7 @@ def collect_rook_cluster(
             rook_dir / "SKIPPED.txt",
             _rook_probe_reason(namespace, kube_context, location, probe_detail),
         )
-        return 2
+        return 0 if allow_skip else 2
 
     def capture(artifact_name: str, words: Sequence[str]) -> int:
         return run_capture(
