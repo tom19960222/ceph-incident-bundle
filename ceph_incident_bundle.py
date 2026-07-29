@@ -845,8 +845,16 @@ def _verify_content_safety(target: Path) -> None:
                         )
             return
 
-        with tarfile.open(target, mode="r:gz") as archive:
-            for member in archive:
+        with tarfile.open(target, mode="r|gz") as archive:
+            while True:
+                member = archive.next()
+                if member is None:
+                    break
+                # Python 3.11 caches every TarInfo even in stream mode.  The
+                # archive was structurally validated first, so content scan
+                # can discard that cache and consume one regular member at a
+                # time without needing link resolution or random access.
+                archive.members.clear()
                 normalised = _normalise_member_name(member.name)
                 if _forbidden_content_path(normalised):
                     raise VerificationError(f"forbidden path: {normalised}")

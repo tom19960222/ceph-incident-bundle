@@ -10,6 +10,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import ceph_incident_bundle as bundle_entry
 
@@ -453,6 +454,33 @@ class VerifyCliTests(unittest.TestCase):
         self.assertEqual(trailer.offset, 4096)
         self.assertGreater(len(trailer.read_sizes), 1)
         self.assertEqual(set(trailer.read_sizes), {1024 * 1024})
+
+    def test_archive_content_scan_does_not_cache_the_member_table(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            bundle = temporary_root / "incident"
+            archive_path = temporary_root / "incident.tar.gz"
+            self.make_valid_bundle_dir(bundle)
+            for index in range(64):
+                (bundle / "nodes/monitor01/system" / f"evidence-{index}.txt").write_text(
+                    "safe evidence\n", encoding="utf-8"
+                )
+            self.make_bundle_archive(bundle, archive_path)
+            opened_archives: list[tarfile.TarFile] = []
+            real_open = tarfile.open
+
+            def observed_open(*args: object, **kwargs: object) -> tarfile.TarFile:
+                opened = real_open(*args, **kwargs)
+                opened_archives.append(opened)
+                return opened
+
+            with mock.patch.object(
+                bundle_entry.tarfile, "open", side_effect=observed_open
+            ):
+                bundle_entry._verify_content_safety(archive_path)
+
+        self.assertEqual(len(opened_archives), 1)
+        self.assertEqual(opened_archives[0].members, [])
 
     def test_archive_file_ancestor_collision_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
