@@ -12,6 +12,6 @@ test-python: check-python
 	$(PYTHON) -m unittest discover -s tests -p 'test_python_*.py' -v
 
 shellcheck:
-	shellcheck lib/*.sh run/*.sh tests/*.sh tests/fixtures/*.sh tests/fixtures/python-node/bin/node-command tests/fixtures/python-node/bin/tar-wrapper
+	shellcheck lib/*.sh run/*.sh tests/*.sh tests/fixtures/*.sh tests/fixtures/python-node/bin/codec-command tests/fixtures/python-node/bin/node-command tests/fixtures/python-node/bin/tar-wrapper
 
 validate: check-python test test-python shellcheck

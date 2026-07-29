@@ -71,6 +71,8 @@ if mode in ("missing-manifest", "unsafe", "unmanifested", "duplicate-manifest"):
     raise SystemExit(0)
 
 child_environment = os.environ.copy()
+if os.environ.get("FAKE_REMOTE_PATH"):
+    child_environment["PATH"] = os.environ["FAKE_REMOTE_PATH"]
 if mode == "remote-failure":
     child_environment["PATH"] = (
         os.environ["FAKE_REMOTE_BIN"] + os.pathsep + child_environment["PATH"]

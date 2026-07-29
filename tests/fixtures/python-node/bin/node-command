@@ -2,6 +2,9 @@
 set -eu
 
 command_name=${0##*/}
+if [ -n "${FAKE_NODE_COMMAND_LOG:-}" ]; then
+  printf '%s %s\n' "$command_name" "$*" >>"$FAKE_NODE_COMMAND_LOG"
+fi
 if [ "${FAKE_NODE_SIGNAL_PARENT:-}" = "HUP" ]; then
   kill -HUP "$PPID"
   sleep 60
@@ -19,9 +22,90 @@ case "$command_name" in
   uname) printf 'Linux monitor01 test-kernel\n' ;;
   uptime) printf 'up 10 days\n' ;;
   free) printf 'Mem: 1024 512 512\n' ;;
-  df) printf '/dev/vda ext4 10G 1G 9G 10%% /\n' ;;
+  df)
+    if [ "${1:-}" = "-Pk" ]; then
+      [ "$#" -eq 2 ] \
+        || { printf 'unexpected fake df argv: %s\n' "$*" >&2; exit 64; }
+    elif [ "$*" != "-hT" ]; then
+      printf 'unexpected fake df argv: %s\n' "$*" >&2
+      exit 64
+    fi
+    available_kib=${FAKE_DF_AVAILABLE_KIB:-}
+    if [ "${1:-}" = "-Pk" ] && [ -n "${FAKE_DF_AVAILABLE_FIRST_KIB:-}" ]; then
+      [ -n "${FAKE_DF_COUNTER:-}" ] \
+        || { printf 'FAKE_DF_COUNTER is required for sequenced df output\n' >&2; exit 64; }
+      df_count=0
+      if [ -f "$FAKE_DF_COUNTER" ]; then
+        read -r df_count <"$FAKE_DF_COUNTER"
+      fi
+      df_count=$((df_count + 1))
+      printf '%s\n' "$df_count" >"$FAKE_DF_COUNTER"
+      if [ "$df_count" -eq 1 ]; then
+        available_kib=$FAKE_DF_AVAILABLE_FIRST_KIB
+      else
+        available_kib=${FAKE_DF_AVAILABLE_SECOND_KIB:-$FAKE_DF_AVAILABLE_FIRST_KIB}
+      fi
+    fi
+    if [ "${1:-}" = "-Pk" ] && [ -n "$available_kib" ]; then
+      printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+      printf '/dev/fake 100000 1 %s 1%% /\n' "$available_kib"
+    else
+      printf '/dev/vda ext4 10G 1G 9G 10%% /\n'
+    fi
+    ;;
   ip) printf '1: lo: <LOOPBACK>\n' ;;
   systemctl) printf '0 loaded units listed\n' ;;
+  journalctl)
+    [ "$#" -eq 3 ] && [ "$1" = "--since" ] && [ "$3" = "--no-pager" ] \
+      || { printf 'unexpected fake journalctl argv: %s\n' "$*" >&2; exit 64; }
+    if [ "${FAKE_JOURNALCTL_TIMEOUT:-}" = "1" ]; then
+      printf 'partial journal before timeout\n'
+      exit 124
+    elif [ "${FAKE_JOURNALCTL_LARGE:-}" = "1" ]; then
+      awk 'BEGIN { for (i = 0; i < 2048; i++) printf "J"; printf "\n" }'
+    else
+      printf 'journal line\n'
+    fi
+    ;;
+  find)
+    [ "${2:-}" = "-type" ] && [ "${3:-}" = "f" ] && [ "${4:-}" = "-print0" ] \
+      || { printf 'unexpected fake find argv: %s\n' "$*" >&2; exit 64; }
+    exec "$FAKE_REAL_FIND" "$@"
+    ;;
+  sudo)
+    [ "${1:-}" = "-n" ] && [ "$#" -ge 2 ] \
+      || { printf 'unexpected fake sudo argv: %s\n' "$*" >&2; exit 64; }
+    shift
+    case "${1:-}" in
+      dd|find|journalctl) ;;
+      *)
+        printf 'unexpected fake sudo command: %s\n' "${1:-<missing>}" >&2
+        exit 64
+        ;;
+    esac
+    exec "$@"
+    ;;
+  dd)
+    source=''
+    if [ -n "${FAKE_DD_LOG:-}" ]; then
+      printf '%s\n' "$*" >>"$FAKE_DD_LOG"
+    fi
+    for argument in "$@"; do
+      case "$argument" in
+        if=*) source=${argument#if=} ;;
+      esac
+    done
+    [ "$#" -eq 3 ] && [ -n "$source" ] \
+      && [ "$2" = "iflag=noatime,nofollow" ] && [ "$3" = "status=none" ] \
+      || { printf 'unexpected fake dd argv: %s\n' "$*" >&2; exit 64; }
+    case "$source" in
+      *"${FAKE_DD_FAIL_MATCH:-__never_match__}"*)
+        printf 'simulated safe read failure\n' >&2
+        exit 9
+        ;;
+    esac
+    cat -- "$source"
+    ;;
   tar) printf 'simulated archive failure\n' >&2; exit 17 ;;
   *) printf 'unexpected fake node command: %s\n' "$command_name" >&2; exit 64 ;;
 esac
