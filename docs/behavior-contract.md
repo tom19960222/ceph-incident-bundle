@@ -361,13 +361,13 @@ kubectl 前綴（:146-153）：有 `--ssh-target` → `ssh <base_opts> <target> 
    - 把 `$out` 打包 `tar -cf - -C $out . | gzip -c` 回 stdout（pipe 失敗 → **exit 74**）；`$out` 不存在則造一個只含 `SKIPPED.txt`（`remote collect-node did not create output`）的目錄再打包。
    - `exit $rc`（node collector 的 rc 穿透回 ssh exit code）。
 4. 整條 ssh 用 `timeout <node_timeout>` 包（不是 `--timeout`！:291-297）。stdout 存 `workdir/.node-<alias>.tar.gz`。
-5. 結果判定（:313-339）：
+5. 結果判定：
    - rc 255/124/137 → 寫 ssh-debug（label `node-<alias>`）。
    - rc 124/137（timeout 砍）→ `nodes/<alias>/SKIPPED.txt`：`node collection timed out after <s>s (exit <rc>) from <target>`，刪 tar，return 2。
-   - tar 非空且解得開 → 解進 `nodes/<alias>/`；若缺 `manifest.jsonl` → 視為截斷，寫 SKIPPED（`node archive from <target> is incomplete (no manifest.jsonl); treated as failure`）、rc=2。
-     **Safety note:** 這一點只記錄 shell reference 的現況，不是 Python target。Shell 會在完整驗證 member table 前解壓；Python node transport 必須依 `docs/read-only-safety.md` 在任何 extraction write 前拒絕 traversal、absolute path、link、special member、collision、oversize、truncated stream 與缺少 manifest。
-   - 解不開/空 → 清掉目錄重建，寫 `SKIPPED: no usable node archive returned from <target> (ssh exit <rc>)`；此時 rc 若原為 0 改成 2。
-   - 刪除暫存 tar；return rc（node collector 自己的 2 也會走到這裡：**遠端 partial 時 tar 已解開、證據保留，只是計入 node_failed**）。
+   - 非空候選檔交給 `accept_node_archive`。它先確認 candidate／destination 都在本次 owned workspace，完整消耗 gzip stream，驗證整張 tar member table、所有 regular-file payload、root `manifest.jsonl`、name normalization／collision／hierarchy，且只接受 regular file 與 directory。Payload cap 為既有 per-node `/var/log` cap 加 1 GiB；`unlimited` 仍保留 1 TiB 的 archive parser safety ceiling。
+   - 驗證全部完成後才建立 `nodes/<alias>/`；逐檔以 exclusive、nofollow 的 regular-file write 解出，目錄／檔案權限由 collector 建立，不沿用 archive ownership、mode、link 或 special member metadata。Extraction failure 只清理本次新建的 node root。
+   - 缺 `manifest.jsonl` → 保留既有 incomplete SKIPPED 語意；空、損壞、不安全或超限 archive → 建立只有 `SKIPPED: no usable node archive returned ...` 的 node directory。Rejected archive 的 member 不會寫入 extraction root 或其外部。
+   - 刪除候選 tar；return remote rc（node collector 自己的 2 仍會保留已驗收 evidence，只計入 node_failed）。
 
 ### 11.2 node collector（`collect_node_main`，lib/collect-node.sh:273-493）
 

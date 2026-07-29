@@ -25,20 +25,27 @@ for path in \
   "$ROOT/lib/collect-node.sh" \
   "$ROOT/lib/collect-var-log.sh" \
   "$ROOT/lib/collect-prometheus.sh" \
+  "$ROOT/lib/node-archive.sh" \
   "$ROOT/lib/verify-bundle.sh" \
   "$ROOT/tests/test-collect.sh" \
   "$ROOT/tests/test-cephadm-collector.sh" \
   "$ROOT/tests/test-node-collector.sh" \
+  "$ROOT/tests/test-node-archive-acceptance.sh" \
   "$ROOT/tests/test-var-log-collector.sh" \
   "$ROOT/tests/test-rook-collector.sh" \
   "$ROOT/tests/test-prom-collector.sh" \
   "$ROOT/tests/test-verify-bundle.sh" \
   "$ROOT/tests/export-shell-collect-fixture.sh" \
-  "$ROOT/tests/fixtures/shell-collect-environment.sh"; do
+  "$ROOT/tests/fixtures/shell-collect-environment.sh" \
+  "$ROOT/tests/fixtures/make-node-archive.py"; do
   [[ -f "$path" ]] || fail "missing $path"
 done
 
-for path in "$ROOT/run/collect.sh" "$ROOT/lib/verify-bundle.sh" "$ROOT/tests/export-shell-collect-fixture.sh"; do
+for path in \
+  "$ROOT/run/collect.sh" \
+  "$ROOT/lib/verify-bundle.sh" \
+  "$ROOT/tests/export-shell-collect-fixture.sh" \
+  "$ROOT/tests/test-node-archive-acceptance.sh"; do
   [[ -x "$path" ]] || fail "not executable $path"
 done
 
@@ -85,6 +92,11 @@ node_collector_args="$(run_and_capture "$ROOT/tests/test-node-collector.sh")"
 node_collector_status="${node_collector_args%%$'\n'*}"
 node_collector_output="${node_collector_args#*$'\n'}"
 [[ "$node_collector_status" == "0" ]] || fail "test-node-collector.sh failed: $node_collector_output"
+
+node_archive_args="$(run_and_capture "$ROOT/tests/test-node-archive-acceptance.sh")"
+node_archive_status="${node_archive_args%%$'\n'*}"
+node_archive_output="${node_archive_args#*$'\n'}"
+[[ "$node_archive_status" == "0" ]] || fail "test-node-archive-acceptance.sh failed: $node_archive_output"
 
 var_log_collector_args="$(run_and_capture "$ROOT/tests/test-var-log-collector.sh")"
 var_log_collector_status="${var_log_collector_args%%$'\n'*}"
