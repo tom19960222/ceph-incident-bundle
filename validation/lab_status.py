@@ -36,6 +36,9 @@ STATE_CREDENTIAL_PATH_INVALID = "credential-path-invalid"
 STATE_CANDIDATE_PENDING_REVIEW = "candidate-pending-review"
 STATE_READY_FOR_PREFLIGHT = "ready-for-preflight"
 STATE_PREFLIGHT_PASSED = "preflight-passed"
+# Reachable only once the dual-run gate (issue #20) can record a full pass;
+# calling that state "preflight-passed" would understate what was proven.
+STATE_GATE_PASSED = "gate-passed"
 STATE_LAST_ATTEMPT_FAILED = "last-attempt-failed"
 
 
@@ -86,7 +89,11 @@ class LabStatus:
 
     @property
     def ready(self) -> bool:
-        return self.state in (STATE_READY_FOR_PREFLIGHT, STATE_PREFLIGHT_PASSED)
+        return self.state in (
+            STATE_READY_FOR_PREFLIGHT,
+            STATE_PREFLIGHT_PASSED,
+            STATE_GATE_PASSED,
+        )
 
     def summary(self) -> dict[str, object]:
         return {
@@ -275,7 +282,8 @@ def _verdict(
             + activate_command("<active profile>", path),
         )
     if report is not None and _reported_profile_hash(report) == profile.profile_hash:
-        status = str(report.get("status", ""))
+        recorded = report.get("status")
+        status = recorded if isinstance(recorded, str) else ""
         directory = report.get("directory")
         if status == PREFLIGHT_PASS_STATUS:
             return (
@@ -286,13 +294,13 @@ def _verdict(
             )
         if status == STATUS_PASS:
             return (
-                STATE_PREFLIGHT_PASSED,
+                STATE_GATE_PASSED,
                 None,
                 _recorded_next_action(report) or f"Hand off {directory}",
             )
         return (
             STATE_LAST_ATTEMPT_FAILED,
-            f"the last attempt for this profile ended as {status}",
+            f"the last attempt for this profile ended as {status or 'unknown'}",
             _recorded_next_action(report)
             or f"Review {directory} and fix the recorded failure",
         )

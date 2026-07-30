@@ -215,6 +215,22 @@ class ReportHistoryTests(StatusTestCase):
                 self.assertIn("fix the recorded failure", status.next_action)
                 self.assertNotIn("\n", status.next_action)
 
+    def test_a_full_gate_pass_is_reported_as_its_own_state(self) -> None:
+        profile = self.lab.write_profile()
+        self.record_preflight(profile)
+        latest = (self.runs / "LATEST").read_text(encoding="utf-8").strip()
+        report_path = self.runs / latest / "report.json"
+        document = json.loads(report_path.read_text(encoding="utf-8"))
+        # Only issue #20's dual-run gate can record this, but a stored `pass` must
+        # not be flattened into "preflight passed".
+        document["status"] = "pass"
+        document["next_action"] = "Proceed to the cutover ticket"
+        report_path.write_text(json.dumps(document), encoding="utf-8")
+        status = self.status(profile)
+        self.assertEqual(status.state, "gate-passed")
+        self.assertTrue(status.ready)
+        self.assertEqual(status.next_action, "Proceed to the cutover ticket")
+
     def test_reports_that_there_is_no_report_yet(self) -> None:
         status = self.status(self.lab.write_profile())
         self.assertIsNone(status.latest_report)

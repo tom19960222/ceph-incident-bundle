@@ -45,6 +45,8 @@ Shell reference 的 Node Evidence Archive receiver 已由 issue #23 完成 pre-e
 
 `lab-status` 的下一步依序判斷：credential path 不可用 → 待審 candidate → bootstrap profile → candidate profile → 最近一次 report 的結果 → 可執行 preflight。Candidate 排在 profile state 之前，避免已經產出 candidate 的流程被反覆送回 discovery。
 
+可能的 `state`：`profile-missing`、`profile-invalid`、`profile-bootstrap`、`profile-candidate`、`credential-path-invalid`、`candidate-pending-review`、`last-attempt-failed`、`ready-for-preflight`、`preflight-passed`、`gate-passed`。最後三個 exit `0`，其餘 exit `2`。`gate-passed` 只有在 #20 的 dual-run gate 能寫出 `status: pass` 之後才會出現。
+
 ## Lab Replacement Workflow
 
 Lab 隨時可能被刪除重建。新環境不能沿用舊 profile 的信任：
