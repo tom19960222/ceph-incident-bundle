@@ -483,9 +483,9 @@ class RookUnavailableTests(RookFixture, unittest.TestCase):
             self.assertIn("kubectl command not found", skipped)
             for artifact in REQUIRED_ROOK_ARTIFACTS:
                 self.assertNotIn(artifact, contents)
-            self.assertIn("rook collection exited 2", contents["errors.log"])
-            self.assertIn("cluster_status=2", contents["summary.txt"])
-            self.assertIn("final_status=2", contents["summary.txt"])
+            self.assertIn("cluster collection exited 2", contents["errors.log"])
+            self.assertIn("cluster_status: 2", contents["summary.txt"])
+            self.assertIn("final_status: 2", contents["summary.txt"])
             self.assert_bundle_verifies(bundle)
 
     def test_missing_remote_kubectl_is_classified_from_the_probe_error(self) -> None:
@@ -606,9 +606,9 @@ class RookPartialCollectionTests(RookFixture, unittest.TestCase):
             errors = contents["errors.log"]
             self.assertIn("exit=17", errors)
             self.assertIn("events.txt", errors)
-            self.assertIn("rook collection exited 2", errors)
-            self.assertIn("cluster_status=2", contents["summary.txt"])
-            self.assertIn("final_status=2", contents["summary.txt"])
+            self.assertIn("cluster collection exited 2", errors)
+            self.assertIn("cluster_status: 2", contents["summary.txt"])
+            self.assertIn("final_status: 2", contents["summary.txt"])
             self.assert_bundle_verifies(bundle)
 
     def test_rook_partial_does_not_hide_a_successful_node(self) -> None:
@@ -623,8 +623,8 @@ class RookPartialCollectionTests(RookFixture, unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             contents = self.extract(self.bundle_of(result))
             self.assertIn("nodes/monitor01/system/hostname.txt", contents)
-            self.assertIn("node_ok=1", contents["summary.txt"])
-            self.assertIn("node_failed=0", contents["summary.txt"])
+            self.assertIn("node_ok: 1", contents["summary.txt"])
+            self.assertIn("node_failed: 0", contents["summary.txt"])
 
 
 class RookTimeoutTests(RookFixture, unittest.TestCase):
@@ -653,7 +653,7 @@ class RookTimeoutTests(RookFixture, unittest.TestCase):
             self.assertEqual(
                 self.rook_entries(contents)["events.txt"]["exit_code"], 124
             )
-            self.assertIn("rook collection exited 2", contents["errors.log"])
+            self.assertIn("cluster collection exited 2", contents["errors.log"])
             self.assert_bundle_verifies(bundle)
 
     def test_timed_out_namespace_probe_is_a_skip_not_a_hang(self) -> None:

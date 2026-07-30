@@ -356,6 +356,20 @@ def serve_ceph(words: list[str]) -> None:
     ):
         emit("-----BEGIN OPENSSH PRIVATE KEY-----\nkey material")
     if remote == "config dump --format json-pretty" and os.environ.get(
+        "FAKE_CEPH_KEY_MATERIAL_CONFIG"
+    ):
+        # A safe line, Ceph key material in both spellings, and a whole PEM block:
+        # the shapes the content-safety contract must blank line by line.
+        emit(
+            "mon_host = 10.0.0.1\n"
+            "key = AQBn0123456789012345678901234567890123456==\n"
+            '"auth_key": "AQBn0123456789012345678901234567890123456=="\n'
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n"
+            "-----END OPENSSH PRIVATE KEY-----\n"
+            "osd_pool_default_size = 3\n"
+        )
+    if remote == "config dump --format json-pretty" and os.environ.get(
         "FAKE_CEPH_WHITESPACE_SECRET"
     ):
         emit("private\vkey: whitespace-must-redact")

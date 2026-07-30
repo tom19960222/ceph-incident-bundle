@@ -102,9 +102,9 @@ class MultiSourceOrchestrationTests(unittest.TestCase):
                 "nodes/storage01/logs/var-log/INDEX.tsv",
             ):
                 self.assertIn(expected, names)
-            self.assertIn("node_ok=2\n", summary)
-            self.assertIn("node_failed=0\n", summary)
-            self.assertIn("final_status=0\n", summary)
+            self.assertIn("node_ok: 2\n", summary)
+            self.assertIn("node_failed: 0\n", summary)
+            self.assertIn("final_status: 0\n", summary)
             configs = [
                 json.loads(line)
                 for line in (root / "node-config.jsonl").read_text(
@@ -183,9 +183,9 @@ class CephRunnerSelectionTests(DirectCephFixture, unittest.TestCase):
             contents = self.extract(self.bundle_of(result))
             self.assertIn("nodes/monitor01/system/hostname.txt", contents)
             self.assertIn("nodes/storage01/system/hostname.txt", contents)
-            self.assertIn("node_ok=1\n", contents["summary.txt"])
-            self.assertIn("node_failed=1\n", contents["summary.txt"])
-            self.assertIn("final_status=2\n", contents["summary.txt"])
+            self.assertIn("node_ok: 1\n", contents["summary.txt"])
+            self.assertIn("node_failed: 1\n", contents["summary.txt"])
+            self.assertIn("final_status: 2\n", contents["summary.txt"])
 
     def test_an_unreachable_explicit_seed_never_falls_back_to_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -228,7 +228,7 @@ class CephRunnerSelectionTests(DirectCephFixture, unittest.TestCase):
             contents = self.extract(self.bundle_of(result))
             self.assertIn("cluster/ceph/json/status.json", contents)
             self.assertIn("cluster/rook/SKIPPED.txt", contents)
-            self.assertIn("cluster_status=0\n", contents["summary.txt"])
+            self.assertIn("cluster_status: 0\n", contents["summary.txt"])
 
     def test_ceph_only_mode_does_not_validate_remote_rook_since(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

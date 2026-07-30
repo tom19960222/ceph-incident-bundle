@@ -410,8 +410,8 @@ class DirectCephFailureSemanticsTests(DirectCephFixture, unittest.TestCase):
             self.assertIn("exit=17", contents["errors.log"])
             self.assertIn("osd-perf.json", contents["errors.log"])
             self.assertIn("cluster collection exited 2", contents["errors.log"])
-            self.assertIn("cluster_status=2", contents["summary.txt"])
-            self.assertIn("final_status=2", contents["summary.txt"])
+            self.assertIn("cluster_status: 2", contents["summary.txt"])
+            self.assertIn("final_status: 2", contents["summary.txt"])
             self.assert_bundle_verifies(bundle)
 
     def test_timed_out_command_is_truncated_and_writes_ssh_debug(self) -> None:
@@ -665,8 +665,8 @@ class MissingLocalSshTransportTests(DirectCephFixture, unittest.TestCase):
             self.assertIn("no cephadm-capable node", contents["cluster/ceph/SKIPPED.txt"])
             self.assertIn("node monitor01 (ceph@10.0.0.1):", errors)
             self.assertIn("ssh: command not found", errors)
-            self.assertIn("final_status=2", contents["summary.txt"])
-            self.assertIn("node_failed=1", contents["summary.txt"])
+            self.assertIn("final_status: 2", contents["summary.txt"])
+            self.assertIn("node_failed: 1", contents["summary.txt"])
 
             self.assert_bundle_verifies(bundle)
 
