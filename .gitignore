@@ -8,3 +8,11 @@
 /CEPH-LAB-CONNECTION.md
 __pycache__/
 *.py[cod]
+# Lab Profiles, candidates and the activation ledger are local-only.  TOML is
+# ignored by default so a real profile kept next to the repo cannot be committed
+# by accident; the placeholder examples are the only tracked exceptions, and any
+# future tooling config needs its own negation here.
+*.toml
+!/validation/lab-profile.example.toml
+!/validation/lab-bootstrap.example.toml
+lab-activation.log.jsonl

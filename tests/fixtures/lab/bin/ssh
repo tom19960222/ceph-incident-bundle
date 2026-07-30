@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Whitelist fake ssh for the fake lab's read-only identity probes.
+
+The full option vector is matched exactly, and only three remote commands are
+answered: ``hostname``, ``ceph fsid`` and ``sudo -n ceph fsid``.  Anything else
+exits 99, so a probe that reaches for ``cephadm shell``, a write verb or an extra
+option fails the suite immediately.
+
+Host key pinning is enforced, not assumed: the fake refuses to connect unless
+``StrictHostKeyChecking=yes`` is set and the collector-owned known_hosts file
+already holds a line for the target address.  A probe that trusts a key it never
+verified therefore fails the way real ssh would.
+
+Knobs (env):
+  FAKE_LAB_SSH_LOG         append each invocation's argv here as one JSON line
+  FAKE_LAB_HOST_ALIASES    JSON {address: hostname} the fake lab's default names
+  FAKE_LAB_HOSTNAMES       JSON {address: hostname} overriding those defaults
+  FAKE_LAB_CEPH_FSID       the FSID `ceph fsid` reports
+  FAKE_LAB_CEPH_DIRECT_FAIL  `ceph fsid` fails so only `sudo -n ceph` answers
+  FAKE_LAB_CEPH_FAIL       both Ceph runners fail
+  FAKE_LAB_SSH_UNREACHABLE space-separated addresses that refuse the connection
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import sys
+
+
+IDENTITY_PATH = re.compile(r"[^-\s]\S*")
+CONNECT_TIMEOUT = re.compile(r"ConnectTimeout=[1-9][0-9]*")
+KNOWN_HOSTS_FILE = re.compile(r"UserKnownHostsFile=(\S.*)")
+SSH_TARGET = re.compile(r"([A-Za-z0-9._%+-]+)@(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9._:-]+)")
+
+EXPECTED = (
+    "-i",
+    IDENTITY_PATH,
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "IdentitiesOnly=yes",
+    "-o",
+    "IdentityAgent=none",
+    "-o",
+    "LogLevel=ERROR",
+    "-o",
+    CONNECT_TIMEOUT,
+    "-o",
+    "StrictHostKeyChecking=yes",
+    "-o",
+    KNOWN_HOSTS_FILE,
+)
+REMOTE_COMMANDS = ("hostname", "ceph fsid", "sudo -n ceph fsid")
+
+arguments = sys.argv[1:]
+log_path = os.environ.get("FAKE_LAB_SSH_LOG")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as output:
+        output.write(json.dumps(arguments) + "\n")
+
+
+def reject(reason: str) -> None:
+    sys.stderr.write(f"fake ssh: unexpected argv ({reason}): {shlex.join(arguments)}\n")
+    raise SystemExit(99)
+
+
+if len(arguments) != len(EXPECTED) + 2:
+    reject("argument count")
+for index, expected in enumerate(EXPECTED):
+    actual = arguments[index]
+    if isinstance(expected, re.Pattern):
+        if expected.fullmatch(actual) is None:
+            reject(f"option {index}")
+    elif expected != actual:
+        reject(f"option {index}")
+
+target = SSH_TARGET.fullmatch(arguments[-2])
+if target is None:
+    reject("ssh target")
+address = target.group(2)
+remote = arguments[-1]
+if remote not in REMOTE_COMMANDS:
+    reject("remote command is not whitelisted")
+
+known_hosts = KNOWN_HOSTS_FILE.fullmatch(arguments[len(EXPECTED) - 1]).group(1)
+try:
+    with open(known_hosts, encoding="utf-8") as source:
+        pinned = [line.split(" ")[0] for line in source.read().splitlines() if line]
+except OSError:
+    pinned = []
+if address not in pinned:
+    sys.stderr.write(f"Host key verification failed for {address}.\n")
+    raise SystemExit(255)
+
+if address in os.environ.get("FAKE_LAB_SSH_UNREACHABLE", "").split():
+    sys.stderr.write(f"ssh: connect to host {address} port 22: Connection refused\n")
+    raise SystemExit(255)
+
+if remote == "hostname":
+    hostnames = {
+        **json.loads(os.environ.get("FAKE_LAB_HOST_ALIASES", "{}")),
+        **json.loads(os.environ.get("FAKE_LAB_HOSTNAMES", "{}")),
+    }
+    sys.stdout.write(hostnames.get(address, address) + "\n")
+    raise SystemExit(0)
+
+if os.environ.get("FAKE_LAB_CEPH_FAIL"):
+    sys.stderr.write("unable to get monitor info from DNS SRV with service name: ceph-mon\n")
+    raise SystemExit(1)
+if remote == "ceph fsid" and os.environ.get("FAKE_LAB_CEPH_DIRECT_FAIL"):
+    sys.stderr.write("[errno 13] RADOS permission denied\n")
+    raise SystemExit(1)
+sys.stdout.write(
+    os.environ.get("FAKE_LAB_CEPH_FSID", "3f2b1c8e-0000-4a1d-8b7e-000000000001") + "\n"
+)
+raise SystemExit(0)

@@ -86,7 +86,7 @@ shell 的 `node_copy_file` 複製 evidence 時不寫 manifest entry，`lib/colle
 
 - 建立 Python test runner 與 bundle normalizer。
 - 建立 shell/Python differential harness 骨架。
-- 定義 TOML Lab Profile、profile candidate、status/discover workflow 與 Lab Validation Report schema。
+- 定義 TOML Lab Profile、profile candidate、status/discover workflow 與 Lab Validation Report schema（#19 完成，見 `validation/`）。
 - Production shell 保持不變。
 
 ### 3. Node collector
@@ -143,7 +143,7 @@ shell 的 `node_copy_file` 複製 evidence 時不寫 manifest entry，`lib/colle
 - Agent 或操作人員檢查 candidate 後明確啟用，再執行 strict preflight 與 full validation。
 - Repository 不硬編碼 endpoints、credentials 或即時 cluster identity。
 
-> Current status: `lab-status`、`lab-profile-discover` 與 `validate-lab` 是已鎖定但尚未實作的公開操作介面。#19 負責 profile/status/discovery，#20 負責 dual-run real-lab harness；#9 不提供暫時性的 ad-hoc 替代品。
+> Current status: #19 已實作 `lab-status`、`lab-profile-discover`、`lab-profile-activate` 與 `lab-preflight`，並固定 Lab Validation Report schema；程式在 `validation/` package，不屬於三個 production modules。`validate-lab` 仍由 #20 負責，尚未實作，因此 `lab-preflight` 通過只證明 lab identity，不是 qualification evidence。
 
 ## Out of Scope
 

@@ -4,17 +4,22 @@
 
 本文件定義 Python rewrite cutover 前的 real-lab validation 操作流程與 agent handoff 契約。
 
-截至 issue #9，以下介面**尚未實作，現在不可假設可用**：
+Issue #19 已實作 Lab Profile、status/discovery/activation workflow、strict identity preflight 與 Lab Validation Report foundation。目前可用的介面：
 
-- `make lab-status`
-- `make lab-profile-discover`
+- `make lab-status LAB_PROFILE=...` — 純本機狀態與唯一下一步。
+- `make lab-profile-discover LAB_PROFILE=...` — 唯讀 discovery，只產生 candidate。
+- `make lab-profile-activate LAB_PROFILE=... LAB_CANDIDATE=... CEPH_INCIDENT_LAB_ACTIVATE=1` — 顯式且留下稽核紀錄的 activation。
+- `make lab-preflight LAB_PROFILE=... CEPH_INCIDENT_LAB_CONFIRM=1` — strict identity preflight，寫出一份 Lab Validation Report。
+
+以下介面**尚未實作，現在不可假設可用**：
+
 - `make validate-lab`
 
-Lab Profile、status/discovery workflow 與 report foundation 由 issue #19 實作；同 lab 的 shell/Python full-collect automation 與完整 `validate-lab` gate 由 issue #20 實作。Issue #9 只建立契約與操作文件，不修改 production collectors 或 Makefile。
+同 lab 的 shell/Python full-collect automation 與完整 `validate-lab` gate 由 issue #20 實作。因此 `lab-preflight` 通過**只證明 lab identity，不是 qualification evidence**；它產生的 report 中 collector coverage、兩次 full collect、bundle comparison、stable-state diff 與 residue 一律是 `not-run`。
 
 Shell reference 的 Node Evidence Archive receiver 已由 issue #23 完成 pre-extraction hardening；這只解除 archive receiver prerequisite，不取代 issue #20 的 strict identity、full-collect、stable-state 與 residue gates。
 
-在 #19、#20 完成前，不得用手動拼接的一組長指令冒充正式 qualification，也不得宣告 Python candidate 已通過 real-lab gate。
+在 #20 完成前，不得用手動拼接的一組長指令冒充正式 qualification，也不得宣告 Python candidate 已通過 real-lab gate。
 
 ## Non-Negotiable Safety Rules
 
@@ -33,23 +38,45 @@ Shell reference 的 Node Evidence Archive receiver 已由 issue #23 完成 pre-e
 
 1. 讀取根目錄 `AGENTS.md`、本 runbook、read-only safety contract、`CONTEXT.md` 與相關 ADR。
 2. 確認工作目錄、Git commit/dirty state 與預定的 Lab Profile 絕對路徑；不要把 local-only profile 加入 Git。
-3. Issue #19 完成後，先執行 `make lab-status LAB_PROFILE=/absolute/path/to/lab.toml`。
+3. 先執行 `make lab-status LAB_PROFILE=/absolute/path/to/lab.toml`（加 `LAB_ARGS=--json` 可取得 machine-readable 版本）。
 4. 只執行 status/report 提供的唯一 `next_action`。若它要求人工確認 candidate 或 identity 差異，停止並交給操作人員；不要自行信任新 identity。
 
-`lab-status` 必須是純讀取本機狀態的入口，不得連線 lab 或改寫 active profile。它應顯示 active/candidate 狀態、profile hash、必要檔案存在性、最近 report 與唯一下一步，但不得顯示 secret content。
+`lab-status` 是純讀取本機狀態的入口，不連線 lab、不改寫 active profile、不執行任何外部指令。它顯示 profile state/hash、missing identity、credential path 是否可用、待審 candidate、最近一次 activation 與 report，以及唯一下一步；只顯示 credential **路徑**，不顯示內容。Exit code：`0` 表示可以繼續，`2` 表示被擋住且必須先做 `next_action`。
+
+`lab-status` 的下一步依序判斷：credential path 不可用 → 待審 candidate → bootstrap profile → candidate profile → 最近一次 report 的結果 → 可執行 preflight。Candidate 排在 profile state 之前，避免已經產出 candidate 的流程被反覆送回 discovery。
 
 ## Lab Replacement Workflow
 
 Lab 隨時可能被刪除重建。新環境不能沿用舊 profile 的信任：
 
-1. 準備一份只含連線入口與 credential path 的 local-only bootstrap/candidate input；不要把聊天、Markdown connection note 當成 machine input。
-2. Issue #19 完成後，以 `make lab-profile-discover LAB_PROFILE=/absolute/path/to/bootstrap.toml` 執行唯讀 discovery。
-3. Discovery 必須輸出獨立的 **Lab Profile Candidate**，不得覆寫或啟用 active profile。它只能使用讀取型操作，並記錄 SSH fingerprints、Ceph/Rook FSID、hostnames/host map 與 Prometheus readiness。
-4. 操作人員或被明確委託的 agent 比較 candidate 與預期拓撲、identity 和 credential paths。檢查報告不得包含 credential content。
-5. 只有在差異被明確接受後，才能以 #19 定義的 activation 動作建立 active Lab Profile。Activation 必須是顯式動作，不能由 discovery 或 validation 自動發生。
+1. 準備一份只含連線入口與 credential path 的 local-only bootstrap profile（`state = "bootstrap"`）；從 `validation/lab-bootstrap.example.toml` 複製，不要把聊天、Markdown connection note 當成 machine input。
+2. 執行 `make lab-profile-discover LAB_PROFILE=/absolute/path/to/bootstrap.toml`。
+3. Discovery 輸出獨立的 **Lab Profile Candidate**（預設 `<name>.candidate.toml`），不覆寫也不啟用 active profile。它只使用讀取型操作（`ssh-keyscan`、`hostname`、`ceph fsid`、本機 `kubectl get`、Prometheus readiness GET），並記錄 SSH fingerprints、Ceph/Rook FSID、hostnames/host map 與 Prometheus readiness。任一 identity 讀不到就完全不寫 candidate，只回報缺哪一項。
+4. 操作人員或被明確委託的 agent 比較 candidate 與預期拓撲、identity 和 credential paths。Discovery 會列出與輸入 profile 的每一項差異；檢查報告不含 credential content。
+5. 只有在差異被明確接受後，才執行 `make lab-profile-activate LAB_PROFILE=/absolute/path/to/lab.toml LAB_CANDIDATE=/absolute/path/to/lab.candidate.toml CEPH_INCIDENT_LAB_ACTIVATE=1`。Activation 不會由 discovery 或 validation 自動發生；覆蓋既有 active profile 需要再加 `LAB_ARGS=--replace-active`。每次 activation 會在 active profile 旁的 `lab-activation.log.jsonl` 追加一筆只含 identity 的稽核紀錄。
 6. 重新執行 `lab-status`。未啟用 candidate、缺少 expected identity、SSH fingerprint 或 FSID 不符時，下一步只能是修正/審核 profile，不能進入 collect。
 
-禁止以 `StrictHostKeyChecking=no`、自動接受所有新 fingerprint、skip identity check 或直接修改 expected FSID 的方式讓 gate 通過。
+禁止以 `StrictHostKeyChecking=no`、自動接受所有新 fingerprint、skip identity check 或直接修改 expected FSID 的方式讓 gate 通過。Discovery 與 preflight 的每一條 SSH 連線都用 collector-owned known_hosts 搭配 `StrictHostKeyChecking=yes`，不讀也不寫操作人員自己的 `known_hosts`。
+
+## Lab Profile
+
+Schema 與可提交的 placeholder 範例見 `validation/lab-profile.example.toml`（active）與 `validation/lab-bootstrap.example.toml`（bootstrap）。要點：
+
+- `state` 只有 `bootstrap`、`candidate`、`active` 三種。只有 `bootstrap` 可以缺 identity；`candidate` 與 `active` 必須帶齊 Ceph/Rook FSID 與每台 host 的 hostname 與 SSH fingerprints，否則 loader 直接拒收。
+- Profile 必須同時描述四條 collector path 的入口（`[ceph] seed`、`[rook] kubeconfig_path`/`namespace`/`operator_namespace`、`[prometheus] url`、`[[hosts]]` host map），因為 qualification 要求四條路徑都完整。
+- 未知的 table 或 key 一律拒收，避免打錯字的 identity 欄位靜默失效。Profile 內出現任何 credential material（PEM header、kubeconfig credential 欄位等）也直接拒收。
+- `profile hash` 是 canonical content hash：註解與排版不影響它，identity 改變才會改變它。
+- 實際 profile 一律 local-only。Repository 只提供無秘密的 example，`.gitignore` 預設忽略 TOML。
+
+## Identity Preflight
+
+```text
+make lab-preflight LAB_PROFILE=/absolute/path/to/lab.toml CEPH_INCIDENT_LAB_CONFIRM=1
+```
+
+依序檢查 profile state（必須 `active`）、credential paths（存在、是一般檔案、只有 owner 可讀，不讀內容）、SSH fingerprints、必要 hosts、Ceph FSID、Rook FSID、Prometheus readiness；第一個失敗的 stage 就停止，並輸出唯一的 `next_action`。Fingerprint 規則是「host 提供的每一把 key 都必須已經在 profile 裡」；profile 記錄了但 host 這次沒提供的 key 不算 mismatch。
+
+每次執行都會寫一份 Lab Validation Report。**通過只代表 identity 正確，不是 qualification**；report 的 `status` 是 `preflight-pass` 而不是 `pass`，`next_action` 指向 #20。
 
 ## Qualification Workflow
 
@@ -122,6 +149,8 @@ Snapshot schema 必須明確排除會自然變動的 counter、epoch、timestamp
 - `next_action`：**恰好一個**具體動作。Pass 時也只能有一個下一步，例如進入指定 cutover ticket；不能放空陣列或建議清單。
 
 Report 不得包含 private key、keyring、password、token、Authorization header、kubeconfig credential payload、完整環境變數 dump 或 command stdin。若錯誤輸出可能帶 secret，應在寫入 report 前遮蔽，只保留定位問題所需的 bounded diagnostics。
+
+實作狀態：schema 由 issue #19 固定，writer 會在寫入前檢查兩件事並 fail closed——`next_action` 恰好一個非空單行字串，且兩種格式都不含 credential marker。Run directory 預設在 `results/lab-validation/<run-id>/`（`LAB_ARGS=--runs-dir` 可覆寫），`LATEST` 是同層記錄 run directory 名稱的檔案。Coverage、runs、comparison、stable state 與 residue 欄位已在 schema 內，但在 #20 之前一律是 `not-run`。
 
 ## Failure and Handoff Rules
 

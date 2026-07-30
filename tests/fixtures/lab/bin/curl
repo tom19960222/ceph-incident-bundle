@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Whitelist fake curl for the fake lab's Prometheus readiness probe.
+
+Only the bounded readiness GET is answered, matched in full:
+``-q -fsS --connect-timeout T --max-time T -o OUT URL/-/ready``.  Anything else
+exits 99, so a probe that adds a query, a header or a write method fails the
+suite immediately.
+
+Knobs (env):
+  FAKE_LAB_CURL_LOG  append each invocation's argv here as one JSON line
+  FAKE_LAB_PROM_MODE ready | notready | down
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import sys
+
+
+TIMEOUT = re.compile(r"[1-9][0-9]*")
+
+arguments = sys.argv[1:]
+log_path = os.environ.get("FAKE_LAB_CURL_LOG")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as output:
+        output.write(json.dumps(arguments) + "\n")
+
+
+def reject(reason: str) -> None:
+    sys.stderr.write(f"fake curl: unexpected argv ({reason}): {shlex.join(arguments)}\n")
+    raise SystemExit(99)
+
+
+if len(arguments) != 9:
+    reject("argument count")
+if arguments[0] != "-q" or arguments[1] != "-fsS":
+    reject("base options")
+if arguments[2] != "--connect-timeout" or TIMEOUT.fullmatch(arguments[3]) is None:
+    reject("connect timeout")
+if arguments[4] != "--max-time" or TIMEOUT.fullmatch(arguments[5]) is None:
+    reject("max time")
+if arguments[6] != "-o" or not arguments[7]:
+    reject("output option")
+url = arguments[8]
+if url.startswith("-") or not url.startswith(("http://", "https://")):
+    reject("url")
+if not url.endswith("/-/ready"):
+    reject("only the readiness endpoint is whitelisted")
+
+mode = os.environ.get("FAKE_LAB_PROM_MODE", "ready")
+if mode == "down":
+    sys.stderr.write("curl: (7) Failed to connect to prometheus\n")
+    raise SystemExit(7)
+if mode == "notready":
+    sys.stderr.write("curl: (22) The requested URL returned error: 503\n")
+    raise SystemExit(22)
+with open(arguments[7], "w", encoding="utf-8") as output:
+    output.write("Prometheus Server is Ready.\n")
+raise SystemExit(0)

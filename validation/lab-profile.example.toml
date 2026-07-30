@@ -1,0 +1,64 @@
+# Lab Profile example — placeholder values only, safe to commit.
+#
+# A real Lab Profile stays local-only and is never committed.  Copy this file to
+# an absolute path outside the repository, replace every placeholder, and pass it
+# as `LAB_PROFILE=/absolute/path/to/lab.toml`.
+#
+# A profile references credential *paths*.  It must never contain a private key,
+# a Ceph keyring, a password, a token or a kubeconfig credential payload; the
+# loader rejects a profile that carries credential material.
+#
+# `state = "active"` means an operator reviewed this identity and accepted it.
+# Discovery only ever writes `state = "candidate"`; activation is a separate,
+# explicit, audited step.
+
+schema_version = 1
+
+[profile]
+name = "example-lab"
+state = "active"
+
+[ssh]
+# The Linux account used on every host, and the private key file used to reach
+# them.  Only the path is recorded here.
+user = "operator"
+key_path = "/home/operator/.ssh/ceph-lab-ed25519"
+
+[ceph]
+# `seed` names the host in the host map that answers cluster-level Ceph reads.
+seed = "monitor01"
+fsid = "3f2b1c8e-0000-4a1d-8b7e-000000000001"
+
+[rook]
+# `namespace` holds the CephCluster; `operator_namespace` defaults to it.  These
+# are the two namespaces the shared inventory carries as ROOK_NAMESPACE and
+# ROOK_OPERATOR_NAMESPACE.
+kubeconfig_path = "/home/operator/.kube/ceph-lab.config"
+namespace = "rook-ceph"
+operator_namespace = "rook-ceph"
+fsid = "3f2b1c8e-0000-4a1d-8b7e-000000000002"
+
+[prometheus]
+url = "http://198.51.100.11:9095"
+
+# Every host in the map is required: qualification collects node evidence from
+# all of them.  `name` becomes the `nodes/<name>/` directory in the bundle.
+# `ssh_fingerprints` lists every host key the profile trusts, in
+# `SHA256:<unpadded-base64>` form.
+[[hosts]]
+name = "monitor01"
+address = "198.51.100.11"
+hostname = "monitor01"
+ssh_fingerprints = ["SHA256:/h4FqMEWPRJfZPw6PJz4b5i2//0AtbRLctMFudlKKWU"]
+
+[[hosts]]
+name = "mon02"
+address = "198.51.100.12"
+hostname = "mon02"
+ssh_fingerprints = ["SHA256:mctW2oBnIHUeSwsmqclzdaOPdE3amEImn9Q8CuzWih4"]
+
+[[hosts]]
+name = "osd01"
+address = "198.51.100.21"
+hostname = "osd01"
+ssh_fingerprints = ["SHA256:BSccPWqXlTrgp2qDcvHrV5ekgxzrMGv4qKPJdlntHco"]
