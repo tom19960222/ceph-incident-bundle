@@ -40,6 +40,10 @@ _Avoid_: Deploy package, uploaded script, node bundle
 單一 node collector 透過 SSH stdout 回傳給工作機的壓縮 evidence 封存檔；它是 incident bundle 的輸入，不是最終 incident bundle。
 _Avoid_: Node bundle, remote tarball
 
+**Evidence Manifest**:
+列出 Node Evidence Archive 或 incident bundle 內每一份 evidence 及其來源、狀態與時間的索引；archive 內每一份 evidence 都必須在索引中有一筆對應紀錄。
+_Avoid_: Command log, 執行紀錄
+
 **Collect**:
 從指定環境取得 cluster evidence 與 node evidence，並產生一份經驗證的 incident bundle。
 _Avoid_: Run, gather, dump

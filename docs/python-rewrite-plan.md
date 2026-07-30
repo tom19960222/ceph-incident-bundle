@@ -57,7 +57,22 @@ Rook 只在明確指定 `--kube-mode` 時收集，這和 #13 的 Ceph 層只在�
 - 驗收要求 observable contract equivalence，不要求 tar/gzip/JSON 等非語意 serialization byte-identical。
 - Production 與 validation tooling 都不使用第三方 Python packages。
 
-詳細理由與 consequences 見 `docs/adr/0001-*.md` 至 `docs/adr/0009-*.md`。
+詳細理由與 consequences 見 `docs/adr/0001-*.md` 至 `docs/adr/0010-*.md`。
+
+## Contract Adjudications
+
+這裡記錄依 #8 裁定、不得由 implementation ticket 自行決定的等價／安全取捨。
+
+### Node manifest 的涵蓋範圍（由 #36 提出）
+
+shell 的 `node_copy_file` 複製 evidence 時不寫 manifest entry，`lib/collect-var-log.sh` 也完全不寫；shell receiver 只驗證 manifest 指向的 artifact 存在。Python receiver 額外要求 archive 內每一份 evidence 都有對應 entry，因此複製類 evidence 若照搬 shell 會使整包 Node Evidence Archive 被拒收。裁定如下，理由與 consequences 見 `docs/adr/0010-manifest-as-evidence-index.md`：
+
+1. 保留 Python receiver 的雙向要求。manifest 語意改為「archive 內全部 evidence 的索引」，不再是「已執行 command 的紀錄」。
+2. 複製類 evidence 的 `command` 記為 `collect-node copy <來源絕對路徑>`。不記真實讀取指令，因為 `node_copy_file` 依 EUID 與 sudo 可用性有三條分支，同一份 evidence 會有三種寫法。
+3. 來源存在但複製失敗時，在目的地寫 SKIPPED artifact 並補一筆 `exit_code` 非 0 的 entry。shell 在這條路徑不留任何痕跡，只以 node exit 2 表示 partial。
+4. `exit_code` 為 per-artifact 語意：0 表示該份證據完整，非 0 表示不完整。`_manifest_generated_tree` 目前把整組 `/var/log` 結果套用到每一筆 entry，屬同一裁定的回溯修正範圍，另立 ticket 處理。
+5. 複製類 evidence 不套用 `/var/log` 的 `MANIFEST-LIMIT.txt` 降級機制。16 MiB 的 manifest cap 容得下五萬筆以上 entry，config 複製的 cardinality 不可能逼近；該機制只為 rotated log 數量爆炸而存在。
+6. #18 差異比對規則：shell 記錄的每一筆 entry，Python 必須有對應且 command 語意相同；Python 額外的 entry 與 SKIPPED artifact 僅限已列舉類別（複製類 evidence、`/var/log` 產出樹）。不得整份排除 manifest，否則 N9、N10 這類 command-policy 斷言會失去對照組。
 
 ## Delivery Phases
 
