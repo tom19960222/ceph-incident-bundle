@@ -46,6 +46,21 @@ CODEC_COMMANDS: dict[str, tuple[str, ...]] = {
     "bz2": ("bzip2", "-dc"),
     "zst": ("zstd", "-qdc"),
 }
+# ADR 0010: a manifest entry's exit_code describes whether that one artifact is
+# complete evidence, not how the collector group fared. Entries synthesized for
+# the /var/log tree have no command exit status of their own, so an incomplete
+# one records this instead.
+INCOMPLETE_ARTIFACT_EXIT_CODE = 2
+# Markers that stand in for evidence that was never collected or was discarded:
+# the marker file is written in full, but the evidence it accounts for is not.
+INCOMPLETE_EVIDENCE_MARKERS = frozenset(
+    {
+        "INSUFFICIENT-SPACE.txt",
+        "MANIFEST-LIMIT.txt",
+        "OVER-LIMIT.txt",
+        "SCAN-LIMIT.txt",
+    }
+)
 OPAQUE_ARCHIVE_SUFFIXES = (
     ".zip",
     ".tar",
@@ -99,9 +114,18 @@ class CaptureResult:
 
 
 @dataclass(frozen=True)
+class VarLogResult:
+    exit_code: int
+    # Output-relative paths of artifacts that did land but are not complete
+    # evidence. Artifacts that failed outright leave no file, and therefore no
+    # manifest entry, so they are not listed here.
+    incomplete_artifacts: frozenset[str]
+
+
+@dataclass(frozen=True)
 class JournalResult:
     node_exit_code: int
-    manifest_exit_code: int | None
+    manifest_exit_code: int
     command: str | None
     started: str | None
     ended: str | None
@@ -528,10 +552,17 @@ def _manifest_generated_tree(
     output: Path,
     manifest: Path,
     host_alias: str,
-    exit_code: int,
+    collector_exit_code: int,
     started: str,
     journal_result: JournalResult,
+    incomplete_artifacts: frozenset[str],
 ) -> int:
+    """Append one manifest entry per file in the generated /var/log tree.
+
+    Each entry's `exit_code` describes that one artifact (ADR 0010), so it is
+    unrelated to `collector_exit_code`, which is only carried through so the
+    manifest-cap degradation below can turn the whole collection partial.
+    """
     try:
         requested_limit = int(
             os.environ.get(
@@ -550,15 +581,23 @@ def _manifest_generated_tree(
             directories.sort()
             for filename in sorted(filenames):
                 artifact = Path(root, filename)
-                artifact_exit_code = exit_code
+                relative = artifact.relative_to(output).as_posix()
                 command = "collect-var-log /var/log"
                 artifact_started = started
                 artifact_ended = ended
-                if artifact == output / "journal-all-since.txt" and journal_result.command:
-                    command = journal_result.command
-                    artifact_exit_code = journal_result.manifest_exit_code or 0
-                    artifact_started = journal_result.started or started
-                    artifact_ended = journal_result.ended or ended
+                if relative == "journal-all-since.txt":
+                    artifact_exit_code = journal_result.manifest_exit_code
+                    if journal_result.command:
+                        command = journal_result.command
+                        artifact_started = journal_result.started or started
+                        artifact_ended = journal_result.ended or ended
+                elif (
+                    relative in INCOMPLETE_EVIDENCE_MARKERS
+                    or relative in incomplete_artifacts
+                ):
+                    artifact_exit_code = INCOMPLETE_ARTIFACT_EXIT_CODE
+                else:
+                    artifact_exit_code = 0
                 entry = _manifest_entry_payload(
                     host_alias,
                     artifact,
@@ -580,27 +619,28 @@ def _manifest_generated_tree(
             "status=partial-var-log-payload-discarded\n",
             encoding="utf-8",
         )
-        exit_code = 2
+        collector_exit_code = 2
         payload = build_payload()
         if payload is None:
             raise OSError("minimal /var/log manifest exceeded its receiver safety cap")
     with manifest.open("ab") as output_stream:
         output_stream.write(payload)
-    return exit_code
+    return collector_exit_code
 
 
 def _collect_var_logs(
     root: Path,
     output: Path,
     config: NodeConfig,
-) -> int:
+) -> VarLogResult:
     output.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not root.is_dir():
         (output / "SKIPPED.txt").write_text(
             f"SKIPPED: {root} is not a directory\n", encoding="utf-8"
         )
-        return 0
+        return VarLogResult(0, frozenset())
 
+    incomplete: set[str] = set()
     index_lines = [INDEX_HEADER]
     errors: list[str] = []
     warnings: list[str] = []
@@ -645,7 +685,8 @@ def _collect_var_logs(
             encoding="utf-8",
         )
         _remove_owned_tree(scratch, output)
-        return 2
+        # Nothing was scanned, so the header-only index is not a full listing.
+        return VarLogResult(2, frozenset({"INDEX.tsv"}))
     sources, scan_errors, scan_limit_reason = _discover_log_files(
         root, scan_limit, entry_limit, scratch
     )
@@ -665,7 +706,8 @@ def _collect_var_logs(
                 encoding="utf-8",
             )
         _remove_owned_tree(scratch, output)
-        return 2
+        # The scan was cut short, so the header-only index is not a full listing.
+        return VarLogResult(2, frozenset({"INDEX.tsv"}))
     errors.extend(f"scan\t{_escape_tsv(error)}\n" for error in scan_errors)
     partial = bool(scan_errors)
     estimated = 0
@@ -792,7 +834,7 @@ def _collect_var_logs(
             encoding="utf-8",
         )
         _remove_owned_tree(scratch, output)
-        return 2
+        return VarLogResult(2, frozenset())
 
     available_bytes = _available_bytes(output)
     if (
@@ -809,7 +851,7 @@ def _collect_var_logs(
             encoding="utf-8",
         )
         _remove_owned_tree(scratch, output)
-        return 2
+        return VarLogResult(2, frozenset())
 
     payload_bytes = 0
     hard_cap_hit = False
@@ -834,6 +876,8 @@ def _collect_var_logs(
     for sequence, candidate in (() if hard_cap_hit else sorted(
         enumerate(candidates), key=lambda item: (item[1].family, item[1].order_key, item[0])
     )):
+        destination = _merged_destination(output, candidate.family)
+        merged_artifact = destination.relative_to(output).as_posix()
         decoded = scratch / f"merge-{sequence}"
         remaining = None
         if config.var_log_max_bytes is not None:
@@ -844,6 +888,7 @@ def _collect_var_logs(
             break
         if status != "ok":
             partial = True
+            incomplete.add(merged_artifact)
             errors.append(f"{_escape_tsv(candidate.relative)}\tmerge-read-failed\n")
             raw_temporary = scratch / f"merge-raw-{sequence}"
             raw_status, _ = _decode_to_file(
@@ -865,7 +910,6 @@ def _collect_var_logs(
                     "raw-preserve-failed-after-merge-read\n"
                 )
             continue
-        destination = _merged_destination(output, candidate.family)
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         header = (
             f"===== source={_escape_tsv(candidate.relative)} "
@@ -888,6 +932,7 @@ def _collect_var_logs(
                 with destination.open("r+b") as merged:
                     merged.truncate(segment_start)
             partial = True
+            incomplete.add(merged_artifact)
             errors.append(
                 f"{_escape_tsv(candidate.relative)}\tmerge-write-failed\n"
             )
@@ -909,6 +954,7 @@ def _collect_var_logs(
                 )
             else:
                 partial = True
+                incomplete.add(merged_artifact)
                 errors.append(f"{_escape_tsv(candidate.relative)}\tchanged-during-collection\n")
         if config.keep_original_logs:
             original = output / "original" / candidate.relative
@@ -947,7 +993,7 @@ def _collect_var_logs(
             (output / "UNREDACTED-OPAQUE.txt").write_text("".join(opaque), encoding="utf-8")
         if sensitive:
             (output / "SKIPPED-sensitive.txt").write_text("".join(sensitive), encoding="utf-8")
-        return 2
+        return VarLogResult(2, frozenset())
     (output / "PAYLOAD-BYTES.txt").write_text(f"{payload_bytes}\n", encoding="utf-8")
     if errors:
         (output / "ERRORS.tsv").write_text("".join(errors), encoding="utf-8")
@@ -957,8 +1003,7 @@ def _collect_var_logs(
         (output / "UNREDACTED-OPAQUE.txt").write_text("".join(opaque), encoding="utf-8")
     if sensitive:
         (output / "SKIPPED-sensitive.txt").write_text("".join(sensitive), encoding="utf-8")
-    exit_code = 2 if partial else 0
-    return exit_code
+    return VarLogResult(2 if partial else 0, frozenset(incomplete))
 
 
 def _journal_command() -> tuple[str, ...] | None:
@@ -1102,18 +1147,18 @@ def _collect_journal(output: Path, config: NodeConfig) -> JournalResult:
             journal,
             "not collected because /var/log payload exceeded the per-node cap",
         )
-        return JournalResult(2, None, None, None, None)
+        return JournalResult(2, INCOMPLETE_ARTIFACT_EXIT_CODE, None, None, None)
     payload_path = output / "PAYLOAD-BYTES.txt"
     if config.var_log_max_bytes is not None and not payload_path.is_file():
         _write_log_skip(journal, "/var/log payload accounting was unavailable")
-        return JournalResult(2, None, None, None, None)
+        return JournalResult(2, INCOMPLETE_ARTIFACT_EXIT_CODE, None, None, None)
     payload_bytes = 0
     if payload_path.is_file():
         try:
             payload_bytes = int(payload_path.read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
             _write_log_skip(journal, "/var/log payload accounting was unavailable")
-            return JournalResult(2, None, None, None, None)
+            return JournalResult(2, INCOMPLETE_ARTIFACT_EXIT_CODE, None, None, None)
     command_prefix = _journal_command()
     if command_prefix is None:
         _write_log_skip(
@@ -1121,7 +1166,7 @@ def _collect_journal(output: Path, config: NodeConfig) -> JournalResult:
         )
         return JournalResult(
             2 if config.var_log_max_bytes is not None else 0,
-            None,
+            INCOMPLETE_ARTIFACT_EXIT_CODE,
             None,
             None,
             None,
@@ -1191,9 +1236,11 @@ def _collect_journal(output: Path, config: NodeConfig) -> JournalResult:
                 journal,
                 "combined /var/log and journal text exceeded the per-node cap",
             )
+            # The capture succeeded, but its payload has just been replaced by
+            # a skip marker, so the artifact is no longer complete evidence.
             return JournalResult(
                 2,
-                capture.exit_code,
+                INCOMPLETE_ARTIFACT_EXIT_CODE,
                 command_text,
                 capture.started,
                 capture.ended,
@@ -1300,8 +1347,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if os.environ.get("CEPH_INCIDENT_TEST_ALLOW_ATIME_READ") == "1":
                 root = Path(os.environ.get("CEPH_INCIDENT_VAR_LOG_DIR", "/var/log"))
             log_started = _utc_now()
-            log_exit = _collect_var_logs(root, log_output, config)
+            log_result = _collect_var_logs(root, log_output, config)
             journal_result = _collect_journal(log_output, config)
+            log_exit = log_result.exit_code
             if journal_result.node_exit_code != 0:
                 log_exit = 2
             log_exit = _manifest_generated_tree(
@@ -1311,6 +1359,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 log_exit,
                 log_started,
                 journal_result,
+                log_result.incomplete_artifacts,
             )
             if log_exit != 0:
                 failed = True
