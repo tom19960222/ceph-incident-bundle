@@ -19,9 +19,10 @@ KUBE_NODE = "10.0.0.9"
 CEPH_SEED = f"ceph@{CEPH_NODE}"
 BOTH_CAPABLE = f"{CEPH_NODE}=cephadm,ceph {KUBE_NODE}=kubectl"
 
-# Shared for every scenario: the defaults the two entrypoints do not agree on
-# (node timeout) are always passed explicitly, so a difference can only come
-# from behaviour rather than from a default.
+# Shared for every scenario.  Both bounds are passed explicitly so a scenario
+# runs in seconds rather than minutes; the defaults themselves are compared
+# against the reference by
+# `test_python_collect_cli.CollectCliContractTests.test_timeout_defaults_match_the_shell_reference`.
 COMMON_ARGUMENTS = ("--timeout", "20", "--node-timeout", "120")
 
 
@@ -33,7 +34,7 @@ class Scenario:
     knobs: dict[str, str] = field(default_factory=dict)
     inventory: str = DEFAULT_INVENTORY
     coverage: tuple[str, ...] = ()
-    expected_exit: int | None = None
+    expected_exit: int = 0
     expect_archive: bool = True
     interrupt_after: str | None = None
 

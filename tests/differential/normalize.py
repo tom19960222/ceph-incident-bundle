@@ -30,8 +30,15 @@ from tests.differential.environment import CollectRun
 
 TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?")
 ARCHIVE_STAMP = re.compile(r"ceph-incident-\d{8}T\d{6}Z\.tar\.gz")
+# Epoch seconds are only ever normalized inside the metrics layer, where the
+# query window and sample timestamps live.  Applying this to all evidence would
+# blank real numbers (a byte total, an object count) that happen to look like a
+# clock, which is exactly the masking the gate must not do.
 EPOCH_SECONDS = re.compile(r"(?<![0-9.])1[0-9]{9}(?![0-9.])")
-HEX_IDENTIFIER = re.compile(r"\b[0-9a-f]{32}\b")
+PROMETHEUS_LAYER = "cluster/prometheus/"
+# The query window as it appears in a recorded request: only these named
+# parameters are clocks, so the rule cannot reach a number that is evidence.
+QUERY_WINDOW_PARAMETER = re.compile(r"\b(start|end|time)=1[0-9]{9}(?:\.[0-9]+)?\b")
 NODE_TEMPORARY = re.compile(r"/tmp/ceph-incident-node\.[A-Za-z0-9._-]+")
 # A redaction scratch file: `<dir>/.<name>.plain.XXXXXX` names the same artifact
 # the other implementation logs directly, so the random component is removed.
@@ -87,9 +94,6 @@ ERROR_CLASSES: tuple[tuple[re.Pattern[str], str], ...] = (
         "node-log-cap-exceeded:{alias}",
     ),
     (re.compile(r"bundle verification failed|VERIFY FAIL"), "verify-failed"),
-    (re.compile(r"skipped malformed HOSTS entry"), "inventory-malformed-entry"),
-    (re.compile(r"skipped unsafe host alias"), "inventory-unsafe-alias"),
-    (re.compile(r"skipped unsafe SSH target"), "inventory-unsafe-target"),
 )
 
 STDERR_CLASSES: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -102,14 +106,18 @@ STDERR_CLASSES: tuple[tuple[re.Pattern[str], str], ...] = (
 class BundleContents:
     """The members of one bundle, whether it is a directory or an archive."""
 
-    def __init__(self, names: list[str], payloads: dict[str, bytes]) -> None:
+    def __init__(
+        self, names: list[str], payloads: dict[str, bytes], modes: dict[str, int]
+    ) -> None:
         self.names = sorted(names)
         self.payloads = payloads
+        self.modes = modes
 
     @classmethod
     def of_archive(cls, path: Path) -> "BundleContents":
         names: list[str] = []
         payloads: dict[str, bytes] = {}
+        modes: dict[str, int] = {}
         with tarfile.open(path, "r:gz") as archive:
             for member in archive.getmembers():
                 name = PurePosixPath(member.name.removeprefix("./")).as_posix()
@@ -119,12 +127,14 @@ class BundleContents:
                 if member.isfile():
                     stream = archive.extractfile(member)
                     payloads[name] = b"" if stream is None else stream.read()
-        return cls(names, payloads)
+                    modes[name] = member.mode & 0o777
+        return cls(names, payloads, modes)
 
     @classmethod
     def of_directory(cls, path: Path) -> "BundleContents":
         names: list[str] = []
         payloads: dict[str, bytes] = {}
+        modes: dict[str, int] = {}
         for item in sorted(path.rglob("*")):
             name = item.relative_to(path).as_posix()
             if item.is_dir():
@@ -132,7 +142,8 @@ class BundleContents:
             else:
                 names.append(name)
                 payloads[name] = item.read_bytes()
-        return cls(names, payloads)
+                modes[name] = item.stat().st_mode & 0o777
+        return cls(names, payloads, modes)
 
 
 def contract_of(run: CollectRun) -> dict[str, object]:
@@ -151,6 +162,10 @@ def contract_of(run: CollectRun) -> dict[str, object]:
         "node_requests": _node_requests(run),
         "ssh_commands": _ssh_commands(run, substitutions),
         "kubectl_commands": _json_ledger(run, "kubectl-argv.jsonl"),
+        "curl_commands": [
+            [_normalize(word, substitutions) for word in argv]
+            for argv in run.curl_commands
+        ],
     }
     source = _bundle_of(run)
     if source is None:
@@ -297,6 +312,10 @@ def _artifact_contract(
         return _catalog_contract(text, substitutions)
     if _is_skip_artifact(name):
         return _classified_lines(text, SKIP_CLASSES, substitutions)
+    # Only the metrics layer carries a query window and sample clocks.
+    metrics_layer = name.startswith(PROMETHEUS_LAYER)
+    if metrics_layer:
+        substitutions = [*substitutions, (EPOCH_SECONDS, "<epoch>")]
     header, body = _split_capture_header(text)
     contract: dict[str, object] = {}
     if header:
@@ -304,7 +323,7 @@ def _artifact_contract(
     if name == "environment.txt":
         contract["fields"] = _environment_fields(body, substitutions)
         return contract
-    body_json = _canonical_json(body)
+    body_json = _canonical_json(body, normalize_epochs=metrics_layer)
     contract["body"] = (
         body_json if body_json is not None else _normalize(body, substitutions)
     )
@@ -336,21 +355,24 @@ def _split_capture_header(text: str) -> tuple[dict[str, str], str]:
     return header, "".join(lines[index:])
 
 
-def _canonical_json(text: str) -> object | None:
+def _canonical_json(text: str, *, normalize_epochs: bool = False) -> object | None:
     stripped = text.strip()
     if not stripped or stripped[0] not in "[{":
         return None
     try:
-        return _without_epochs(json.loads(stripped))
+        parsed = json.loads(stripped)
     except json.JSONDecodeError:
         return None
+    return _without_epochs(parsed) if normalize_epochs else parsed
 
 
 def _without_epochs(value: object) -> object:
-    """Replace sample timestamps inside parsed JSON, wherever they sit.
+    """Replace sample timestamps inside a parsed metrics dump, wherever they sit.
 
     A metrics dump carries its query window as numbers, not text, so the string
-    timestamp rule cannot reach them; the values themselves are still compared.
+    timestamp rule cannot reach them; the sample values themselves are still
+    compared.  Only the metrics layer is passed through here — elsewhere a number
+    in this range is evidence, not a clock.
     """
 
     if isinstance(value, dict):
@@ -376,7 +398,7 @@ def _debug_log_contract(
                 {
                     "command": [
                         _normalize(word, substitutions)
-                        for word in _argv(line.removeprefix("# command: "))
+                        for word in _bounded_argv(line.removeprefix("# command: "))
                     ]
                 }
             )
@@ -489,23 +511,28 @@ def candidate_environment_additions(keys: list[str]) -> list[str]:
     return [key for key in keys if CANDIDATE_ENVIRONMENT_KEYS.fullmatch(key)]
 
 
+def file_modes(run: CollectRun) -> dict[str, int]:
+    """Every bundle file's permission mode.
+
+    Compared one-way rather than for equality: the candidate is allowed to be
+    stricter than the reference, never looser.  See
+    `test_the_candidate_never_widens_a_file_mode`.
+    """
+
+    source = _bundle_of(run)
+    return dict(sorted(source.modes.items())) if source is not None else {}
+
+
 def _classified_lines(
     text: str,
     classes: tuple[tuple[re.Pattern[str], str], ...],
     substitutions: list[tuple[re.Pattern[str], str]],
-    *,
-    drop_unclassified: bool = False,
 ) -> list[str]:
-    classified: list[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        entry = _classify(stripped, classes, substitutions)
-        if drop_unclassified and entry.startswith("literal:"):
-            continue
-        classified.append(entry)
-    return classified
+    return [
+        _classify(stripped, classes, substitutions)
+        for line in text.splitlines()
+        if (stripped := line.strip())
+    ]
 
 
 def _event_classes(
@@ -558,17 +585,26 @@ def _structured_capture_failure(
 
 
 def _argv(command: str) -> list[str]:
-    """Compare commands as argv, not as one implementation's quoting style.
-
-    A leading `timeout <seconds>` is dropped: bounding a command with timeout(1)
-    or with a subprocess deadline is the sanctioned mechanism difference between
-    the two implementations, and the bounded command itself is what this compares.
-    """
+    """Compare commands as argv, not as one implementation's quoting style."""
 
     try:
-        words = shlex.split(command)
+        return shlex.split(command)
     except ValueError:
         return [command]
+
+
+def _bounded_argv(command: str) -> list[str]:
+    """An argv whose bounding wrapper is stripped, keeping the bounded command.
+
+    The reference bounds its verbose SSH probe with `timeout <seconds> …` and
+    records the whole line; the candidate bounds the same probe with a subprocess
+    deadline, which leaves no token to record.  That mechanism difference is the
+    one the rewrite sanctioned (inventory C21), so only the wrapper is dropped
+    here — every remaining word is still compared, and this is used solely for
+    the ssh-debug command line.
+    """
+
+    words = _argv(command)
     if len(words) > 2 and words[0] == "timeout" and words[1].isdecimal():
         return words[2:]
     return words
@@ -621,9 +657,14 @@ def _decompress(name: str, payload: bytes) -> bytes:
         return lzma.decompress(payload)
     if name.endswith(".bz2"):
         return bz2.decompress(payload)
-    return subprocess.run(
-        ["zstd", "-qdc"], input=payload, stdout=subprocess.PIPE, check=True
-    ).stdout
+    try:
+        return subprocess.run(
+            ["zstd", "-qdc"], input=payload, stdout=subprocess.PIPE, check=True
+        ).stdout
+    except FileNotFoundError as error:  # pragma: no cover - host without zstd
+        raise RuntimeError(
+            "comparing zstd evidence needs the zstd command on this host"
+        ) from error
 
 
 def _sha256(payload: bytes) -> str:
@@ -646,8 +687,7 @@ def _substitutions(run: CollectRun) -> list[tuple[re.Pattern[str], str]]:
         (NODE_TEMPORARY, "<node-tmp>"),
         (ARCHIVE_STAMP, "ceph-incident-<timestamp>.tar.gz"),
         (TIMESTAMP, "<timestamp>"),
-        (EPOCH_SECONDS, "<epoch>"),
-        (HEX_IDENTIFIER, "<identifier>"),
+        (QUERY_WINDOW_PARAMETER, r"\1=<epoch>"),
         (REDACTION_SCRATCH, r"/\1"),
     ]
     return rules

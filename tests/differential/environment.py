@@ -16,7 +16,7 @@ import shutil
 import signal
 import subprocess
 import sys
-import time
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,6 +52,9 @@ class CollectRun:
     archive: Path | None
     workdir: Path | None
     ledgers: dict[str, list[str]] = field(default_factory=dict)
+    # HTTP command policy: the lossless NUL-delimited curl argv ledger, so a
+    # request parameter cannot drift behind the human-readable log line.
+    curl_commands: list[list[str]] = field(default_factory=list)
 
 
 def build_world(root: Path, *, inventory_text: str, knobs: dict[str, str]) -> dict[str, str]:
@@ -163,6 +166,7 @@ def run_collect(
         archive=_archive_in(output_root),
         workdir=_workdir_in(output_root),
         ledgers=_read_ledgers(root / "ledgers"),
+        curl_commands=_read_curl_argv(root / "ledgers" / "curl-argv.nul"),
     )
 
 
@@ -189,17 +193,23 @@ def _run_and_interrupt(
     )
     assert process.stderr is not None
     observed: list[str] = []
-    deadline = time.monotonic() + timeout
     signalled = False
-    while time.monotonic() < deadline:
-        line = process.stderr.readline()
-        if not line:
-            break
-        observed.append(line)
-        if pattern.search(line):
-            os.killpg(process.pid, signal.SIGINT)
-            signalled = True
-            break
+    # A run that never reaches the marker must not block the gate: the watchdog
+    # kills it, `readline` then returns empty and the loop reports what it saw.
+    watchdog = threading.Timer(timeout, process.kill)
+    watchdog.start()
+    try:
+        while True:
+            line = process.stderr.readline()
+            if not line:
+                break
+            observed.append(line)
+            if pattern.search(line):
+                os.killpg(process.pid, signal.SIGINT)
+                signalled = True
+                break
+    finally:
+        watchdog.cancel()
     if not signalled:
         process.kill()
         raise AssertionError(
@@ -221,6 +231,25 @@ def _workdir_in(output_root: Path) -> Path | None:
         return None
     workdirs = sorted(item for item in output_root.glob("tmp.*") if item.is_dir())
     return workdirs[0] if workdirs else None
+
+
+def _read_curl_argv(path: Path) -> list[list[str]]:
+    """Read the fake curl's lossless argv ledger.
+
+    Each invocation is written as NUL-terminated words followed by one more NUL,
+    so an argument containing whitespace survives intact.  No Prometheus request
+    argument is ever the empty string, so the double NUL is an unambiguous
+    record separator.
+    """
+
+    if not path.is_file():
+        return []
+    records = path.read_bytes().split(b"\0\0")
+    return [
+        [word.decode("utf-8", "replace") for word in record.split(b"\0") if word]
+        for record in records
+        if record
+    ]
 
 
 def _read_ledgers(directory: Path) -> dict[str, list[str]]:

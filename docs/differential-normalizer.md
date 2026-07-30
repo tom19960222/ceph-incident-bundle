@@ -32,6 +32,11 @@ fake `ssh` 與 fake `kubectl` 都是白名單 adapter：未列入的 remote comm
 
 - `exit_code`、`stdout`（`bundle:` 行）、是否產出 archive、是否保留 workdir。
 - bundle member 集合（檔案與目錄，排序後比較）。
+- 每個檔案 member 的 permission mode，但以**單向**契約比較（
+  `test_the_candidate_never_widens_a_file_mode`）：candidate 不得多出任何權限位；
+  它比 reference 更嚴的檔案集合被釘住（目前是 collector 自己建立的 `manifest.jsonl`、
+  `errors.log`、`redactions.log`：reference 交給 umask 得到 0644，candidate 明確
+  建成 0600），新出現的差異會失敗。
 - 每個 artifact 的內容：capture header（`# host` / `# collector` / `# timeout`）、
   body、JSON 內容、壓縮內容解壓後的 bytes、opaque raw evidence 的 sha256。
 - `manifest.jsonl` 與每個 node 的 manifest：host、collector、bundle-relative
@@ -39,17 +44,20 @@ fake `ssh` 與 fake `kubectl` 都是白名單 adapter：未列入的 remote comm
 - `summary.txt`、`environment.txt`、`CONTENTS.md`、`README-FIRST.txt`。
 - `redactions.log` 的每檔遮蔽結果。
 - `errors.log` 的失敗事件集合。
-- external command policy：ssh 與 kubectl 的完整 argv ledger、node 請求的
+- external command policy：ssh、kubectl 與 curl 的完整 argv ledger（curl 走
+  NUL-delimited 無損 ledger，因此連含空白的單一參數都逐字比較）、node 請求的
   參數（alias、since、timeout、payload cap、skip-logs、keep-original-logs）。
 
 ## 被批准忽略的差異（清單以外都會失敗）
 
 | # | 差異 | 處理方式 | 理由 |
 |---|---|---|---|
-| 1 | timestamps（ISO8601、epoch、`created_utc`、`started`/`ended`、mtimes） | 值換成 `<timestamp>` / `<epoch>` | 兩次 run 不可能同時；ADR 0006 只要求 observable contract 等價 |
-| 2 | random temporary paths（workdir `tmp.*`、node 端 `/tmp/ceph-incident-node.*`、redaction scratch `.<name>.plain.XXXXXX`、invocation id、archive 檔名時間戳） | 換成 `<workdir>` / `<node-tmp>` / 原 artifact 名 / `<identifier>` | 由 mktemp 與 uuid 決定，不是行為 |
+| 1 | timestamps（ISO8601 字串、`created_utc`、`started`/`ended`、mtimes） | 值換成 `<timestamp>` | 兩次 run 不可能同時；ADR 0006 只要求 observable contract 等價 |
+| 1a | epoch seconds，**僅限**兩處：`cluster/prometheus/` 層的內容（dump-info window 起迄、metric sample 時間戳，含 JSON 數值），以及任何被記錄的請求裡 `start=`／`end=`／`time=` 這三個具名參數的值 | 值換成 `<epoch>` | 那是查詢時鐘；其他數字（byte 總量、object 數）即使落在同一範圍也是證據，一律逐字比較 |
+| 2 | random temporary paths（workdir `tmp.*`、node 端 `/tmp/ceph-incident-node.*`、redaction scratch `.<name>.plain.XXXXXX`、archive 檔名時間戳） | 換成 `<workdir>` / `<node-tmp>` / 原 artifact 名 | 由 mktemp 決定，不是行為 |
 | 3 | JSON formatting 與 key order | 解析後比較資料結構 | ADR 0006 明文不要求 serialization byte-identical |
 | 4 | shell quoting 風格（`printf %q` 對 `shlex.join`） | manifest / CONTENTS.md / ssh-debug 的 command 一律 `shlex.split` 成 argv 後比較 | 同一條 argv 的兩種書寫；argv 本身仍逐字比較 |
+| 4a | ssh-debug `# command:` 行開頭的 `timeout <秒數>` wrapper | 只在該行去掉 wrapper，其餘每個 word 仍逐字比較 | 兩邊都有界：reference 用 `timeout(1)` 包住 verbose probe，candidate 用 subprocess deadline（`write_ssh_debug_log` 的 `timeout=connection_timeout`），只有 reference 會把界限寫進那行紀錄。這正是 inventory C21 允許的機制差異 |
 | 5 | tar member order | member 集合排序後比較 | AC 明列 |
 | 6 | gzip metadata 與壓縮率 | 比較解壓後內容；`PAYLOAD-BYTES.txt` 只在該 node 的 payload 內含壓縮成員時換成 `<compressor-dependent-bytes>`（其餘情況逐字比較 byte 數） | 重壓縮大小由 compressor 決定；payload 內容仍逐一比較 |
 | 7 | 檔案系統走訪順序（`redactions.log`） | 以「檔案 → 遮蔽結果」mapping 比較 | 每一筆與其結果都仍被比較，只有行序被忽略 |

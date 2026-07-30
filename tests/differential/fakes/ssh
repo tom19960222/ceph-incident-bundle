@@ -14,6 +14,13 @@ anything else exits 99 — so a collector that grows a new command surface, a
 `cephadm shell` fallback or a `kubectl exec` fails the gate immediately instead
 of quietly diverging.  Every invocation is appended to the ledgers so the tests
 can compare the two command policies directly.
+
+This deliberately overlaps `tests/fixtures/python-ceph/bin/ssh` rather than
+sharing code with it.  That fixture serves one implementation and pins the node
+bootstrap by digest; this one has to answer both implementations' node
+invocations, and the streamed source is asserted by the differential test
+instead.  Merging them would force one adapter to be lenient about the other's
+shape, which is exactly the leniency the gate is supposed to remove.
 """
 
 from __future__ import annotations

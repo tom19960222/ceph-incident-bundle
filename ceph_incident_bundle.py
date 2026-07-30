@@ -159,7 +159,9 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
     values: dict[str, object] = {
         "out": Path(__file__).resolve().parent / "results",
         "timeout": 20,
-        "node_timeout": 300,
+        # Same defaults as the shell reference: a per-command bound of 20s and a
+        # generous whole-node bound, so a large node is not killed mid-collection.
+        "node_timeout": 600,
         "trust_ssh_host_key": True,
         "redact": True,
         "skip_logs": False,

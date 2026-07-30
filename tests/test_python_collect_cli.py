@@ -17,6 +17,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from ceph_incident_bundle import _parse_collect_arguments  # noqa: E402
+
 ENTRYPOINT = ROOT / "ceph_incident_bundle.py"
 
 # Every option the shell reference documents in its usage text, minus the two
@@ -130,6 +135,21 @@ class CollectCliContractTests(unittest.TestCase):
             self.assertEqual(result.stdout, "")
             self.assertIn("missing ssh key", result.stderr)
             self.assertFalse((root / "results").exists())
+
+    def test_timeout_defaults_match_the_shell_reference(self) -> None:
+        """Defaults are part of the CLI contract, not an implementation choice."""
+
+        defaults = _parse_collect_arguments(
+            ("--inventory", "i", "--ssh-key", "k")
+        )
+        self.assertEqual(defaults["timeout"], 20)
+        self.assertEqual(defaults["node_timeout"], 600)
+        self.assertEqual(defaults["since"], "24h")
+        self.assertEqual(defaults["var_log_max_bytes"], 10 * 1024**3)
+        self.assertEqual(defaults["mode"], "auto")
+        self.assertEqual(defaults["kube_mode"], "remote")
+        self.assertIs(defaults["redact"], True)
+        self.assertIs(defaults["trust_ssh_host_key"], True)
 
     def test_an_empty_host_list_is_a_fatal_usage_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

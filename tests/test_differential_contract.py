@@ -21,6 +21,7 @@ from tests.differential.normalize import (
     contract_of,
     describe_differences,
     environment_keys,
+    file_modes,
 )
 from tests.differential.scenarios import SCENARIOS, Scenario
 
@@ -75,13 +76,12 @@ class DifferentialContractTests(unittest.TestCase):
             for implementation, run in runs.items()
         )
 
-        if scenario.expected_exit is not None:
-            for implementation, run in runs.items():
-                self.assertEqual(
-                    run.exit_code,
-                    scenario.expected_exit,
-                    f"{implementation}: unexpected exit code\n{diagnostics}",
-                )
+        for implementation, run in runs.items():
+            self.assertEqual(
+                run.exit_code,
+                scenario.expected_exit,
+                f"{implementation}: unexpected exit code\n{diagnostics}",
+            )
         for implementation, run in runs.items():
             self.assertEqual(
                 run.archive is not None,
@@ -150,6 +150,39 @@ class DifferentialContractTests(unittest.TestCase):
             set(),
             "the candidate recorded an undocumented environment field",
         )
+
+    def test_the_candidate_never_widens_a_file_mode(self) -> None:
+        """Permission modes are a one-way contract: tighter is fine, looser is not.
+
+        The candidate creates its collector-owned bundle metadata 0600 where the
+        reference leaves it umask-derived, so equality would be the wrong test.
+        This asserts the candidate adds no permission bit anywhere, and pins the
+        set of files where it is deliberately stricter — a new divergence fails.
+        """
+
+        expected_tighter = {"manifest.jsonl", "errors.log", "redactions.log"}
+        for scenario in SCENARIOS:
+            modes = {
+                implementation: file_modes(run_of(scenario, implementation))
+                for implementation in IMPLEMENTATIONS
+            }
+            shared = set(modes["shell"]) & set(modes["python"])
+            if not modes["shell"] and not modes["python"]:
+                continue  # an interrupted run leaves neither bundle nor workdir
+            with self.subTest(scenario=scenario.name):
+                self.assertTrue(shared, "no comparable bundle files")
+                widened = {
+                    name
+                    for name in shared
+                    if modes["python"][name] & ~modes["shell"][name]
+                }
+                self.assertEqual(widened, set(), "the candidate widened a file mode")
+                tighter = {
+                    name
+                    for name in shared
+                    if modes["python"][name] != modes["shell"][name]
+                }
+                self.assertEqual(tighter, expected_tighter & shared)
 
     def test_no_scenario_reaches_a_default_off_command(self) -> None:
         """`cephadm shell` and `kubectl exec` stay unreachable in both runs."""
