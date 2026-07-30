@@ -75,5 +75,8 @@ payload cap 判定、redaction 決策。第 9 項的 fallback 是設計核心：
 
 fake `ssh` 站在 SSH 邊界上，因此 differential run 比較的是**工作機端**的完整
 契約；node collector 自己的 evidence surface 不在其中（兩邊的 node payload 由
-定義就不同）。node 端的等價性由 `docs/test-scenario-ledger.md` 的 N 系列情境
-負責，目前仍有未移植項目，見該文件的 blocked 清單。
+定義就不同，共用同一份 canned archive）。node 端的等價性由
+`docs/test-scenario-ledger.md` 的 N 系列情境負責——它們是離線 fake-command
+黑箱測試（`tests/test_python_collect_node.py`），不是 differential run。這條界線
+不會因為 N 系列全部 ported 而改變：node manifest 的 command policy、SKIPPED
+語意與複製類 evidence 都只在那組測試裡被比對。

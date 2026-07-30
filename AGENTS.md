@@ -40,4 +40,4 @@ The non-negotiable rules are:
 - `docs/differential-normalizer.md` — the only list of differences the gate may ignore. Widening it needs the same review as changing behaviour.
 - `docs/test-scenario-ledger.md` — which shell scenario each Python test covers, and which are still blocked.
 
-The gate compares the workstation side. The node collector's own evidence surface is only partly ported (#36), so do not claim the candidate is observable-equivalent, feature-complete or qualification-ready.
+The differential gate compares the workstation side: both implementations receive the same canned Node Evidence Archive, so it says nothing about the node collector's own evidence surface. That surface is fully ported (#36) and its equivalence rests on the ledger's N-series black-box tests (`tests/test_python_collect_node.py`) instead. Real-lab qualification (#20) has not run, so do not claim the candidate is qualification-ready.

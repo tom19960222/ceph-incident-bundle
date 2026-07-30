@@ -33,6 +33,80 @@ NODE_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("systemctl", "--failed", "--no-pager", "--plain"),
     ),
 )
+# Optional tools: collected when installed, skipped with a marker when not, and
+# never able to turn the node partial (shell `node_run_optional`).  The two
+# groups are named for where they sit in the shell reference's collection order:
+# the timesyncd journal and its config files land between them.
+OPTIONAL_COMMANDS_BEFORE_TIMESYNCD_CONFIG: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("resources/iostat.txt", ("iostat", "-xz", "1", "3")),
+    ("time/chronyc-tracking.txt", ("chronyc", "tracking")),
+    ("time/chronyc-sources.txt", ("chronyc", "sources", "-v")),
+    ("time/ntpq-peers.txt", ("ntpq", "-pn")),
+    ("time/timedatectl-status.txt", ("timedatectl", "status")),
+    (
+        "time/timedatectl-show-timesync.txt",
+        ("timedatectl", "show-timesync", "--all"),
+    ),
+    ("time/timedatectl-timesync-status.txt", ("timedatectl", "timesync-status")),
+    (
+        "time/systemd-timesyncd-status.txt",
+        ("systemctl", "status", "systemd-timesyncd", "--no-pager", "--plain"),
+    ),
+)
+OPTIONAL_COMMANDS_AFTER_TIMESYNCD_CONFIG: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("storage/pvs.txt", ("pvs", "--noheadings", "--separator", " ")),
+    ("storage/vgs.txt", ("vgs", "--noheadings", "--separator", " ")),
+    ("storage/lvs.txt", ("lvs", "--noheadings", "--separator", " ")),
+    ("containers/podman-ps.txt", ("podman", "ps", "-a")),
+    ("containers/docker-ps.txt", ("docker", "ps", "-a")),
+)
+LSBLK_COMMAND = (
+    "lsblk",
+    "-a",
+    "-o",
+    "NAME,MAJ:MIN,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,SERIAL",
+)
+CEPHADM_LS_COMMAND = ("cephadm", "ls", "--format", "json-pretty")
+ETC_EVIDENCE_FILES = ("os-release", "hosts", "resolv.conf")
+# Credential material is pruned before `find` descends into it, so a keyring
+# never reaches the listing, let alone the copy loop.
+CREDENTIAL_PRUNE: tuple[str, ...] = (
+    "(",
+    "-iname",
+    "*keyring*",
+    "-o",
+    "-iname",
+    "*private_key*",
+    "-o",
+    "-path",
+    "*/.ssh/*",
+    ")",
+    "-prune",
+)
+VAR_LIB_CEPH_CONFIG_NAMES: tuple[str, ...] = (
+    "(",
+    "-name",
+    "ceph.conf",
+    "-o",
+    "-name",
+    "*.conf",
+    "-o",
+    "-name",
+    "config",
+    "-o",
+    "-name",
+    "*.config",
+    ")",
+)
+VAR_LIB_CEPH_LISTING_SCRIPT = (
+    'for path do\n'
+    '  if [ -d "$path" ]; then type=d\n'
+    '  elif [ -f "$path" ]; then type=f\n'
+    '  else type=o\n'
+    '  fi\n'
+    '  printf "%s %s\\n" "$type" "$path"\n'
+    'done\n'
+)
 SAFE_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 SAFE_INVOCATION_ID = re.compile(r"[a-f0-9]{32}\Z")
 DEFAULT_VAR_LOG_MAX_BYTES = 10 * 1024**3
@@ -51,6 +125,8 @@ CODEC_COMMANDS: dict[str, tuple[str, ...]] = {
 # the /var/log tree have no command exit status of their own, so an incomplete
 # one records this instead.
 INCOMPLETE_ARTIFACT_EXIT_CODE = 2
+# A command that was never reachable, recorded the same way a failed exec is.
+MISSING_COMMAND_EXIT_CODE = 127
 # Markers that stand in for evidence that was never collected or was discarded:
 # the marker file is written in full, but the evidence it accounts for is not.
 INCOMPLETE_EVIDENCE_MARKERS = frozenset(
@@ -231,7 +307,16 @@ def _write_artifact(
     timeout: int,
     relative_artifact: str,
     command: Sequence[str],
+    command_text: str | None = None,
 ) -> bool:
+    """Capture one command into an artifact and index it in the manifest.
+
+    `command_text` overrides what the manifest records.  Only the collector's own
+    stable verbs use it (ADR 0010): an expression that names credential patterns
+    would be redacted out of the manifest by the content-safety layer, which
+    would leave the artifact with no index entry at all.
+    """
+
     artifact = output / relative_artifact
     artifact.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     started = _utc_now()
@@ -268,11 +353,12 @@ def _write_artifact(
             f"# TRUNCATED: command timed out after {timeout}s (exit {exit_code})\n"
         ).encode()
     artifact.write_bytes(header + stdout + stderr + timeout_marker)
+    recorded_command = shlex.join(command) if command_text is None else command_text
     _append_manifest_entry(
         manifest,
         host_alias,
         artifact,
-        shlex.join(command),
+        recorded_command,
         exit_code,
         started,
         ended,
@@ -282,9 +368,473 @@ def _write_artifact(
             errors.write(
                 f"{ended} host={host_alias} collector=collect-node "
                 f"artifact={artifact} exit={exit_code} "
-                f"command={shlex.join(command)}\n"
+                f"command={recorded_command}\n"
             )
     return exit_code == 0
+
+
+def _sudo_path() -> str | None:
+    """Where `sudo` is, honouring the offline knob that takes it away."""
+
+    if os.environ.get("CEPH_INCIDENT_TEST_FORCE_NO_SUDO") == "1":
+        return None
+    return shutil.which("sudo")
+
+
+def _privileged_argv(command: Sequence[str]) -> tuple[str, ...] | None:
+    """Shell `node_run_privileged`: root reads directly, everyone else via sudo.
+
+    Returns None when the read needs sudo and sudo is not installed.  The caller
+    records a skip marker rather than retrying the read unprivileged, so a
+    partial read can never masquerade as complete evidence.
+    """
+
+    if os.geteuid() == 0:
+        return tuple(command)
+    if _sudo_path() is None:
+        return None
+    return ("sudo", "-n", *command)
+
+
+def _find_argv(arguments: Sequence[str]) -> tuple[str, ...]:
+    """Shell `node_find0`: privileged scan where possible, plain scan otherwise.
+
+    Unlike a privileged capture, a scan that cannot use sudo still runs: it just
+    sees less, and the caller reports only the files it actually copied.
+    """
+
+    command: tuple[str, ...] = ("find", *arguments)
+    if os.geteuid() == 0 or _sudo_path() is None:
+        return command
+    return ("sudo", "-n", *command)
+
+
+def _node_path(variable: str, default: str) -> Path:
+    """A node path an offline test may relocate, gated on the same read knob.
+
+    Production always reads the real path: the override only exists so the fake
+    world can own `/etc`, `/var/lib/ceph` and the timesyncd config.
+    """
+
+    if os.environ.get("CEPH_INCIDENT_TEST_ALLOW_ATIME_READ") == "1":
+        return Path(os.environ.get(variable, default))
+    return Path(default)
+
+
+def _write_skipped_evidence(
+    artifact: Path,
+    manifest: Path,
+    host_alias: str,
+    reason: str,
+    command: Sequence[str] | str,
+    exit_code: int,
+) -> None:
+    """Record evidence that was never collected, and index it in the manifest.
+
+    The shell reference writes the marker file and nothing else.  ADR 0010 makes
+    the manifest the index of everything inside the archive, so the marker needs
+    an entry too — naming the command that would have produced the evidence and
+    a non-zero `exit_code`, because the artifact is not complete evidence.
+    """
+
+    started = _utc_now()
+    artifact.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    artifact.write_text(f"SKIPPED: {reason}\n", encoding="utf-8")
+    _append_manifest_entry(
+        manifest,
+        host_alias,
+        artifact,
+        command if isinstance(command, str) else shlex.join(command),
+        exit_code,
+        started,
+        _utc_now(),
+    )
+
+
+def _run_optional(
+    output: Path,
+    manifest: Path,
+    config: NodeConfig,
+    timeout: int,
+    relative_artifact: str,
+    command: Sequence[str],
+) -> None:
+    """Shell `node_run_optional`: an absent tool is a skip, a failure is evidence.
+
+    Neither outcome makes the node partial — an incident node is not required to
+    run LVM, containers or any particular time daemon.
+    """
+
+    if shutil.which(command[0]) is None:
+        _write_skipped_evidence(
+            output / relative_artifact,
+            manifest,
+            config.host_alias,
+            f"command not found: {command[0]}",
+            command,
+            MISSING_COMMAND_EXIT_CODE,
+        )
+        return
+    _write_artifact(
+        output, manifest, config.host_alias, timeout, relative_artifact, command
+    )
+
+
+def _run_privileged(
+    output: Path,
+    manifest: Path,
+    config: NodeConfig,
+    timeout: int,
+    relative_artifact: str,
+    command: Sequence[str],
+    command_text: str | None = None,
+) -> bool:
+    """Capture a privileged read, or record why it could not be attempted."""
+
+    argv = _privileged_argv(command)
+    if argv is None:
+        _write_skipped_evidence(
+            output / relative_artifact,
+            manifest,
+            config.host_alias,
+            f"sudo command not found for privileged read: {command[0]}",
+            command if command_text is None else command_text,
+            MISSING_COMMAND_EXIT_CODE,
+        )
+        # A node that never granted the collector sudo is not a failed
+        # collection, exactly as in the shell reference.
+        return True
+    return _write_artifact(
+        output,
+        manifest,
+        config.host_alias,
+        timeout,
+        relative_artifact,
+        argv,
+        command_text,
+    )
+
+
+def _copy_evidence(
+    source: Path, destination: Path, manifest: Path, host_alias: str
+) -> bool:
+    """Copy one node file into the archive and index the copy (ADR 0010).
+
+    `command` records the absolute source path rather than the read itself: the
+    safe read has three shapes depending on EUID and sudo, so it is not a stable
+    contract, while the source path always lets an operator trace the evidence.
+    """
+
+    started = _utc_now()
+    command = f"collect-node copy {source}"
+    read_source = source
+    if source.is_symlink():
+        # `/etc/resolv.conf` is a symlink on most systemd hosts and the shell
+        # reference follows it.  Resolving first keeps the read itself
+        # no-follow, so only this deliberate indirection is honoured.  The
+        # source path an operator asked for is still what gets reported.
+        read_source = source.resolve()
+    status, _ = _decode_to_file(read_source, "plain", destination, None)
+    if status != "ok":
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        destination.write_text(
+            f"SKIPPED: copy failed: {source}\n", encoding="utf-8"
+        )
+        _append_manifest_entry(
+            manifest,
+            host_alias,
+            destination,
+            command,
+            INCOMPLETE_ARTIFACT_EXIT_CODE,
+            started,
+            _utc_now(),
+        )
+        return False
+    _append_manifest_entry(
+        manifest, host_alias, destination, command, 0, started, _utc_now()
+    )
+    return True
+
+
+def _find_files(root: Path, expression: Sequence[str], timeout: int) -> list[Path]:
+    """Enumerate files under `root` with `find -print0`.
+
+    `timeout` is the heavy bound, not the per-command one: the shell reference
+    leaves these scans unbounded, so a busy `/var/lib/ceph` must not be cut
+    short at the 20s a single capture gets.  A scan that fails or times out
+    yields nothing rather than raising — the shell reference also lets its
+    `find` pipeline fail open and reports only what it managed to copy.
+    """
+
+    command = _find_argv((str(root), *expression, "-print0"))
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    paths: list[Path] = []
+    for encoded_path in result.stdout.split(b"\0"):
+        if not encoded_path:
+            continue
+        path = Path(os.fsdecode(encoded_path))
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        # `relative_to` is lexical, so a `..` inside the scan root would still
+        # look contained while the copy destination escaped the archive.
+        if ".." in relative.parts:
+            continue
+        paths.append(path)
+    return sorted(paths)
+
+
+def _collect_timesyncd_config(
+    output: Path, manifest: Path, config: NodeConfig, scan_timeout: int
+) -> bool:
+    """Copy the timesyncd config and every `conf.d` drop-in, file by file."""
+
+    conf = _node_path(
+        "CEPH_INCIDENT_TIMESYNCD_CONF", "/etc/systemd/timesyncd.conf"
+    )
+    conf_directory = _node_path(
+        "CEPH_INCIDENT_TIMESYNCD_CONF_D_DIR", "/etc/systemd/timesyncd.conf.d"
+    )
+    destination = output / "time" / "systemd-timesyncd-config"
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    copied = False
+    complete = True
+    if conf.is_file():
+        if _copy_evidence(
+            conf, destination / "timesyncd.conf", manifest, config.host_alias
+        ):
+            copied = True
+        else:
+            complete = False
+    if conf_directory.is_dir():
+        for source in _find_files(
+            conf_directory,
+            ("-maxdepth", "1", "-type", "f", "-name", "*.conf"),
+            scan_timeout,
+        ):
+            relative = source.relative_to(conf_directory)
+            if _copy_evidence(
+                source,
+                destination / "timesyncd.conf.d" / relative,
+                manifest,
+                config.host_alias,
+            ):
+                copied = True
+            else:
+                complete = False
+    if not copied:
+        _write_skipped_evidence(
+            destination / "SKIPPED.txt",
+            manifest,
+            config.host_alias,
+            f"systemd-timesyncd config not found at {conf} or {conf_directory}",
+            f"collect-node copy {conf} {conf_directory}",
+            INCOMPLETE_ARTIFACT_EXIT_CODE,
+        )
+    return complete
+
+
+def _copy_etc_evidence(output: Path, manifest: Path, config: NodeConfig) -> bool:
+    """Copy the readable `/etc` identity files the shell reference collects."""
+
+    etc = _node_path("CEPH_INCIDENT_ETC_DIR", "/etc")
+    complete = True
+    for name in ETC_EVIDENCE_FILES:
+        source = etc / name
+        if not os.access(source, os.R_OK):
+            continue
+        if not _copy_evidence(
+            source, output / "system" / name, manifest, config.host_alias
+        ):
+            complete = False
+    return complete
+
+
+def _collect_var_lib_ceph(
+    output: Path,
+    manifest: Path,
+    config: NodeConfig,
+    timeout: int,
+    scan_timeout: int,
+) -> bool:
+    """List `/var/lib/ceph` and copy its configs, never its credentials."""
+
+    ceph_directory = _node_path("CEPH_INCIDENT_VAR_LIB_CEPH_DIR", "/var/lib/ceph")
+    listing_artifact = "cephadm/var-lib-ceph-listing.txt"
+    listing_command = (
+        "find",
+        str(ceph_directory),
+        "-maxdepth",
+        "3",
+        *CREDENTIAL_PRUNE,
+        "-o",
+        "-exec",
+        "sh",
+        "-c",
+        VAR_LIB_CEPH_LISTING_SCRIPT,
+        "sh",
+        "{}",
+        "+",
+    )
+    # The find expression names the credential patterns it prunes, so recording
+    # it verbatim would make the content-safety layer redact this manifest line
+    # away and leave the listing unindexed.  A stable collector verb keeps the
+    # manifest an index, exactly as ADR 0010 does for copied evidence.
+    listing_command_text = f"collect-node list {ceph_directory}"
+    if not ceph_directory.is_dir():
+        _write_skipped_evidence(
+            output / listing_artifact,
+            manifest,
+            config.host_alias,
+            f"{ceph_directory} is not a readable directory on this node",
+            listing_command_text,
+            INCOMPLETE_ARTIFACT_EXIT_CODE,
+        )
+        return True
+    if not _run_privileged(
+        output,
+        manifest,
+        config,
+        timeout,
+        listing_artifact,
+        listing_command,
+        listing_command_text,
+    ):
+        # A listing the collector could not produce leaves no way to tell which
+        # configs were missed, so the copy loop is not started either.  A
+        # listing skipped for want of sudo is a different case: it reports
+        # success, and the copy loop still gathers what it can read.
+        return False
+    destination = output / "cephadm" / "var-lib-ceph-configs"
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    complete = True
+    for source in _find_files(
+        ceph_directory,
+        (
+            "-maxdepth",
+            "4",
+            *CREDENTIAL_PRUNE,
+            "-o",
+            "-type",
+            "f",
+            *VAR_LIB_CEPH_CONFIG_NAMES,
+        ),
+        scan_timeout,
+    ):
+        relative = source.relative_to(ceph_directory)
+        if not _copy_evidence(
+            source, destination / relative, manifest, config.host_alias
+        ):
+            complete = False
+    return complete
+
+
+def _collect_node_evidence(
+    output: Path, manifest: Path, config: NodeConfig
+) -> bool:
+    """Collect the node evidence surface, in the shell reference's order.
+
+    Returns False when a required capture or copy did not land.  Optional tools
+    and best-effort privileged reads never make the node partial: a node without
+    LVM, containers, cephadm or a time daemon is a normal node, not a failure.
+    """
+
+    timeout = config.command_timeout
+    # dmesg and the ceph journal can be large under load, so the shell reference
+    # gives them a heavier bound than the per-command timeout.
+    heavy_timeout = max(timeout, 120)
+    since = _journal_since(config.since)
+    complete = True
+
+    if not _run_privileged(
+        output, manifest, config, timeout, "storage/lsblk.txt", LSBLK_COMMAND
+    ):
+        complete = False
+    if not _run_privileged(
+        output, manifest, config, heavy_timeout, "kernel/dmesg.txt", ("dmesg", "-T")
+    ):
+        complete = False
+
+    # The ceph journal is optional on sudo itself: the shell reference always
+    # asks for it through `sudo -n`, and simply skips when sudo is absent.
+    ceph_journal = (
+        "sudo",
+        "-n",
+        "journalctl",
+        "--since",
+        since,
+        "-u",
+        "ceph*",
+        "--no-pager",
+    )
+    if _sudo_path() is None:
+        _write_skipped_evidence(
+            output / "systemd" / "journal-ceph.txt",
+            manifest,
+            config.host_alias,
+            "command not found: sudo",
+            ceph_journal,
+            MISSING_COMMAND_EXIT_CODE,
+        )
+    else:
+        _write_artifact(
+            output,
+            manifest,
+            config.host_alias,
+            heavy_timeout,
+            "systemd/journal-ceph.txt",
+            ceph_journal,
+        )
+
+    for relative_artifact, command in OPTIONAL_COMMANDS_BEFORE_TIMESYNCD_CONFIG:
+        _run_optional(output, manifest, config, timeout, relative_artifact, command)
+    _run_privileged(
+        output,
+        manifest,
+        config,
+        timeout,
+        "time/systemd-timesyncd-journal.txt",
+        ("journalctl", "--since", since, "-u", "systemd-timesyncd", "--no-pager"),
+    )
+    if not _collect_timesyncd_config(output, manifest, config, heavy_timeout):
+        complete = False
+    for relative_artifact, command in OPTIONAL_COMMANDS_AFTER_TIMESYNCD_CONFIG:
+        _run_optional(output, manifest, config, timeout, relative_artifact, command)
+
+    if shutil.which(CEPHADM_LS_COMMAND[0]) is None:
+        _write_skipped_evidence(
+            output / "cephadm" / "cephadm-ls.json",
+            manifest,
+            config.host_alias,
+            f"command not found: {CEPHADM_LS_COMMAND[0]}",
+            CEPHADM_LS_COMMAND,
+            MISSING_COMMAND_EXIT_CODE,
+        )
+    else:
+        _run_privileged(
+            output,
+            manifest,
+            config,
+            timeout,
+            "cephadm/cephadm-ls.json",
+            CEPHADM_LS_COMMAND,
+        )
+
+    if not _copy_etc_evidence(output, manifest, config):
+        complete = False
+    if not _collect_var_lib_ceph(output, manifest, config, timeout, heavy_timeout):
+        complete = False
+    return complete
 
 
 def _codec_for(path: str) -> str:
@@ -363,7 +913,7 @@ def _safe_read_command(source: Path) -> tuple[str, ...] | None:
         return ("sudo", "-n", *command)
     if os.geteuid() == 0 or source_stat.st_uid == os.geteuid():
         return command
-    if shutil.which("sudo") is None:
+    if _sudo_path() is None:
         return None
     return ("sudo", "-n", *command)
 
@@ -452,7 +1002,7 @@ def _discover_log_files(
     elif (
         os.environ.get("CEPH_INCIDENT_TEST_ALLOW_ATIME_READ") != "1"
         and os.geteuid() != 0
-        and shutil.which("sudo") is not None
+        and _sudo_path() is not None
     ):
         command = ("sudo", "-n", *command)
     errors_file = tempfile.TemporaryFile(dir=scratch)
@@ -1016,7 +1566,7 @@ def _journal_command() -> tuple[str, ...] | None:
         return command
     if os.geteuid() == 0:
         return command
-    if shutil.which("sudo") is None:
+    if _sudo_path() is None:
         return None
     return ("sudo", "-n", *command)
 
@@ -1324,6 +1874,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 command,
             ):
                 failed = True
+        if not _collect_node_evidence(output, manifest, config):
+            failed = True
         log_output = output / "logs" / "var-log"
         if config.skip_logs:
             log_output.mkdir(mode=0o700, parents=True)
@@ -1343,9 +1895,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 _utc_now(),
             )
         else:
-            root = Path("/var/log")
-            if os.environ.get("CEPH_INCIDENT_TEST_ALLOW_ATIME_READ") == "1":
-                root = Path(os.environ.get("CEPH_INCIDENT_VAR_LOG_DIR", "/var/log"))
+            root = _node_path("CEPH_INCIDENT_VAR_LOG_DIR", "/var/log")
             log_started = _utc_now()
             log_result = _collect_var_logs(root, log_output, config)
             journal_result = _collect_journal(log_output, config)
