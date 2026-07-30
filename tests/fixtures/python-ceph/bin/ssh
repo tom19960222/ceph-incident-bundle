@@ -17,6 +17,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import gzip
+import bz2
+import lzma
+import subprocess
 import io
 import json
 import os
@@ -179,28 +183,6 @@ def node_archive(alias: str, *, skip_logs: bool) -> bytes:
     log_artifact = (
         "logs/var-log/SKIPPED.txt" if skip_logs else "logs/var-log/INDEX.tsv"
     )
-    entries = [
-        {
-            "host": alias,
-            "collector": "collect-node",
-            "artifact": "/tmp/ceph-incident-node.fixture/out/system/hostname.txt",
-            "command": "hostname",
-            "exit_code": 0,
-            "started": "2026-07-29T00:00:00Z",
-            "ended": "2026-07-29T00:00:01Z",
-        },
-        {
-            "host": alias,
-            "collector": "collect-node",
-            "artifact": f"/tmp/ceph-incident-node.fixture/out/{log_artifact}",
-            "command": (
-                "skip var-log fixture" if skip_logs else "safe var-log fixture"
-            ),
-            "exit_code": 0,
-            "started": "2026-07-29T00:00:00Z",
-            "ended": "2026-07-29T00:00:01Z",
-        },
-    ]
     files = {
         "system/hostname.txt": f"{alias}\n".encode(),
         log_artifact: (
@@ -208,10 +190,71 @@ def node_archive(alias: str, *, skip_logs: bool) -> bytes:
             if skip_logs
             else b"path\tdisposition\tdetail\n"
         ),
-        "manifest.jsonl": (
-            "".join(json.dumps(entry) + "\n" for entry in entries)
-        ).encode(),
     }
+    if os.environ.get("FAKE_NODE_COMPRESSED_SECRET"):
+        files["logs/var-log/merged/tree/files/ceph.log.gz"] = gzip.compress(
+            b"safe evidence\nsecret = must-not-leak\n", mtime=0
+        )
+        files["logs/var-log/raw/opaque.tar.gz"] = gzip.compress(
+            b"secret = intentionally opaque\n", mtime=0
+        )
+    if os.environ.get("FAKE_NODE_COMPRESSED_BOMB"):
+        files["logs/var-log/merged/tree/files/bomb.log.gz"] = gzip.compress(
+            b"safe evidence\n" + b"x" * (64 * 1024) + b"\nsecret = must-not-leak\n",
+            mtime=0,
+        )
+    if os.environ.get("FAKE_NODE_ALL_CODECS_SECRET"):
+        codec_payload = b"safe evidence\nsecret = must-not-leak\n"
+        files["logs/var-log/merged/tree/files/ceph.log.gz"] = gzip.compress(
+            codec_payload, mtime=0
+        )
+        files["logs/var-log/merged/tree/files/ceph.log.xz"] = lzma.compress(
+            codec_payload
+        )
+        files["logs/var-log/merged/tree/files/ceph.log.bz2"] = bz2.compress(
+            codec_payload
+        )
+        encoded_zstd = subprocess.run(
+            ["zstd", "-q", "-c"],
+            input=codec_payload,
+            stdout=subprocess.PIPE,
+            check=True,
+        )
+        files["logs/var-log/merged/tree/files/ceph.log.zst"] = encoded_zstd.stdout
+    if os.environ.get("FAKE_NODE_POST_REDACTION_CAP"):
+        files["logs/var-log/merged/tree/files/ceph.merged"] = b"key=x\n"
+        files["logs/var-log/PAYLOAD-BYTES.txt"] = b"6\n"
+    if os.environ.get("FAKE_NODE_PAYLOAD_ROOT_FILE"):
+        files["logs/var-log/merged"] = b"123456789\n"
+        files["logs/var-log/PAYLOAD-BYTES.txt"] = b"0\n"
+    if os.environ.get("FAKE_NODE_CORRUPT_GZIP"):
+        files["logs/var-log/merged/tree/files/corrupt.log.gz"] = (
+            b"not a gzip stream\n"
+        )
+    if os.environ.get("FAKE_NODE_PROMETHEUS_LOOKALIKE"):
+        files[
+            "cluster/prometheus/fake-job/lookalike.json.gz"
+        ] = gzip.compress(b"secret = must-redact-lookalike\n", mtime=0)
+    entries = []
+    for name in files:
+        entries.append(
+            {
+                "host": alias,
+                "collector": "collect-node",
+                "artifact": f"/tmp/ceph-incident-node.fixture/out/{name}",
+                "command": (
+                    "hostname"
+                    if name == "system/hostname.txt"
+                    else "safe var-log fixture"
+                ),
+                "exit_code": 0,
+                "started": "2026-07-29T00:00:00Z",
+                "ended": "2026-07-29T00:00:01Z",
+            }
+        )
+    files["manifest.jsonl"] = (
+        "".join(json.dumps(entry) + "\n" for entry in entries)
+    ).encode()
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
         for name, payload in files.items():
@@ -304,6 +347,22 @@ def serve_ceph(words: list[str]) -> None:
         sys.stderr.write(f"simulated failure for {fail_on}\n")
         raise SystemExit(17)
 
+    if remote == "config dump --format json-pretty" and os.environ.get(
+        "FAKE_CEPH_SECRET_CONFIG"
+    ):
+        emit('[{"who":"mon.a","secret":"must-not-leak"}]')
+    if remote == "config dump --format json-pretty" and os.environ.get(
+        "FAKE_CEPH_PRIVATE_KEY_CONFIG"
+    ):
+        emit("-----BEGIN OPENSSH PRIVATE KEY-----\nkey material")
+    if remote == "config dump --format json-pretty" and os.environ.get(
+        "FAKE_CEPH_WHITESPACE_SECRET"
+    ):
+        emit("private\vkey: whitespace-must-redact")
+    if remote == "config dump --format json-pretty" and os.environ.get(
+        "FAKE_CEPH_LONG_GAP_SECRET"
+    ):
+        emit("private" + " " * (128 * 1024) + "key: long-gap-must-redact")
     if remote in CEPH_RESPONSES:
         emit(CEPH_RESPONSES[remote])
 

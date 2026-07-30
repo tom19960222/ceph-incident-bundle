@@ -137,8 +137,12 @@ case "$url" in
       fi
     done
     start="$(param_for start)"
-    printf '{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"__name__":"%s"},"values":[[%s,"1"]]}]}}' \
-      "$metric" "${start:-0}" >"$out"
+    if [[ "${FAKE_CURL_SECRET_METRIC:-}" == "1" ]]; then
+      printf '{"status":"success","secret":"metric-must-stay","data":{"resultType":"matrix","result":[]}}' >"$out"
+    else
+      printf '{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"__name__":"%s"},"values":[[%s,"1"]]}]}}' \
+        "$metric" "${start:-0}" >"$out"
+    fi
     ;;
   *)
     printf 'fake curl: unexpected url %s\n' "$url" >&2

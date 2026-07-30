@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import gzip
+import mmap
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -17,6 +19,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 from urllib.parse import urlsplit
 
 from ceph_incident_collectors import (
@@ -54,11 +57,55 @@ USAGE = """Usage:
     [--seed USER@HOST] [--mode auto|cephadm|rook] [--since RANGE]
     [--skip-logs] [--keep-original-logs]
     [--var-log-max-bytes BYTES|unlimited]
+    [--trust-ssh-host-key|--no-trust-ssh-host-key]
     [--kube-mode local|remote] [--kube-context CTX]
     [--prom-url URL] [--prom-job-regex RE] [--prom-step SECONDS]
-    [--prom-timeout SECONDS] [--quiet] [--keep-workdir]
+    [--prom-timeout SECONDS] [--redact|--no-redact]
+    [--quiet] [--keep-workdir]
   ceph_incident_bundle.py verify <bundle-dir|bundle.tar.gz>"""
 REQUIRED_FILES = ("manifest.jsonl", "summary.txt", "README-FIRST.txt")
+REDACTABLE_SUFFIXES = (
+    ".txt",
+    ".log",
+    ".merged",
+    ".yaml",
+    ".json",
+    ".jsonl",
+    ".conf",
+    ".gz",
+    ".xz",
+    ".bz2",
+    ".zst",
+)
+COMPRESSED_CODECS = {
+    ".gz": (("gzip", "-dc", "--"), ("gzip", "-c", "--")),
+    ".xz": (("xz", "-dc", "--"), ("xz", "-c", "--")),
+    ".bz2": (("bzip2", "-dc", "--"), ("bzip2", "-c", "--")),
+    ".zst": (("zstd", "-qdc", "--"), ("zstd", "-q", "-c", "--")),
+}
+PEM_BEGIN = re.compile(
+    rb"-----BEGIN[\t\v\f\r ]+.*PRIVATE[\t\v\f\r ]+KEY-----", re.IGNORECASE
+)
+PEM_END = re.compile(
+    rb"-----END[\t\v\f\r ]+.*PRIVATE[\t\v\f\r ]+KEY-----", re.IGNORECASE
+)
+SENSITIVE_LINE = re.compile(
+    rb"password|secret|token|keyring|private(?:[\t\v\f\r _-]+)?key",
+    re.IGNORECASE,
+)
+CEPH_KEY_LABEL = re.compile(
+    rb"(?:^|[^A-Za-z0-9])key[\t\v\f\r ]*[:=]", re.IGNORECASE
+)
+BASE64_SECRET = re.compile(rb"[A-Za-z0-9+/]{38,}={1,2}")
+PRIVATE_KEY_CONTENT = re.compile(
+    rb"-----BEGIN[ A-Za-z]*PRIVATE KEY-----"
+)
+CEPH_KEY_CONTENT = re.compile(
+    rb"(?:^|\n)[\t\v\f\r ]*key[\t\v\f\r ]*=[\t\v\f\r ]*"
+    rb"[A-Za-z0-9+/]{20,}={0,2}"
+)
+FINAL_BUNDLE_SAFETY_CEILING_BYTES = 1024**4
+REDACTION_DECODE_SAFETY_CEILING_BYTES = 10 * 1024**3
 SAFE_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 SAFE_SSH_USER = re.compile(r"[A-Za-z0-9._%+-]+\Z")
 SAFE_SSH_TARGET = re.compile(
@@ -78,6 +125,24 @@ class CollectUsageError(Exception):
     """The public collect invocation or inventory is invalid."""
 
 
+def _structural_payload_cap() -> int:
+    test_cap = os.environ.get("CEPH_INCIDENT_TEST_BUNDLE_SAFETY_CAP_BYTES", "")
+    if test_cap.isdecimal():
+        return min(FINAL_BUNDLE_SAFETY_CEILING_BYTES, int(test_cap))
+    return FINAL_BUNDLE_SAFETY_CEILING_BYTES
+
+
+def _redaction_decode_cap(source: Path) -> int:
+    test_cap = os.environ.get("CEPH_INCIDENT_TEST_REDACTION_DECODE_CAP_BYTES", "")
+    policy_cap = REDACTION_DECODE_SAFETY_CEILING_BYTES
+    if test_cap.isdecimal():
+        policy_cap = min(policy_cap, int(test_cap))
+    # Decoding, the atomic redaction rewrite, and recompression can each need
+    # one file-sized allocation in sequence.  Keep headroom for the rewrite.
+    available_cap = shutil.disk_usage(source.parent).free // 3
+    return min(policy_cap, available_cap)
+
+
 def _positive_integer(value: str, option: str) -> int:
     try:
         parsed = int(value)
@@ -94,6 +159,7 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
         "timeout": 20,
         "node_timeout": 300,
         "trust_ssh_host_key": True,
+        "redact": True,
         "skip_logs": False,
         "keep_original_logs": False,
         "keep_workdir": False,
@@ -116,6 +182,10 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
             continue
         if argument in ("--trust-ssh-host-key", "--no-trust-ssh-host-key"):
             values["trust_ssh_host_key"] = argument == "--trust-ssh-host-key"
+            index += 1
+            continue
+        if argument in ("--redact", "--no-redact"):
+            values["redact"] = argument == "--redact"
             index += 1
             continue
         if argument in (
@@ -404,12 +474,554 @@ def _write_cluster_skip_once(workdir: Path, layer: str, reason: str) -> None:
         destination.write_text(f"SKIPPED: {reason}\n", encoding="utf-8")
 
 
-def _verify_bundle_path(target: Path) -> None:
+def _is_redaction_target(workdir: Path, path: Path) -> bool:
+    relative = path.relative_to(workdir)
+    parts = relative.parts
+    if (
+        len(parts) >= 5
+        and parts[0] == "nodes"
+        and parts[2:5] == ("logs", "var-log", "raw")
+    ):
+        return False
+    if (
+        len(parts) == 4
+        and parts[:2] == ("cluster", "prometheus")
+        and path.name.endswith(".json.gz")
+    ):
+        return False
+    name = path.name
+    return (
+        name == "config"
+        or ".log." in name
+        or any(name.endswith(suffix) for suffix in REDACTABLE_SUFFIXES)
+    )
+
+
+def _redact_plain_file(
+    source: Path, redaction_log: Path, *, display_path: Path | None = None
+) -> None:
+    mode = source.stat().st_mode & 0o7777
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{source.name}.", dir=source.parent
+    )
+    temporary = Path(temporary_name)
+    count = 0
+    in_pem = False
+    try:
+        with os.fdopen(descriptor, "wb") as output, source.open("rb") as input_file:
+            size = os.fstat(input_file.fileno()).st_size
+            if size:
+                with mmap.mmap(
+                    input_file.fileno(), length=0, access=mmap.ACCESS_READ
+                ) as mapped:
+                    start = 0
+                    while start < size:
+                        newline = mapped.find(b"\n", start)
+                        content_end = size if newline < 0 else newline
+                        line_end = size if newline < 0 else newline + 1
+                        redact_line = False
+                        if PEM_BEGIN.search(mapped, start, content_end):
+                            in_pem = True
+                        if in_pem:
+                            redact_line = True
+                            if PEM_END.search(mapped, start, content_end):
+                                in_pem = False
+                        elif (
+                            SENSITIVE_LINE.search(mapped, start, content_end)
+                            or CEPH_KEY_LABEL.search(mapped, start, content_end)
+                            or BASE64_SECRET.search(mapped, start, content_end)
+                        ):
+                            redact_line = True
+                        if redact_line:
+                            output.write(b"[REDACTED]\n")
+                            count += 1
+                        else:
+                            offset = start
+                            while offset < line_end:
+                                chunk_end = min(offset + 64 * 1024, line_end)
+                                output.write(mapped[offset:chunk_end])
+                                offset = chunk_end
+                            if newline < 0:
+                                output.write(b"\n")
+                        start = line_end
+        os.chmod(temporary, mode)
+        os.replace(temporary, source)
+    finally:
+        temporary.unlink(missing_ok=True)
+    with redaction_log.open("a", encoding="utf-8") as output:
+        output.write(f"{display_path or source}: {count} line(s) redacted\n")
+
+
+def _redact_compressed_file(source: Path, redaction_log: Path) -> bool:
+    decoder, encoder = COMPRESSED_CODECS[source.suffix]
+    mode = source.stat().st_mode & 0o7777
+    plain_descriptor, plain_name = tempfile.mkstemp(
+        prefix=f".{source.name}.plain.", dir=source.parent
+    )
+    encoded_descriptor, encoded_name = tempfile.mkstemp(
+        prefix=f".{source.name}.encoded.", dir=source.parent
+    )
+    os.close(plain_descriptor)
+    os.close(encoded_descriptor)
+    plain = Path(plain_name)
+    encoded = Path(encoded_name)
+    try:
+        decoded_returncode: int | None = None
+        decode_over_cap = False
+        decoder_process: subprocess.Popen[bytes] | None = None
+        decode_cap = _redaction_decode_cap(source)
+        try:
+            with plain.open("wb") as output:
+                decoder_process = subprocess.Popen(
+                    [*decoder, str(source)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                if decoder_process.stdout is None:
+                    raise OSError("decoder stdout pipe was not created")
+                decoded_bytes = 0
+                while True:
+                    chunk = decoder_process.stdout.read(64 * 1024)
+                    if not chunk:
+                        break
+                    decoded_bytes += len(chunk)
+                    if decoded_bytes > decode_cap:
+                        decode_over_cap = True
+                        decoder_process.kill()
+                        break
+                    output.write(chunk)
+                decoder_process.stdout.close()
+                decoded_returncode = decoder_process.wait()
+        except OSError:
+            decoded_returncode = None
+        finally:
+            if decoder_process is not None:
+                if decoder_process.stdout is not None:
+                    decoder_process.stdout.close()
+                if decoder_process.poll() is None:
+                    decoder_process.kill()
+                    decoder_process.wait()
+        if decode_over_cap:
+            with redaction_log.open("a", encoding="utf-8") as output:
+                output.write(
+                    f"{source}: decompressed payload exceeds safety cap, "
+                    "original left as-is (NOT redacted)\n"
+                )
+            return False
+        if decoded_returncode is None or decoded_returncode != 0:
+            with redaction_log.open("a", encoding="utf-8") as output:
+                output.write(
+                    f"{source}: {source.suffix.removeprefix('.')} decompress failed, "
+                    "left as-is (NOT redacted)\n"
+                )
+            return True
+
+        _redact_plain_file(plain, redaction_log, display_path=source)
+        try:
+            with encoded.open("wb") as output:
+                encoded_result = subprocess.run(
+                    [*encoder, str(plain)],
+                    stdout=output,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+        except OSError:
+            encoded_result = None
+        if encoded_result is None or encoded_result.returncode != 0:
+            with redaction_log.open("a", encoding="utf-8") as output:
+                output.write(
+                    f"{source}: {source.suffix.removeprefix('.')} recompress failed, "
+                    "original left as-is (NOT redacted)\n"
+                )
+            return False
+        os.chmod(encoded, mode)
+        os.replace(encoded, source)
+        return True
+    finally:
+        plain.unlink(missing_ok=True)
+        encoded.unlink(missing_ok=True)
+
+
+def _redact_bundle_text(workdir: Path) -> bool:
+    redaction_log = workdir / "redactions.log"
+    redaction_log.touch(mode=0o600)
+    complete = True
+    for root_name in ("cluster", "nodes"):
+        for root, directories, filenames in os.walk(workdir / root_name):
+            directories[:] = sorted(directories)
+            for filename in sorted(filenames):
+                path = Path(root, filename)
+                if path.is_symlink() or not _is_redaction_target(workdir, path):
+                    continue
+                if path.suffix in COMPRESSED_CODECS:
+                    if not _redact_compressed_file(path, redaction_log):
+                        complete = False
+                else:
+                    _redact_plain_file(path, redaction_log)
+    return complete
+
+
+def _forbidden_content_path(name: str) -> bool:
+    return (
+        "keyring" in name
+        or ".ssh" in name
+        or "id_ed25519" in name
+        or "private_key" in name
+        or name.endswith((".pem", ".key", ".crt", ".pfx", ".p12"))
+    )
+
+
+def _scan_ceph_key_prefix(
+    chunk: bytes, state: int, base64_count: int
+) -> tuple[int, int, bool]:
+    """Scan the line-anchored Ceph key regex without buffering whole lines."""
+
+    whitespace = b" \t\v\f\r"
+    base64_alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    position = 0
+    while position < len(chunk):
+        if state < 0:
+            newline = chunk.find(b"\n", position)
+            if newline < 0:
+                break
+            state = 0
+            base64_count = 0
+            position = newline + 1
+            continue
+        byte = chunk[position]
+        position += 1
+        if byte == ord("\n"):
+            state = 0
+            base64_count = 0
+        elif state == 0:
+            if byte in whitespace:
+                continue
+            state = 1 if byte == ord("k") else -1
+        elif state == 1:
+            state = 2 if byte == ord("e") else -1
+        elif state == 2:
+            state = 3 if byte == ord("y") else -1
+        elif state == 3:
+            if byte in whitespace:
+                continue
+            state = 4 if byte == ord("=") else -1
+        elif state == 4:
+            if byte in whitespace:
+                continue
+            if byte in base64_alphabet:
+                state = 5
+                base64_count = 1
+            else:
+                state = -1
+        else:
+            if byte not in base64_alphabet:
+                state = -1
+                continue
+            base64_count += 1
+            if base64_count >= 20:
+                return state, base64_count, True
+    return state, base64_count, False
+
+
+def _scan_private_key_marker(
+    chunk: bytes, active: bool, begin_tail: bytes, target_progress: int
+) -> tuple[bool, bytes, int, bool]:
+    """Scan the unbounded shell private-key regex with bounded state."""
+
+    begin = b"-----BEGIN"
+    target = b"PRIVATE KEY-----"
+    allowed = b" ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    position = 0
+    while position < len(chunk):
+        newline = chunk.find(b"\n", position)
+        line_end = len(chunk) if newline < 0 else newline
+        while position < line_end:
+            if active:
+                byte = chunk[position]
+                position += 1
+                if byte == target[target_progress]:
+                    target_progress += 1
+                    if target_progress == len(target):
+                        return False, b"", 0, True
+                elif byte == target[0]:
+                    target_progress = 1
+                else:
+                    target_progress = 0
+                if byte not in allowed and not (
+                    byte == ord("-") and target_progress > 0
+                ):
+                    active = False
+                    begin_tail = b"-" if byte == ord("-") else b""
+                continue
+
+            if begin_tail:
+                boundary_end = min(line_end, position + len(begin))
+                boundary = begin_tail + chunk[position:boundary_end]
+                boundary_match = boundary.find(begin)
+                if 0 <= boundary_match < len(begin_tail):
+                    consumed = boundary_match + len(begin) - len(begin_tail)
+                    position += consumed
+                    active = True
+                    begin_tail = b""
+                    target_progress = 0
+                    continue
+            begin_at = chunk.find(begin, position, line_end)
+            if begin_at < 0:
+                begin_tail = (begin_tail + chunk[position:line_end])[-(len(begin) - 1) :]
+                position = line_end
+                break
+            position = begin_at + len(begin)
+            active = True
+            begin_tail = b""
+            target_progress = 0
+
+        if newline < 0:
+            break
+        active = False
+        begin_tail = b""
+        target_progress = 0
+        position = newline + 1
+    return active, begin_tail, target_progress, False
+
+
+def _scan_secret_stream(evidence: object, name: str) -> None:
+    tail = b""
+    secret_found = False
+    binary = False
+    ceph_state = 0
+    ceph_base64_count = 0
+    private_active = False
+    private_begin_tail = b""
+    private_target_progress = 0
+    while True:
+        chunk = evidence.read(1024 * 1024)
+        if not chunk:
+            break
+        binary = binary or b"\0" in chunk
+        window = tail + chunk
+        ceph_state, ceph_base64_count, ceph_key_found = _scan_ceph_key_prefix(
+            chunk, ceph_state, ceph_base64_count
+        )
+        (
+            private_active,
+            private_begin_tail,
+            private_target_progress,
+            private_key_found,
+        ) = _scan_private_key_marker(
+            chunk,
+            private_active,
+            private_begin_tail,
+            private_target_progress,
+        )
+        if (
+            PRIVATE_KEY_CONTENT.search(window)
+            or CEPH_KEY_CONTENT.search(window)
+            or ceph_key_found
+            or private_key_found
+        ):
+            secret_found = True
+        tail = window[-512:]
+    if secret_found and not binary:
+        raise VerificationError(f"unredacted PRIVATE KEY / key material in: {name}")
+
+
+def _verify_content_safety(target: Path) -> None:
+    try:
+        if target.is_dir():
+            for root, directories, filenames in os.walk(
+                target, topdown=True, onerror=_raise_walk_error
+            ):
+                for name in (*directories, *filenames):
+                    relative = Path(root, name).relative_to(target).as_posix()
+                    if _forbidden_content_path(relative):
+                        raise VerificationError(f"forbidden path: {relative}")
+                for filename in filenames:
+                    path = Path(root, filename)
+                    if path.is_symlink() or not path.is_file():
+                        continue
+                    with path.open("rb") as evidence:
+                        _scan_secret_stream(
+                            evidence, path.relative_to(target).as_posix()
+                        )
+            return
+
+        with tarfile.open(target, mode="r|gz") as archive:
+            while True:
+                member = archive.next()
+                if member is None:
+                    break
+                # Python 3.11 caches every TarInfo even in stream mode.  The
+                # archive was structurally validated first, so content scan
+                # can discard that cache and consume one regular member at a
+                # time without needing link resolution or random access.
+                archive.members.clear()
+                normalised = _normalise_member_name(member.name)
+                if _forbidden_content_path(normalised):
+                    raise VerificationError(f"forbidden path: {normalised}")
+                if not member.isfile():
+                    continue
+                evidence = archive.extractfile(member)
+                if evidence is None:
+                    raise VerificationError(f"cannot read archive member: {member.name}")
+                with evidence:
+                    _scan_secret_stream(evidence, normalised)
+    except VerificationError:
+        raise
+    except (OSError, tarfile.TarError, EOFError, zlib.error) as error:
+        raise VerificationError(f"cannot scan bundle content: {target}") from error
+
+
+def _run_content_safety(target: Path, *, redact: bool | None) -> bool:
+    """Temporary cutover policy behind one removable public-entrypoint seam."""
+
+    complete = True
+    if redact is True:
+        if not target.is_dir():
+            raise VerificationError("redaction requires a bundle workdir")
+        complete = _redact_bundle_text(target)
+    elif redact is False and target.is_dir():
+        (target / "redactions.log").touch(mode=0o600)
+    else:
+        _verify_content_safety(target)
+    return complete
+
+
+def _enforce_node_log_caps(workdir: Path, max_bytes: int | str) -> bool:
+    """Recheck the durable node-log payload after the content-safety phase."""
+
+    if max_bytes == "unlimited":
+        return True
+    assert isinstance(max_bytes, int)
+    complete = True
+    nodes_root = workdir / "nodes"
+    for node_dir in sorted(nodes_root.iterdir()):
+        if node_dir.is_symlink() or not node_dir.is_dir():
+            continue
+        var_log = node_dir / "logs" / "var-log"
+        if not var_log.is_dir() or var_log.is_symlink():
+            continue
+        total = 0
+        for payload_root in ("merged", "raw", "original"):
+            root = var_log / payload_root
+            if not root.exists():
+                continue
+            if root.is_symlink():
+                raise VerificationError("symlink is not allowed in node log payload")
+            if root.is_file():
+                total += root.stat().st_size
+                continue
+            if not root.is_dir():
+                raise VerificationError(
+                    "non-regular node log payload is not allowed"
+                )
+            for current_root, directories, filenames in os.walk(root):
+                for directory in directories:
+                    if Path(current_root, directory).is_symlink():
+                        raise VerificationError(
+                            "symlink is not allowed in node log payload"
+                        )
+                for filename in filenames:
+                    path = Path(current_root, filename)
+                    if path.is_symlink() or not path.is_file():
+                        raise VerificationError(
+                            "non-regular node log payload is not allowed"
+                        )
+                    total += path.stat().st_size
+        journal = var_log / "journal-all-since.txt"
+        payload_marker = var_log / "PAYLOAD-BYTES.txt"
+        over_limit_marker = var_log / "OVER-LIMIT.txt"
+        for writable_path in (journal, payload_marker, over_limit_marker):
+            if writable_path.is_symlink():
+                raise VerificationError(
+                    f"symlink is not allowed in node log payload: {writable_path.name}"
+                )
+        if journal.is_file():
+            total += journal.stat().st_size
+        if total > max_bytes:
+            for payload_root in ("merged", "raw", "original"):
+                path = var_log / payload_root
+                if path.is_symlink():
+                    raise VerificationError(
+                        "symlink is not allowed in node log payload"
+                    )
+                if path.is_dir():
+                    shutil.rmtree(path)
+                elif path.is_file():
+                    path.unlink()
+                elif path.exists():
+                    raise VerificationError(
+                        "non-regular node log payload is not allowed"
+                    )
+            journal.write_text(
+                "SKIPPED: not collected because post-redaction node log payload "
+                "exceeded the per-node cap\n",
+                encoding="utf-8",
+            )
+            payload_marker.unlink(missing_ok=True)
+            over_limit_marker.write_text(
+                f"actual_payload_bytes={total}\n"
+                f"max_bytes={max_bytes}\n"
+                "status=not-collected-post-redaction-cap\n",
+                encoding="utf-8",
+            )
+            with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
+                errors.write(
+                    f"node {node_dir.name} log payload exceeded cap after redaction\n"
+                )
+            complete = False
+        elif payload_marker.is_file():
+            payload_marker.write_text(f"{total}\n", encoding="utf-8")
+    return complete
+
+
+def _verify_structural_bundle_path(target: Path) -> None:
     if target.is_dir():
         _verify_directory(target)
     else:
         files = _read_archive(target)
         _verify_file_set(files)
+
+
+def _verify_bundle_path(target: Path) -> None:
+    if target.is_symlink():
+        raise VerificationError(f"symlink is not allowed as bundle target: {target}")
+    if target.is_dir():
+        _verify_structural_bundle_path(target)
+        _run_content_safety(target, redact=None)
+        return
+
+    cap = _structural_payload_cap()
+    with tempfile.TemporaryDirectory(prefix="ceph-incident-verify.") as temporary:
+        snapshot = Path(temporary) / "bundle.tar.gz"
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(target, flags)
+        except OSError as error:
+            raise VerificationError(f"cannot read archive: {target}") from error
+        copied = 0
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise VerificationError(f"expected a regular archive: {target}")
+            with os.fdopen(descriptor, "rb", closefd=False) as source, snapshot.open(
+                "xb"
+            ) as destination:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > cap:
+                        raise VerificationError(
+                            "archive exceeds structural payload cap"
+                        )
+                    destination.write(chunk)
+        finally:
+            os.close(descriptor)
+        _verify_structural_bundle_path(snapshot)
+        _run_content_safety(snapshot, redact=None)
 
 
 def _reserve_archive_path(output_root: Path, timestamp: str) -> Path:
@@ -481,6 +1093,7 @@ def _collect(arguments: Sequence[str]) -> int:
         print(f"FATAL: cannot create collector-owned workspace: {error}", file=sys.stderr)
         return 1
     archive: Path | None = None
+    packaged_candidate: Path | None = None
     retain_workdir = bool(options["keep_workdir"])
     previous_term_handler = signal.getsignal(signal.SIGTERM)
 
@@ -669,6 +1282,18 @@ def _collect(arguments: Sequence[str]) -> int:
                         f"node {inventory_node.host_alias} "
                         f"({inventory_node.target}): {result.reason}\n"
                     )
+        progress("redacting collected evidence" if options["redact"] else "checking collected evidence")
+        content_safety_complete = _run_content_safety(
+            workdir, redact=bool(options["redact"])
+        )
+        if not content_safety_complete:
+            with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
+                errors.write(
+                    "redaction failed; original collected artifact was preserved\n"
+                )
+        log_caps_complete = _enforce_node_log_caps(
+            workdir, options["var_log_max_bytes"]
+        )
         if known_hosts is not None:
             known_hosts.unlink(missing_ok=True)
         prometheus_status = prometheus.exit_code if prometheus is not None else None
@@ -686,6 +1311,8 @@ def _collect(arguments: Sequence[str]) -> int:
                 or rook_status
                 or prometheus_status
                 or missing_cluster_source
+                or not content_safety_complete
+                or not log_caps_complete
             )
             else 0
         )
@@ -794,8 +1421,15 @@ def _collect(arguments: Sequence[str]) -> int:
         retain_workdir = True
         if archive is not None:
             archive.unlink(missing_ok=True)
+        if packaged_candidate is not None:
+            packaged_candidate.unlink(missing_ok=True)
         try:
             _rewrite_summary_final_status(workdir, 1)
+        except OSError:
+            pass
+        try:
+            with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
+                errors.write(f"bundle verification failed: {error}\n")
         except OSError:
             pass
         print(f"VERIFY FAILED: workdir kept at {workdir}: {error}", file=sys.stderr)
@@ -834,49 +1468,107 @@ def _raise_walk_error(error: OSError) -> None:
     raise error
 
 
+def _verify_zero_tar_trailer(snapshot: BinaryIO, payload_end: int) -> None:
+    snapshot.seek(payload_end)
+    trailing_bytes = 0
+    while True:
+        chunk = snapshot.read(1024 * 1024)
+        if not chunk:
+            break
+        trailing_bytes += len(chunk)
+        if any(chunk):
+            raise VerificationError("invalid archive: missing tar end markers")
+    if trailing_bytes < 1024:
+        raise VerificationError("invalid archive: missing tar end markers")
+
+
 def _read_archive(target: Path) -> set[str]:
     files: set[str] = set()
     try:
-        # Consume the gzip stream to EOF before opening the tar.  This verifies
-        # the gzip trailer/CRC even when every tar member itself is readable.
-        with gzip.open(target, mode="rb") as compressed_stream:
-            while compressed_stream.read(1024 * 1024):
-                pass
-
-        with tarfile.open(target, mode="r:gz") as archive:
-            members = archive.getmembers()
-            normalised_members: list[tuple[tarfile.TarInfo, str]] = []
-            seen_names: dict[str, str] = {}
-            for member in members:
-                normalised_name = _normalise_member_name(member.name)
-                if normalised_name in seen_names:
-                    raise VerificationError(
-                        "duplicate archive member after normalisation: "
-                        f"{member.name} collides with {seen_names[normalised_name]}"
+        payload_cap = _structural_payload_cap()
+        if target.stat().st_size > payload_cap:
+            raise VerificationError("archive exceeds structural payload cap")
+        # Snapshot the fully consumed gzip payload before parsing the tar.  The
+        # cap bounds gzip expansion, and both passes inspect the same bytes.
+        with tempfile.TemporaryFile() as snapshot:
+            expanded_bytes = 0
+            with gzip.open(target, mode="rb") as compressed_stream:
+                while True:
+                    chunk = compressed_stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    expanded_bytes += len(chunk)
+                    if expanded_bytes > payload_cap:
+                        raise VerificationError(
+                            "archive exceeds structural payload cap"
+                        )
+                    snapshot.write(chunk)
+            if expanded_bytes < 1024 or expanded_bytes % 512:
+                raise VerificationError("invalid archive: missing tar end markers")
+            snapshot.seek(0)
+            with tarfile.open(fileobj=snapshot, mode="r:") as archive:
+                members = archive.getmembers()
+                normalised_members: list[tuple[tarfile.TarInfo, str]] = []
+                seen_names: dict[str, str] = {}
+                member_kinds: dict[str, str] = {}
+                for member in members:
+                    normalised_name = _normalise_member_name(member.name)
+                    if normalised_name in seen_names:
+                        raise VerificationError(
+                            "duplicate archive member after normalisation: "
+                            f"{member.name} collides with {seen_names[normalised_name]}"
+                        )
+                    seen_names[normalised_name] = member.name
+                    normalised_members.append((member, normalised_name))
+                    if not (member.isfile() or member.isdir()):
+                        if member.issym():
+                            member_kind = "symlink"
+                        elif member.islnk():
+                            member_kind = "hardlink"
+                        else:
+                            member_kind = "non-file/non-directory"
+                        raise VerificationError(
+                            f"archive contains {member_kind} member: {member.name}"
+                        )
+                    if normalised_name == "." and not member.isdir():
+                        raise VerificationError(
+                            "archive member hierarchy collision: . is a file ancestor"
+                        )
+                    member_kinds[normalised_name] = (
+                        "directory" if member.isdir() else "file"
                     )
-                seen_names[normalised_name] = member.name
-                normalised_members.append((member, normalised_name))
-                if not (member.isfile() or member.isdir()):
-                    if member.issym():
-                        member_kind = "symlink"
-                    elif member.islnk():
-                        member_kind = "hardlink"
-                    else:
-                        member_kind = "non-file/non-directory"
-                    raise VerificationError(
-                        f"archive contains {member_kind} member: {member.name}"
-                    )
 
-            for member, normalised_name in normalised_members:
-                if member.isdir():
-                    continue
-                files.add(normalised_name)
-                stream = archive.extractfile(member)
-                if stream is None:
-                    raise VerificationError(f"cannot read archive member: {member.name}")
-                with stream:
-                    while stream.read(1024 * 1024):
-                        pass
+                for name in member_kinds:
+                    parts = PurePosixPath(name).parts
+                    for index in range(1, len(parts)):
+                        parent = PurePosixPath(*parts[:index]).as_posix()
+                        if member_kinds.get(parent) == "file":
+                            raise VerificationError(
+                                "archive member hierarchy collision: "
+                                f"{name} below {parent}"
+                            )
+
+                payload_end = max(
+                    (
+                        member.offset_data + ((member.size + 511) // 512) * 512
+                        for member in members
+                    ),
+                    default=0,
+                )
+                _verify_zero_tar_trailer(snapshot, payload_end)
+
+                for member, normalised_name in normalised_members:
+                    if member.isdir():
+                        continue
+                    files.add(normalised_name)
+                    stream = archive.extractfile(member)
+                    if stream is None:
+                        raise VerificationError(
+                            f"cannot read archive member: {member.name}"
+                        )
+                    with stream:
+                        while stream.read(1024 * 1024):
+                            pass
     except (OSError, tarfile.TarError, EOFError, zlib.error) as error:
         raise VerificationError(f"invalid archive: {target}") from error
     return files
@@ -884,6 +1576,8 @@ def _read_archive(target: Path) -> set[str]:
 
 def _verify_directory(target: Path) -> None:
     files: set[str] = set()
+    payload_bytes = 0
+    payload_cap = _structural_payload_cap()
     try:
         for root, directories, filenames in os.walk(
             target, topdown=True, onerror=_raise_walk_error
@@ -898,6 +1592,11 @@ def _verify_directory(target: Path) -> None:
                 if path.is_dir():
                     continue
                 if path.is_file():
+                    payload_bytes += path.stat().st_size
+                    if payload_bytes > payload_cap:
+                        raise VerificationError(
+                            "bundle directory exceeds structural payload cap"
+                        )
                     files.add(relative_name)
                     continue
                 raise VerificationError(
