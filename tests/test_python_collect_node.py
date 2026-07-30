@@ -1656,6 +1656,22 @@ class NodeEvidenceSurfaceTests(NodeCollectorFixture, unittest.TestCase):
                 "sudo <-n> <journalctl> <--since> <-24h> <-u> <ceph*> <--no-pager>",
                 ledger,
             )
+            # The `/var/lib/ceph` listing records a collector verb rather than
+            # its find expression (ADR 0010), so the manifest cannot show that
+            # the scan ran privileged.  The argv ledger has to, or a silent drop
+            # to an unprivileged scan would go unnoticed.
+            for scanned in (
+                root / "var-lib-ceph",
+                root / "timesyncd.conf.d",
+            ):
+                with self.subTest(scan_root=scanned):
+                    self.assertTrue(
+                        any(
+                            line.startswith(f"sudo <-n> <find> <{scanned}>")
+                            for line in ledger
+                        ),
+                        ledger,
+                    )
             manifest = self.node_manifest(bundle)
             self.assertEqual(
                 manifest["kernel/dmesg.txt"], ("sudo -n dmesg -T", 0)
@@ -1902,6 +1918,27 @@ class NodeEvidenceSurfaceTests(NodeCollectorFixture, unittest.TestCase):
             self.assertEqual(
                 evidence["time/systemd-timesyncd-config/timesyncd.conf"],
                 b"[Time]\nNTP=192.168.18.1\n",
+            )
+
+    def test_a_failed_symlinked_copy_reports_the_path_it_was_asked_for(self) -> None:
+        """A lost `/etc/resolv.conf` is named once, not once per indirection."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            # The read lands on the symlink's target, so that is what fails.
+            environment["FAKE_DD_FAIL_MATCH"] = "resolv-target"
+
+            bundle = self.collect_node_evidence(root, environment, expected_exit=2)
+
+            source = root / "etc" / "resolv.conf"
+            self.assertEqual(
+                self.node_evidence(bundle)["system/resolv.conf"],
+                f"SKIPPED: copy failed: {source}\n".encode(),
+            )
+            self.assertEqual(
+                self.node_manifest(bundle)["system/resolv.conf"],
+                (f"collect-node copy {source}", 2),
             )
 
 

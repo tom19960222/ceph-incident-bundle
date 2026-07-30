@@ -34,10 +34,10 @@ NODE_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
 )
 # Optional tools: collected when installed, skipped with a marker when not, and
-# never able to turn the node partial (shell `node_run_optional`).  Split in two
-# so the shell reference's collection order survives the port — the timesyncd
-# journal and its config files land between the two groups.
-OPTIONAL_TIME_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+# never able to turn the node partial (shell `node_run_optional`).  The two
+# groups are named for where they sit in the shell reference's collection order:
+# the timesyncd journal and its config files land between them.
+OPTIONAL_COMMANDS_BEFORE_TIMESYNCD_CONFIG: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("resources/iostat.txt", ("iostat", "-xz", "1", "3")),
     ("time/chronyc-tracking.txt", ("chronyc", "tracking")),
     ("time/chronyc-sources.txt", ("chronyc", "sources", "-v")),
@@ -53,7 +53,7 @@ OPTIONAL_TIME_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("systemctl", "status", "systemd-timesyncd", "--no-pager", "--plain"),
     ),
 )
-OPTIONAL_STORAGE_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+OPTIONAL_COMMANDS_AFTER_TIMESYNCD_CONFIG: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("storage/pvs.txt", ("pvs", "--noheadings", "--separator", " ")),
     ("storage/vgs.txt", ("vgs", "--noheadings", "--separator", " ")),
     ("storage/lvs.txt", ("lvs", "--noheadings", "--separator", " ")),
@@ -527,12 +527,14 @@ def _copy_evidence(
 
     started = _utc_now()
     command = f"collect-node copy {source}"
+    read_source = source
     if source.is_symlink():
         # `/etc/resolv.conf` is a symlink on most systemd hosts and the shell
         # reference follows it.  Resolving first keeps the read itself
-        # no-follow, so only this deliberate indirection is honoured.
-        source = source.resolve()
-    status, _ = _decode_to_file(source, "plain", destination, None)
+        # no-follow, so only this deliberate indirection is honoured.  The
+        # source path an operator asked for is still what gets reported.
+        read_source = source.resolve()
+    status, _ = _decode_to_file(read_source, "plain", destination, None)
     if status != "ok":
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         destination.write_text(
@@ -557,8 +559,11 @@ def _copy_evidence(
 def _find_files(root: Path, expression: Sequence[str], timeout: int) -> list[Path]:
     """Enumerate files under `root` with `find -print0`.
 
-    A scan that fails yields nothing rather than raising: the shell reference
-    also lets its `find` pipeline fail open and reports only what it copied.
+    `timeout` is the heavy bound, not the per-command one: the shell reference
+    leaves these scans unbounded, so a busy `/var/lib/ceph` must not be cut
+    short at the 20s a single capture gets.  A scan that fails or times out
+    yields nothing rather than raising — the shell reference also lets its
+    `find` pipeline fail open and reports only what it managed to copy.
     """
 
     command = _find_argv((str(root), *expression, "-print0"))
@@ -590,7 +595,7 @@ def _find_files(root: Path, expression: Sequence[str], timeout: int) -> list[Pat
 
 
 def _collect_timesyncd_config(
-    output: Path, manifest: Path, config: NodeConfig, timeout: int
+    output: Path, manifest: Path, config: NodeConfig, scan_timeout: int
 ) -> bool:
     """Copy the timesyncd config and every `conf.d` drop-in, file by file."""
 
@@ -615,7 +620,7 @@ def _collect_timesyncd_config(
         for source in _find_files(
             conf_directory,
             ("-maxdepth", "1", "-type", "f", "-name", "*.conf"),
-            timeout,
+            scan_timeout,
         ):
             relative = source.relative_to(conf_directory)
             if _copy_evidence(
@@ -656,7 +661,11 @@ def _copy_etc_evidence(output: Path, manifest: Path, config: NodeConfig) -> bool
 
 
 def _collect_var_lib_ceph(
-    output: Path, manifest: Path, config: NodeConfig, timeout: int
+    output: Path,
+    manifest: Path,
+    config: NodeConfig,
+    timeout: int,
+    scan_timeout: int,
 ) -> bool:
     """List `/var/lib/ceph` and copy its configs, never its credentials."""
 
@@ -701,8 +710,10 @@ def _collect_var_lib_ceph(
         listing_command,
         listing_command_text,
     ):
-        # Without a trustworthy listing there is no way to tell which configs
-        # were missed, so the copy loop is not started either.
+        # A listing the collector could not produce leaves no way to tell which
+        # configs were missed, so the copy loop is not started either.  A
+        # listing skipped for want of sudo is a different case: it reports
+        # success, and the copy loop still gathers what it can read.
         return False
     destination = output / "cephadm" / "var-lib-ceph-configs"
     destination.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -718,7 +729,7 @@ def _collect_var_lib_ceph(
             "f",
             *VAR_LIB_CEPH_CONFIG_NAMES,
         ),
-        timeout,
+        scan_timeout,
     ):
         relative = source.relative_to(ceph_directory)
         if not _copy_evidence(
@@ -785,7 +796,7 @@ def _collect_node_evidence(
             ceph_journal,
         )
 
-    for relative_artifact, command in OPTIONAL_TIME_COMMANDS:
+    for relative_artifact, command in OPTIONAL_COMMANDS_BEFORE_TIMESYNCD_CONFIG:
         _run_optional(output, manifest, config, timeout, relative_artifact, command)
     _run_privileged(
         output,
@@ -795,9 +806,9 @@ def _collect_node_evidence(
         "time/systemd-timesyncd-journal.txt",
         ("journalctl", "--since", since, "-u", "systemd-timesyncd", "--no-pager"),
     )
-    if not _collect_timesyncd_config(output, manifest, config, timeout):
+    if not _collect_timesyncd_config(output, manifest, config, heavy_timeout):
         complete = False
-    for relative_artifact, command in OPTIONAL_STORAGE_COMMANDS:
+    for relative_artifact, command in OPTIONAL_COMMANDS_AFTER_TIMESYNCD_CONFIG:
         _run_optional(output, manifest, config, timeout, relative_artifact, command)
 
     if shutil.which(CEPHADM_LS_COMMAND[0]) is None:
@@ -821,7 +832,7 @@ def _collect_node_evidence(
 
     if not _copy_etc_evidence(output, manifest, config):
         complete = False
-    if not _collect_var_lib_ceph(output, manifest, config, timeout):
+    if not _collect_var_lib_ceph(output, manifest, config, timeout, heavy_timeout):
         complete = False
     return complete
 
@@ -902,7 +913,7 @@ def _safe_read_command(source: Path) -> tuple[str, ...] | None:
         return ("sudo", "-n", *command)
     if os.geteuid() == 0 or source_stat.st_uid == os.geteuid():
         return command
-    if shutil.which("sudo") is None:
+    if _sudo_path() is None:
         return None
     return ("sudo", "-n", *command)
 
@@ -991,7 +1002,7 @@ def _discover_log_files(
     elif (
         os.environ.get("CEPH_INCIDENT_TEST_ALLOW_ATIME_READ") != "1"
         and os.geteuid() != 0
-        and shutil.which("sudo") is not None
+        and _sudo_path() is not None
     ):
         command = ("sudo", "-n", *command)
     errors_file = tempfile.TemporaryFile(dir=scratch)
@@ -1555,7 +1566,7 @@ def _journal_command() -> tuple[str, ...] | None:
         return command
     if os.geteuid() == 0:
         return command
-    if shutil.which("sudo") is None:
+    if _sudo_path() is None:
         return None
     return ("sudo", "-n", *command)
 
@@ -1884,9 +1895,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 _utc_now(),
             )
         else:
-            root = Path("/var/log")
-            if os.environ.get("CEPH_INCIDENT_TEST_ALLOW_ATIME_READ") == "1":
-                root = Path(os.environ.get("CEPH_INCIDENT_VAR_LOG_DIR", "/var/log"))
+            root = _node_path("CEPH_INCIDENT_VAR_LOG_DIR", "/var/log")
             log_started = _utc_now()
             log_result = _collect_var_logs(root, log_output, config)
             journal_result = _collect_journal(log_output, config)

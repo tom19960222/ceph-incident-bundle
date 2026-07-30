@@ -66,7 +66,7 @@
 
 - `/var/log` 與其他可能影響 atime 或遭遇 symlink race 的一般檔案，必須以支援 `noatime` 與 `nofollow` 的讀法取得；目前契約為 GNU `dd iflag=noatime,nofollow`，必要時使用非互動 `sudo -n`。
 - 若平台不支援安全讀法、權限不足、路徑在檢查後變成 symlink，或任何條件無法證明，該檔案必須記為 read-failed/partial；不得退回 `cat`、一般 `open` 或會跟隨 symlink 的讀法。
-- 唯一被允許的 symlink 例外是 `/etc` 的 identity 檔案（`os-release`、`hosts`、`resolv.conf`）：`/etc/resolv.conf` 在多數 systemd 主機上就是 symlink，shell reference 也跟隨它。作法是先解析 symlink，再對解析後的路徑做 `noatime,nofollow` 讀取——讀取本身仍不跟隨 symlink，只有這一次刻意的間接被承認。
+- 唯一被允許的 symlink 例外是**複製類 evidence 的來源路徑本身**（實務上只有 `/etc` 的 identity 檔案與 `timesyncd.conf`：其餘來源都由 `find -type f` 產生，本來就不會是 symlink）。`/etc/resolv.conf` 在多數 systemd 主機上就是 symlink，shell reference 也跟隨它。作法是先解析 symlink，再對解析後的路徑做 `noatime,nofollow` 讀取——讀取本身仍不跟隨 symlink，只有這一次刻意的間接被承認；SKIPPED marker 與 manifest 記的都是操作人員指定的原始路徑，不是解析後的目標。
 - 目錄列舉可以讀 metadata，但不能追蹤跨出預定 root 的 symlink。
 
 ### Owned workspace containment
