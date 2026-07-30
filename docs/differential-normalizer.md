@@ -42,8 +42,9 @@ fake `ssh` 與 fake `kubectl` 都是白名單 adapter：未列入的 remote comm
 - `manifest.jsonl` 與每個 node 的 manifest：host、collector、bundle-relative
   artifact、command argv、exit_code，逐行逐欄比較。
 - `summary.txt`、`environment.txt`、`CONTENTS.md`、`README-FIRST.txt`。
-- `redactions.log` 的每檔遮蔽結果。
-- `errors.log` 的失敗事件集合。
+- `redactions.log` 的每檔遮蔽結果（同一個檔案被記錄兩次也算差異，只有行序被忽略）。
+- `errors.log` 的失敗事件集合，含每個失敗 node 的 alias、target 與**該 node 的 exit
+  code**（`node <alias> (<target>) collector exited <code>`）。
 - external command policy：ssh、kubectl 與 curl 的完整 argv ledger（curl 走
   NUL-delimited 無損 ledger，因此連含空白的單一參數都逐字比較）、node 請求的
   參數（alias、since、timeout、payload cap、skip-logs、keep-original-logs）。
@@ -59,12 +60,14 @@ fake `ssh` 與 fake `kubectl` 都是白名單 adapter：未列入的 remote comm
 | 4 | shell quoting 風格（`printf %q` 對 `shlex.join`） | manifest / CONTENTS.md / ssh-debug 的 command 一律 `shlex.split` 成 argv 後比較 | 同一條 argv 的兩種書寫；argv 本身仍逐字比較 |
 | 4a | ssh-debug `# command:` 行開頭的 `timeout <秒數>` wrapper | 只在該行去掉 wrapper，其餘每個 word 仍逐字比較 | 兩邊都有界：reference 用 `timeout(1)` 包住 verbose probe，candidate 用 subprocess deadline（`write_ssh_debug_log` 的 `timeout=connection_timeout`），只有 reference 會把界限寫進那行紀錄。這正是 inventory C21 允許的機制差異 |
 | 5 | tar member order | member 集合排序後比較 | AC 明列 |
-| 6 | gzip metadata 與壓縮率 | 比較解壓後內容；`PAYLOAD-BYTES.txt` 只在該 node 的 payload 內含壓縮成員時換成 `<compressor-dependent-bytes>`（其餘情況逐字比較 byte 數） | 重壓縮大小由 compressor 決定；payload 內容仍逐一比較 |
+| 6 | gzip metadata 與壓縮率 | 比較解壓後內容；`PAYLOAD-BYTES.txt` 只在該 node 的 payload 內含壓縮成員時換成 `<compressor-dependent-bytes>`（其餘情況逐字比較 byte 數） | 重壓縮大小由 compressor 決定；payload 內容仍逐一比較。**誠實記錄**：目前共用的 canned Node Evidence Archive 每個 node 都含 `.gz` 成員，所以這條逃逸實務上總是套用；逐字比較那半條規則要等出現無壓縮成員的 node payload 才會生效 |
 | 7 | 檔案系統走訪順序（`redactions.log`） | 以「檔案 → 遮蔽結果」mapping 比較 | 每一筆與其結果都仍被比較，只有行序被忽略 |
 | 8 | `errors.log` 的記錄粒度與交錯 | 以「分類後事件集合」比較 | 同一個失敗兩邊可能寫在不同時點；每個事件類別仍必須雙邊都有 |
-| 9 | 人可讀失敗措辭（`SKIPPED*.txt`、`errors.log`、stderr lifecycle） | 只在**認得的措辭**上收斂成已記錄的語意 class；認不出來的字串以 `literal:` 逐字比較 | 沿用 `docs/test-scenario-inventory.md` §11.3「對齊語意、不逐字綁英文措辭」 |
+| 9 | 人可讀失敗措辭（`SKIPPED*.txt`、`errors.log`、stderr lifecycle） | 只在**認得的措辭**上收斂成已記錄的語意 class；認不出來的字串以 `literal:` 逐字比較。每個 class 都綁在事件本身（例如「node collection timed out」），不綁單一個字，因此別層的 timeout 或別種不完整 archive 不會借用它 | 沿用 `docs/test-scenario-inventory.md` §11.3「對齊語意、不逐字綁英文措辭」 |
 | 10 | progress prose（stderr） | 只比較 lifecycle 事件（interrupted / verify-failed / workdir-kept） | progress 是人機介面；stdout 純淨性與 `--quiet` 由 Python suite 覆蓋 |
-| 11 | candidate-only `environment.txt` 欄位（`node_target_*`、`node_invocation_id_*`、`rook_namespace`、`rook_operator_namespace`、`kube_context`） | 從比較中移除，另由 `test_candidate_environment_additions_stay_documented` 檢查只出現已記錄的 key | rewrite plan 明文要求 Python 記錄 node invocation identifier 等額外可觀察性 |
+| 11 | candidate-only `environment.txt` 欄位（`node_target_*`、`node_invocation_id_*`、`rook_namespace`、`rook_operator_namespace`、`kube_context`） | 從比較中移除，另由 `test_candidate_environment_additions_stay_documented` 檢查只出現已記錄的 key | rewrite plan 明文要求 Python 記錄 node invocation identifier 等額外可觀察性。`environment.txt` 內不含 `=` 的行不會被丟掉，會收進 `<non-field lines>` 一起比較 |
+| 12 | ssh argv ledger 內 node collector 的**啟動 payload 本身**（最後一個 word） | 換成 `<node-collector-invocation>`；同一條 argv 的其餘每個 word 仍逐字比較 | 兩邊的 payload 由定義就不同（串流 shell script 對串流 Python module）。這個 invocation 改由 node request ledger 逐欄比較（alias、since、timeout、payload cap、skip-logs、keep-original-logs），不是不比 |
+| 13 | node request ledger 的 `implementation`、`payload_sha256`、`payload_members` | 從比較中移除 | 這三個欄位記的就是「哪一個實作、送了哪一份 payload」，依第 12 項同樣由定義不同；ledger 的其餘欄位（node 收到的每個參數）仍逐欄比較 |
 
 **不被忽略**：artifacts 的存在與內容、exit code 與 status、manifest、command
 policy（含 default-off 邊界）、bundle lifecycle（workdir 保留 / archive 產出）、

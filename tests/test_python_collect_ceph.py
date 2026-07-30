@@ -663,7 +663,7 @@ class MissingLocalSshTransportTests(DirectCephFixture, unittest.TestCase):
 
             errors = contents["errors.log"]
             self.assertIn("no cephadm-capable node", contents["cluster/ceph/SKIPPED.txt"])
-            self.assertIn("node monitor01 (ceph@10.0.0.1):", errors)
+            self.assertIn("node monitor01 (ceph@10.0.0.1) collector exited 2:", errors)
             self.assertIn("ssh: command not found", errors)
             self.assertIn("final_status: 2", contents["summary.txt"])
             self.assertIn("node_failed: 1", contents["summary.txt"])

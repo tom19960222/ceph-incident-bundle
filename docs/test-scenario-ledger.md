@@ -41,15 +41,15 @@
 | C1 | `json_escape` 正確跳脫 `"` 與 `\` | not-ported | `json_escape` 不存在；Python 用 `json` 模組 | — |
 | C2 | `json_escape` 不呼叫 python3（shell-native） | not-ported | 「不呼叫 python3」是純 shell 約束 | — |
 | C3 | `manifest_add` 寫出一行 JSONL，欄位 host/collector/a… | ported | `test_python_collect_ceph.CollectDirectCephCliTests.test_direct_ceph_manifest_records_every_capture` | — |
-| C4 | `manifest_add` 拒絕非數字 exit_code（非 0 退出並說明 exit… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_untrusted_node_archives_are_rejected_before_extraction` | — |
+| C4 | `manifest_add` 拒絕非數字 exit_code（非 0 退出並說明 exit… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_untrusted_node_archives_are_rejected_before_extraction`（`nonnumeric-exit-code` 子案例；Python 的 writer 以 `int` 型別保證，因此這條語意由 receiver 守，處置是拒收該 archive 而非 writer 自己退出） | — |
 | C5 | `redact_file`：Password/SECRET/token/keyring/p… | ported | `test_python_content_safety.CollectContentSafetyTests.test_collect_redacts_sensitive_text_by_default`<br>`test_python_content_safety.CollectContentSafetyTests.test_redaction_handles_ascii_whitespace_and_a_long_single_line` | mixed-full-collection-redacted |
 | C6 | `redact_file`：`-----BEGIN ... PRIVATE KEY----… | ported | `test_python_content_safety.CollectContentSafetyTests.test_ceph_key_material_and_private_key_blocks_are_redacted` | — |
 | C7 | `redact_file`：多行 PEM 本體（含 base64 行與 END 行）整段遮… | ported | `test_python_content_safety.CollectContentSafetyTests.test_ceph_key_material_and_private_key_blocks_are_redacted` | — |
 | C8 | `redact_file`：Ceph key 素材（`key = AQB...==`、`"… | ported | `test_python_content_safety.CollectContentSafetyTests.test_ceph_key_material_and_private_key_blocks_are_redacted` | — |
-| C9 | `redact_file` 保留原檔權限（640） | ported | `test_python_content_safety.CollectContentSafetyTests.test_all_supported_compressed_text_codecs_are_redacted` | — |
+| C9 | `redact_file` 保留原檔權限（640） | ported | `test_python_content_safety.RedactionFilePermissionTests.test_plain_redaction_keeps_the_original_permission_mode`<br>`test_python_content_safety.RedactionFilePermissionTests.test_compressed_redaction_keeps_the_original_permission_mode` | — |
 | C10 | `redact_gz_file`：gzip 檔解壓-遮蔽-重壓，正常內容保留、秘密不外洩、… | ported | `test_python_content_safety.CollectContentSafetyTests.test_compressed_text_is_redacted_but_opaque_raw_evidence_is_unchanged` | mixed-full-collection-redacted |
 | C11 | `redact_compressed_file` 支援 xz / bz2 / zst 三種… | ported | `test_python_content_safety.CollectContentSafetyTests.test_all_supported_compressed_text_codecs_are_redacted` | — |
-| C12 | 重壓縮失敗時回非 0、原壓縮檔內容/mode 原封不動（不破壞原 artifact） | ported | `test_python_content_safety.CollectContentSafetyTests.test_recompress_failure_preserves_original_and_continues_other_redactions` | — |
+| C12 | 重壓縮失敗時回非 0、原壓縮檔內容/mode 原封不動（不破壞原 artifact） | ported | `test_python_content_safety.CollectContentSafetyTests.test_recompress_failure_preserves_original_and_continues_other_redactions`<br>`test_python_content_safety.RedactionFilePermissionTests.test_recompress_failure_keeps_the_original_bytes_and_mode` | — |
 | C13 | `redact_bundle_text`：早期壓縮檔遮蔽失敗 → 整體回 2，但**繼續*… | ported | `test_python_content_safety.CollectContentSafetyTests.test_recompress_failure_preserves_original_and_continues_other_redactions` | — |
 | C14 | `redact_bundle_text`：`merged/` 純文字要遮蔽；`raw/` … | ported | `test_python_content_safety.CollectContentSafetyTests.test_compressed_text_is_redacted_but_opaque_raw_evidence_is_unchanged`<br>`test_python_content_safety.CollectContentSafetyTests.test_prometheus_metric_exclusion_is_anchored_to_the_cluster_layer` | mixed-full-collection-redacted |
 | C15 | `enforce_node_log_caps`：遮蔽後超過 cap → 回 2、丟棄 me… | ported | `test_python_content_safety.CollectContentSafetyTests.test_post_redaction_payload_cap_discards_node_log_payload`<br>`test_python_content_safety.CollectContentSafetyTests.test_post_redaction_cap_counts_a_regular_payload_root` | — |
@@ -222,3 +222,20 @@ inventory 的 138 個情境現在只剩兩種狀態：128 個 ported、10 個分
 細節的 not-ported。offline gate 的覆蓋邊界仍受 `docs/differential-normalizer.md`
 限制——differential run 比較的是工作機端契約，node 端等價性由上表的 N 系列
 （黑箱 fake-command 測試）負責，而不是由 differential run 負責。
+
+## Gate 宣告（2026-07-30）
+
+#18 的 offline observable-contract equivalence gate 在此宣告通過，範圍與依據：
+
+- 138 個情境逐項結案，`tests/test_python_scenario_ledger.py` 機械檢查 ID 與
+  inventory 一致、每個 `ported` 指向的 test class 與 **method** 都存在、
+  `not-ported` 正好是 inventory 的十項實作細節。
+- 13 個 differential scenarios 在同一個 fake world 雙跑，`make validate` 離線
+  可重複全綠（shell suite、Python suite、differential suite、Python 3.11 gate、
+  shellcheck）。
+- 宣告前的第二輪 Standards ／ Spec 雙軸 review 找出的 contract gaps 都已修正，
+  見 `docs/python-rewrite-plan.md` 的 #18 段落。
+- 宣告的是**工作機端** observable contract equivalence。node evidence surface
+  的等價性是由 N 系列黑箱測試「斷言」，不是由 shell／Python 雙跑「證明」；
+  依 ADR 0010，node manifest 的涵蓋範圍本來就刻意與 shell 不同。
+- real-lab qualification（#20）尚未執行，因此仍不可宣稱 qualification-ready。

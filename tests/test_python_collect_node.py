@@ -430,6 +430,38 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
                 skipped = archive.extractfile(prefix + "SKIPPED.txt")
                 self.assertIsNotNone(skipped)
                 self.assertIn(b"disabled by --skip-logs", skipped.read())
+                # ADR 0010: the marker is written in full, but the evidence it
+                # stands for is absent, so its entry cannot claim completeness.
+                self.assertEqual(
+                    self.var_log_manifest_exit_codes(archive), {"SKIPPED.txt": 2}
+                )
+
+    def test_an_absent_var_log_is_indexed_as_missing_evidence(self) -> None:
+        """A node without `/var/log` stays complete, and says so honestly.
+
+        ADR 0010: the marker is never indexed as exit 0.  The reference spends no
+        journal budget when there was no payload to account for, so no journal
+        artifact appears either and the node is not partial.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            (root / "var-log").rmdir()
+
+            result = self.run_collect(root, environment)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            bundle = Path(result.stdout.removeprefix("bundle: ").strip())
+            with tarfile.open(bundle, "r:gz") as archive:
+                skipped = archive.extractfile(
+                    "./nodes/monitor01/logs/var-log/SKIPPED.txt"
+                )
+                self.assertIsNotNone(skipped)
+                self.assertIn(b"is not a directory", skipped.read())
+                self.assertEqual(
+                    self.var_log_manifest_exit_codes(archive), {"SKIPPED.txt": 2}
+                )
 
     def test_var_log_preserves_opaque_bytes_skips_sensitive_paths_and_never_mutates_sources(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

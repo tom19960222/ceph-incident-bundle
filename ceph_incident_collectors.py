@@ -1801,7 +1801,12 @@ def collect_single_node(
         candidate.unlink(missing_ok=True)
 
     exit_code = 0 if remote_exit_code == 0 else 2
-    reason = None if exit_code == 0 else f"node collector exited {remote_exit_code}"
+    # The status itself is recorded by the caller; this is the detail behind it.
+    reason = (
+        None
+        if exit_code == 0
+        else f"remote collector reported partial evidence (exit {remote_exit_code})"
+    )
     return NodeCollectionResult(
         exit_code, remote_exit_code, True, reason, invocation_id
     )

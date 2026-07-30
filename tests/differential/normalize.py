@@ -66,8 +66,13 @@ SKIP_CLASSES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"kubectl exec disabled", re.I), "toolbox-exec-disabled"),
     (re.compile(r"toolbox Pod not found", re.I), "toolbox-missing"),
     (re.compile(r"operator Pod not found", re.I), "operator-missing"),
-    (re.compile(r"timed out", re.I), "node-timeout"),
-    (re.compile(r"missing manifest|no manifest\.jsonl|incomplete", re.I), "node-archive-missing-manifest"),
+    # Anchored on the event, not on the word: another layer's timeout, or another
+    # kind of incomplete archive, must not borrow one of these two classes.
+    (re.compile(r"node collection timed out", re.I), "node-timeout"),
+    (
+        re.compile(r"missing manifest|no manifest\.jsonl", re.I),
+        "node-archive-missing-manifest",
+    ),
     (re.compile(r"no usable node archive|invalid or unreadable archive", re.I), "node-archive-unusable"),
     (re.compile(r"python 3\.11", re.I), "node-python-unsupported"),
     (re.compile(r"skip-logs", re.I), "var-log-skipped"),
@@ -85,8 +90,12 @@ ERROR_CLASSES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"cluster collection exited (?P<code>\d+)"), "cluster-partial:{code}"),
     (re.compile(r"prometheus collection exited (?P<code>\d+)"), "prometheus-partial:{code}"),
     (
-        re.compile(r"node (?P<alias>\S+) \((?P<target>[^)]+)\)"),
-        "node-partial:{alias}:{target}",
+        # The node's own exit code is part of the compared status, not prose:
+        # only the wording around it is allowed to differ.
+        re.compile(
+            r"node (?P<alias>\S+) \((?P<target>[^)]+)\) collector exited (?P<code>\d+)"
+        ),
+        "node-partial:{alias}:{target}:{code}",
     ),
     (re.compile(r"redaction failed"), "redaction-failed"),
     (
@@ -462,21 +471,26 @@ def _manifest_contract(
 
 def _redaction_contract(
     payload: bytes, substitutions: list[tuple[re.Pattern[str], str]]
-) -> dict[str, str]:
-    """redactions.log as a per-file mapping: order follows each tree walk."""
+) -> dict[str, list[str]]:
+    """redactions.log as a per-file mapping: order follows each tree walk.
 
-    mapping: dict[str, str] = {}
+    Every logged result is kept, not just the last one for a path: a file logged
+    twice on one side and once on the other is a real difference, and a mapping
+    that overwrote would swallow it.  Only the line order is ignored.
+    """
+
+    mapping: dict[str, list[str]] = {}
     for line in payload.decode("utf-8", "replace").splitlines():
         if not line.strip():
             continue
         path, _, detail = line.partition(": ")
-        mapping[_normalize(path, substitutions)] = detail
-    return mapping
+        mapping.setdefault(_normalize(path, substitutions), []).append(detail)
+    return {path: sorted(details) for path, details in mapping.items()}
 
 
 def _environment_fields(
     body: str, substitutions: list[tuple[re.Pattern[str], str]]
-) -> dict[str, str]:
+) -> dict[str, object]:
     """environment.txt as a mapping, minus the candidate's documented additions.
 
     The candidate records more than the reference (node invocation identifiers,
@@ -485,12 +499,22 @@ def _environment_fields(
     escape review.
     """
 
-    fields: dict[str, str] = {}
+    fields: dict[str, object] = {}
+    other: list[str] = []
     for line in body.splitlines():
         key, separator, value = line.partition("=")
-        if not separator or CANDIDATE_ENVIRONMENT_KEYS.fullmatch(key):
+        if not separator:
+            # Not a field at all.  Collected rather than dropped, so a stray line
+            # fails the comparison instead of vanishing from it; line order is
+            # ignored because the candidate's extra keys move everything down.
+            if line.strip():
+                other.append(_normalize(line, substitutions))
+            continue
+        if CANDIDATE_ENVIRONMENT_KEYS.fullmatch(key):
             continue
         fields[key] = _normalize(value, substitutions)
+    if other:
+        fields["<non-field lines>"] = sorted(other)
     return fields
 
 

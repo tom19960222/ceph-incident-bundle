@@ -1188,7 +1188,10 @@ def _collect_var_logs(
         (output / "SKIPPED.txt").write_text(
             f"SKIPPED: {root} is not a directory\n", encoding="utf-8"
         )
-        return VarLogResult(0, frozenset())
+        # The marker is written in full, but the evidence it stands for is not
+        # here, so ADR 0010 forbids indexing it as complete.  Like the reference,
+        # a node without `/var/log` is not partial.
+        return VarLogResult(0, frozenset({"SKIPPED.txt"}))
 
     incomplete: set[str] = set()
     index_lines = [INDEX_HEADER]
@@ -1690,7 +1693,9 @@ def _discard_log_payload(output: Path) -> None:
     (output / "PAYLOAD-BYTES.txt").unlink(missing_ok=True)
 
 
-def _collect_journal(output: Path, config: NodeConfig) -> JournalResult:
+def _collect_journal(
+    output: Path, config: NodeConfig, var_log_exit_code: int
+) -> JournalResult:
     journal = output / "journal-all-since.txt"
     if (output / "OVER-LIMIT.txt").exists():
         _write_log_skip(
@@ -1700,6 +1705,13 @@ def _collect_journal(output: Path, config: NodeConfig) -> JournalResult:
         return JournalResult(2, INCOMPLETE_ARTIFACT_EXIT_CODE, None, None, None)
     payload_path = output / "PAYLOAD-BYTES.txt"
     if config.var_log_max_bytes is not None and not payload_path.is_file():
+        if var_log_exit_code == 0:
+            # No accounting because there was no `/var/log` to account for: the
+            # reference spends no journal budget here, collects no journal and
+            # stays complete (`lib/collect-node.sh`, the final `elif`).  Failing
+            # closed instead would report a partial node the reference calls
+            # complete.
+            return JournalResult(0, 0, None, None, None)
         _write_log_skip(journal, "/var/log payload accounting was unavailable")
         return JournalResult(2, INCOMPLETE_ARTIFACT_EXIT_CODE, None, None, None)
     payload_bytes = 0
@@ -1890,7 +1902,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 config.host_alias,
                 skipped,
                 "collect-var-log /var/log",
-                0,
+                # ADR 0010: the marker is complete, the evidence it stands for is
+                # absent — deliberately here, but absent all the same.
+                INCOMPLETE_ARTIFACT_EXIT_CODE,
                 started,
                 _utc_now(),
             )
@@ -1898,7 +1912,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
             root = _node_path("CEPH_INCIDENT_VAR_LOG_DIR", "/var/log")
             log_started = _utc_now()
             log_result = _collect_var_logs(root, log_output, config)
-            journal_result = _collect_journal(log_output, config)
+            journal_result = _collect_journal(
+                log_output, config, log_result.exit_code
+            )
             log_exit = log_result.exit_code
             if journal_result.node_exit_code != 0:
                 log_exit = 2
