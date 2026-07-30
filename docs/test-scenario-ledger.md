@@ -58,7 +58,7 @@
 | C18 | `run_capture` 成功路徑：artifact 首行 `# host: ...` … | ported | `test_python_collect_ceph.CollectDirectCephCliTests.test_direct_ceph_manifest_records_every_capture` | — |
 | C19 | `run_capture` 失敗路徑：回傳指令的非 0 碼（7）、輸出仍寫入 artifa… | ported | `test_python_collect_ceph.DirectCephFailureSemanticsTests.test_failed_required_command_is_partial_and_keeps_other_evidence` | — |
 | C20 | `run_capture` 缺 `--` 分隔符 → 致命錯誤並說明 | not-ported | `--` 呼叫慣例是 shell API 細節 | — |
-| C21 | `run_capture` 以預設 20s timeout 包住指令，artifact 標… | ported | `test_python_collect_ceph.DirectCephFailureSemanticsTests.test_timed_out_command_is_truncated_and_writes_ssh_debug`<br>`test_python_collect_prometheus.PrometheusQueryShapeTests.test_the_command_timeout_bounds_every_request` | — |
+| C21 | `run_capture` 以預設 20s timeout 包住指令，artifact 標… | ported | `test_python_collect_cli.CollectCliContractTests.test_timeout_defaults_match_the_shell_reference`（預設 20s）<br>`test_python_collect_ceph.CollectDirectCephCliTests.test_direct_ceph_seed_collects_json_and_text_evidence`（`# timeout:` 標頭）<br>`test_python_collect_ceph.DirectCephFailureSemanticsTests.test_timed_out_command_is_truncated_and_writes_ssh_debug`<br>`test_python_collect_prometheus.PrometheusQueryShapeTests.test_the_command_timeout_bounds_every_request` | — |
 | C22 | artifact 檔名以 `-` 開頭仍可正確建立 | not-ported | 以 `-` 開頭的檔名是 shell 重導陷阱；`open()` 無此問題 | — |
 | C23 | `run_capture` 不改變呼叫端 errexit 狀態 | not-ported | `errexit` 狀態是純 bash 語意 | — |
 
@@ -225,11 +225,15 @@ inventory 的 138 個情境現在只剩兩種狀態：128 個 ported、10 個分
 
 ## Gate 宣告（2026-07-30）
 
-#18 的 offline observable-contract equivalence gate 在此宣告通過，範圍與依據：
+#18 的 offline observable-contract equivalence gate 在此宣告通過。宣告的範圍就是
+它證明的範圍，以下逐條寫明證到哪裡：
 
-- 138 個情境逐項結案，`tests/test_python_scenario_ledger.py` 機械檢查 ID 與
-  inventory 一致、每個 `ported` 指向的 test class 與 **method** 都存在、
-  `not-ported` 正好是 inventory 的十項實作細節。
+- 138 個情境全部有狀態（128 ported、10 not-ported），
+  `tests/test_python_scenario_ledger.py` 機械檢查 ID 與 inventory 一致、每個
+  `ported` 指向的 test class 與 **method** 都存在且通過、`not-ported` 正好是
+  inventory 的十項實作細節。**這個檢查證明的是「指向的測試存在且通過」**，不是
+  「該測試斷言了該列的每個子句」；後者由宣告前的雙軸 review 抽查，抽到不足的
+  C9、C12、C21、B4–B8 已當場補強，其餘逐列稽核見 #42。
 - 13 個 differential scenarios 在同一個 fake world 雙跑，`make validate` 離線
   可重複全綠（shell suite、Python suite、differential suite、Python 3.11 gate、
   shellcheck）。
@@ -238,4 +242,7 @@ inventory 的 138 個情境現在只剩兩種狀態：128 個 ported、10 個分
 - 宣告的是**工作機端** observable contract equivalence。node evidence surface
   的等價性是由 N 系列黑箱測試「斷言」，不是由 shell／Python 雙跑「證明」；
   依 ADR 0010，node manifest 的涵蓋範圍本來就刻意與 shell 不同。
+- 唯一未結的裁定是 `--skip-logs` marker 的 `exit_code`（等 #8）。它不影響本宣告：
+  node manifest 在 differential run 內來自共用的 canned archive，兩邊逐位元組
+  相同，不在被比較的差異面內。
 - real-lab qualification（#20）尚未執行，因此仍不可宣稱 qualification-ready。

@@ -430,10 +430,12 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
                 skipped = archive.extractfile(prefix + "SKIPPED.txt")
                 self.assertIsNotNone(skipped)
                 self.assertIn(b"disabled by --skip-logs", skipped.read())
-                # ADR 0010: the marker is written in full, but the evidence it
-                # stands for is absent, so its entry cannot claim completeness.
+                # Pinned, not endorsed: whether an operator-declined collection
+                # is indexed as complete evidence is open with #8.  An absent
+                # `/var/log` is a different case and is indexed as incomplete —
+                # see `test_an_absent_var_log_is_indexed_as_missing_evidence`.
                 self.assertEqual(
-                    self.var_log_manifest_exit_codes(archive), {"SKIPPED.txt": 2}
+                    self.var_log_manifest_exit_codes(archive), {"SKIPPED.txt": 0}
                 )
 
     def test_an_absent_var_log_is_indexed_as_missing_evidence(self) -> None:

@@ -1402,13 +1402,13 @@ def _collect(arguments: Sequence[str]) -> int:
             node_results.append((inventory_node, result))
             if result.reason is not None:
                 with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
-                    # The reference records the node's own exit code here, so a
-                    # reader can tell one failed node from another without
-                    # opening the bundle; the reason is the detail behind it.
+                    # The reference records the code this node collection
+                    # reported, so a reader can tell a node that never answered
+                    # from one that answered partially; the reason is the detail.
                     errors.write(
                         f"node {inventory_node.host_alias} "
                         f"({inventory_node.target}) collector exited "
-                        f"{result.exit_code}: {result.reason}\n"
+                        f"{result.reported_exit_code}: {result.reason}\n"
                     )
         progress("redacting collected evidence" if options["redact"] else "checking collected evidence")
         content_safety_complete = _run_content_safety(

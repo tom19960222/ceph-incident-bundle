@@ -1902,9 +1902,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 config.host_alias,
                 skipped,
                 "collect-var-log /var/log",
-                # ADR 0010: the marker is complete, the evidence it stands for is
-                # absent — deliberately here, but absent all the same.
-                INCOMPLETE_ARTIFACT_EXIT_CODE,
+                # Left at 0 on purpose: unlike an absent `/var/log`, this is the
+                # operator declining the evidence, and ADR 0010 does not
+                # enumerate that case.  Raised with #8; do not change it here.
+                0,
                 started,
                 _utc_now(),
             )

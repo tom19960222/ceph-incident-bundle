@@ -171,6 +171,12 @@ class CollectionInterrupted(Exception):
 class NodeCollectionResult:
     exit_code: int
     remote_exit_code: int
+    # The code this node collection reports to the run, which is what the
+    # reference records in `errors.log`.  It is neither of the two above: the
+    # reference passes the remote or transport code straight through, except
+    # that a timeout and an unusable archive from a successful remote both
+    # become 2 (`run/collect.sh`, `collect_remote_node`).
+    reported_exit_code: int
     accepted: bool
     reason: str | None
     invocation_id: str
@@ -1720,7 +1726,7 @@ def collect_single_node(
             candidate.unlink(missing_ok=True)
             reason = f"node transport is unavailable: {command[0]}: command not found"
             _write_skipped(destination, reason)
-            return NodeCollectionResult(2, 127, False, reason, invocation_id)
+            return NodeCollectionResult(2, 127, 127, False, reason, invocation_id)
         try:
             _, stderr = process.communicate(input=node_source, timeout=node_timeout)
         except subprocess.TimeoutExpired:
@@ -1738,7 +1744,9 @@ def collect_single_node(
                 known_hosts_file=known_hosts_file,
             )
             _write_skipped(destination, reason)
-            return NodeCollectionResult(2, 124, False, reason, invocation_id)
+            # The reference bounds the whole collection with `timeout` and turns
+            # its 124/137 into a plain 2 before reporting it.
+            return NodeCollectionResult(2, 124, 2, False, reason, invocation_id)
         except KeyboardInterrupt as error:
             _stop_process(process)
             candidate.unlink(missing_ok=True)
@@ -1747,6 +1755,10 @@ def collect_single_node(
     if stderr:
         sys.stderr.buffer.write(stderr)
     remote_exit_code = process.returncode
+    # An archive the workstation cannot use is a failure of the collection even
+    # when the remote said it succeeded; the reference reports it as 2 rather
+    # than as the remote's 0.
+    rejected_exit_code = remote_exit_code if remote_exit_code != 0 else 2
     if _exit_code_of(remote_exit_code) in (255, 137):
         # A transport-level failure explains itself only with a verbose probe.
         _write_node_ssh_debug_log(
@@ -1768,7 +1780,7 @@ def collect_single_node(
                 )
             _write_skipped(destination, reason)
             return NodeCollectionResult(
-                2, remote_exit_code, False, reason, invocation_id
+                2, remote_exit_code, rejected_exit_code, False, reason, invocation_id
             )
         try:
             if isinstance(var_log_max_bytes, int):
@@ -1789,24 +1801,24 @@ def collect_single_node(
             reason = f"incomplete node archive returned from {target}: missing manifest"
             _write_skipped(destination, reason)
             return NodeCollectionResult(
-                2, remote_exit_code, False, reason, invocation_id
+                2, remote_exit_code, rejected_exit_code, False, reason, invocation_id
             )
         except ArchiveRejected as error:
             reason = f"no usable node archive returned from {target}: {error}"
             _write_skipped(destination, reason)
             return NodeCollectionResult(
-                2, remote_exit_code, False, reason, invocation_id
+                2, remote_exit_code, rejected_exit_code, False, reason, invocation_id
             )
     finally:
         candidate.unlink(missing_ok=True)
 
     exit_code = 0 if remote_exit_code == 0 else 2
-    # The status itself is recorded by the caller; this is the detail behind it.
+    # The reported code is the detail; the reason says what it means.
     reason = (
         None
         if exit_code == 0
-        else f"remote collector reported partial evidence (exit {remote_exit_code})"
+        else "remote collector reported partial node evidence"
     )
     return NodeCollectionResult(
-        exit_code, remote_exit_code, True, reason, invocation_id
+        exit_code, remote_exit_code, remote_exit_code, True, reason, invocation_id
     )
