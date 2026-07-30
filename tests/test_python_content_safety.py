@@ -11,6 +11,9 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+import ceph_incident_bundle as bundle_entry
 
 from tests.test_python_collect_ceph import DirectCephFixture
 
@@ -494,6 +497,77 @@ class CollectContentSafetyTests(DirectCephFixture, unittest.TestCase):
             errors = (workdirs[0] / "errors.log").read_text(encoding="utf-8")
             self.assertIn("bundle verification failed", errors)
             self.assertEqual(list((root / "results").glob("*.tar.gz")), [])
+
+
+class RedactionFilePermissionTests(unittest.TestCase):
+    """Ledger C9 and C12: redaction rewrites evidence without widening its mode.
+
+    The end-to-end cases cannot prove preservation, because every artifact they
+    see was created by a collector that already fixes the mode at 0600.  These
+    call the redaction seam directly on evidence that arrives with a different
+    mode, which is the only way the claim is actually tested.
+    """
+
+    def _log(self, root: Path) -> Path:
+        log = root / "redactions.log"
+        log.touch()
+        return log
+
+    def test_plain_redaction_keeps_the_original_permission_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            artifact = root / "ceph.conf"
+            artifact.write_text(
+                "mon_host = 10.0.0.1\nkey = AQBn0123456789012345678901234567890123456==\n",
+                encoding="utf-8",
+            )
+            artifact.chmod(0o640)
+
+            bundle_entry._redact_plain_file(artifact, self._log(root))
+
+            self.assertEqual(artifact.stat().st_mode & 0o7777, 0o640)
+            redacted = artifact.read_text(encoding="utf-8")
+            self.assertIn("[REDACTED]", redacted)
+            self.assertIn("mon_host = 10.0.0.1", redacted)
+
+    def test_compressed_redaction_keeps_the_original_permission_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            artifact = root / "ceph.log.gz"
+            artifact.write_bytes(
+                gzip.compress(b"safe evidence\nsecret = must-not-leak\n", mtime=0)
+            )
+            artifact.chmod(0o640)
+
+            complete = bundle_entry._redact_compressed_file(artifact, self._log(root))
+
+            self.assertTrue(complete)
+            self.assertEqual(artifact.stat().st_mode & 0o7777, 0o640)
+            payload = gzip.decompress(artifact.read_bytes())
+            self.assertIn(b"[REDACTED]", payload)
+            self.assertNotIn(b"must-not-leak", payload)
+
+    def test_recompress_failure_keeps_the_original_bytes_and_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            artifact = root / "ceph.log.gz"
+            original = gzip.compress(b"secret = must-not-leak\n", mtime=0)
+            artifact.write_bytes(original)
+            artifact.chmod(0o640)
+            log = self._log(root)
+            failing_encoder = {".gz": (("gzip", "-dc", "--"), ("false",))}
+
+            with mock.patch.dict(
+                bundle_entry.COMPRESSED_CODECS, failing_encoder, clear=False
+            ):
+                complete = bundle_entry._redact_compressed_file(artifact, log)
+
+            self.assertFalse(complete)
+            self.assertEqual(artifact.read_bytes(), original)
+            self.assertEqual(artifact.stat().st_mode & 0o7777, 0o640)
+            self.assertIn("recompress failed", log.read_text(encoding="utf-8"))
+            self.assertEqual(sorted(item.name for item in root.iterdir()),
+                             ["ceph.log.gz", "redactions.log"])
 
 
 if __name__ == "__main__":

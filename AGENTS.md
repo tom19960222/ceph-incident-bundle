@@ -38,6 +38,8 @@ The non-negotiable rules are:
 `make validate` includes the offline observable-contract equivalence gate (`make test-differential`): the shell reference and the Python candidate run the same scenarios in one shared fake world and their normalized contracts are compared. Before changing either implementation or the normalizer, read:
 
 - `docs/differential-normalizer.md` — the only list of differences the gate may ignore. Widening it needs the same review as changing behaviour.
-- `docs/test-scenario-ledger.md` — which shell scenario each Python test covers, and which are still blocked.
+- `docs/test-scenario-ledger.md` — which shell scenario each Python test covers, plus the gate declaration and its exact scope.
 
-The differential gate compares the workstation side: both implementations receive the same canned Node Evidence Archive, so it says nothing about the node collector's own evidence surface. That surface is fully ported (#36) and its equivalence rests on the ledger's N-series black-box tests (`tests/test_python_collect_node.py`) instead. Real-lab qualification (#20) has not run, so do not claim the candidate is qualification-ready.
+The gate was declared passed on 2026-07-30 for the workstation-side contract (#18). That declaration is not qualification: it says the two implementations agree offline, nothing about a real lab.
+
+The differential gate compares the workstation side: both implementations receive the same canned Node Evidence Archive, so it says nothing about the node collector's own evidence surface. That surface is fully ported (#36), but its equivalence is *asserted* by the ledger's N-series black-box tests (`tests/test_python_collect_node.py`) — hand-written against the shell contract — not *demonstrated* by a shell-versus-Python comparison; ADR 0010 also makes the node manifest deliberately diverge. Say it that way when the distinction matters. Real-lab qualification (#20) has not run, so do not claim the candidate is qualification-ready.
