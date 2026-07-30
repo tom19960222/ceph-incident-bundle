@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import mmap
 import os
 import re
@@ -54,7 +55,8 @@ DEFAULT_ROOK_NAMESPACE = "rook-ceph"
 
 USAGE = """Usage:
   ceph_incident_bundle.py collect --inventory PATH --ssh-key PATH [options]
-    [--seed USER@HOST] [--mode auto|cephadm|rook] [--since RANGE]
+    [--seed USER@HOST] [--out DIR] [--mode auto|cephadm|rook] [--since RANGE]
+    [--timeout SECONDS] [--node-timeout SECONDS]
     [--skip-logs] [--keep-original-logs]
     [--var-log-max-bytes BYTES|unlimited]
     [--trust-ssh-host-key|--no-trust-ssh-host-key]
@@ -157,7 +159,9 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
     values: dict[str, object] = {
         "out": Path(__file__).resolve().parent / "results",
         "timeout": 20,
-        "node_timeout": 300,
+        # Same defaults as the shell reference: a per-command bound of 20s and a
+        # generous whole-node bound, so a large node is not killed mid-collection.
+        "node_timeout": 600,
         "trust_ssh_host_key": True,
         "redact": True,
         "skip_logs": False,
@@ -456,15 +460,131 @@ def _read_inventory(path: Path) -> Inventory:
     )
 
 
+README_FIRST = """Ceph incident bundle
+
+Start with:
+- summary.txt
+- errors.log
+- cluster/
+- nodes/
+
+This bundle is read-only evidence captured at incident time. Review it before \
+sharing outside your team.
+"""
+
+
 def _write_initial_bundle_files(workdir: Path) -> None:
     (workdir / "cluster").mkdir(mode=0o700)
     (workdir / "nodes").mkdir(mode=0o700)
-    (workdir / "README-FIRST.txt").write_text(
-        "Operationally read-only incident evidence. Review errors.log and summary.txt.\n",
-        encoding="utf-8",
-    )
+    (workdir / "README-FIRST.txt").write_text(README_FIRST, encoding="utf-8")
     (workdir / "manifest.jsonl").touch(mode=0o600)
     (workdir / "errors.log").touch(mode=0o600)
+
+
+CATALOG_PREAMBLE = """# Bundle contents
+
+Read-only Ceph incident evidence. Below is what each file is, and — for \
+captured commands — the exact command and exit code that produced it (from the \
+manifest.jsonl files).
+
+## Top-level
+
+- `README-FIRST.txt` — start here
+- `summary.txt` — run summary (mode, seed, nodes ok/failed, final exit code)
+- `environment.txt` — when/mode/seed/git commit + chosen ceph_source / \
+ceph_runner / rook_source
+- `manifest.jsonl` — machine-readable: one JSON line per captured command
+- `errors.log` — commands that returned non-zero, or nodes that failed
+- `redactions.log` — per-file count of lines redacted
+- `CONTENTS.md` — this file
+
+## Cluster-level commands (cluster/)
+
+"""
+CATALOG_TABLE_HEADER = "| exit | file | command |\n|---|---|---|\n"
+
+
+def _catalog_rows(manifest: Path, base: Path, prefix: str = "") -> str:
+    """Render one manifest as `| exit | file | command |` rows.
+
+    Artifact paths are made bundle-relative: a workstation capture is relative to
+    the bundle root, and a node capture's remote `…/out/<rel>` path becomes
+    `nodes/<alias>/<rel>`, so a reader can find the file the row describes.
+    """
+
+    if not manifest.is_file():
+        return ""
+    rows = []
+    for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        artifact = str(entry.get("artifact", ""))
+        if not artifact:
+            continue
+        if artifact.startswith(f"{base}/"):
+            relative = artifact[len(str(base)) + 1 :]
+        elif "/out/" in artifact:
+            relative = prefix + artifact.rsplit("/out/", 1)[1]
+        else:
+            relative = artifact
+        command = str(entry.get("command", "")).replace("|", "\\|")
+        rows.append(f"| {entry.get('exit_code')} | `{relative}` | `{command}` |\n")
+    return "".join(rows)
+
+
+def _write_bundle_catalog(workdir: Path) -> None:
+    """Write the human-readable index the bundle contract requires."""
+
+    sections = [CATALOG_PREAMBLE, CATALOG_TABLE_HEADER]
+    sections.append(_catalog_rows(workdir / "manifest.jsonl", workdir))
+    nodes = workdir / "nodes"
+    node_directories = (
+        sorted(item for item in nodes.iterdir() if item.is_dir())
+        if nodes.is_dir()
+        else []
+    )
+    for node_directory in node_directories:
+        alias = node_directory.name
+        sections.append(f"\n## Node: {alias} (nodes/{alias}/)\n\n")
+        node_manifest = node_directory / "manifest.jsonl"
+        if node_manifest.is_file():
+            sections.append(CATALOG_TABLE_HEADER)
+            sections.append(
+                _catalog_rows(node_manifest, node_directory, f"nodes/{alias}/")
+            )
+            if (node_directory / "logs" / "var-log" / "INDEX.tsv").is_file():
+                sections.append(
+                    f"\n- `nodes/{alias}/logs/var-log/INDEX.tsv` — source-to-family "
+                    "map, codec, sizes, and merge/raw/skip disposition for "
+                    "`/var/log`.\n"
+                )
+        else:
+            sections.append(
+                f"Not collected — see `nodes/{alias}/SKIPPED.txt`.\n"
+            )
+    (workdir / "CONTENTS.md").write_text("".join(sections), encoding="utf-8")
+
+
+def _collector_commit() -> str:
+    """The collector revision this bundle came from, or `unknown` offline."""
+
+    repository = str(Path(__file__).resolve().parent)
+    try:
+        completed = subprocess.run(
+            ["git", "-C", repository, "rev-parse", "--short", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    revision = completed.stdout.decode("utf-8", "replace").strip()
+    return revision if completed.returncode == 0 and revision else "unknown"
 
 
 def _write_cluster_skip_once(workdir: Path, layer: str, reason: str) -> None:
@@ -1045,11 +1165,11 @@ def _rewrite_summary_final_status(workdir: Path, final_status: int) -> None:
     if not summary.is_file():
         return
     lines = summary.read_text(encoding="utf-8").splitlines()
-    replacement = f"final_status={final_status}"
+    replacement = f"final_status: {final_status}"
     rewritten = [
-        replacement if line.startswith("final_status=") else line for line in lines
+        replacement if line.startswith("final_status:") else line for line in lines
     ]
-    if not any(line.startswith("final_status=") for line in lines):
+    if not any(line.startswith("final_status:") for line in lines):
         rewritten.append(replacement)
     temporary = workdir / ".summary.txt.tmp"
     temporary.write_text(
@@ -1185,9 +1305,6 @@ def _collect(arguments: Sequence[str]) -> int:
                 runner=ceph_runner,
             )
             ceph_done = True
-            if ceph_status != 0:
-                with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
-                    errors.write(f"cluster collection exited {ceph_status}\n")
         rook_status: int | None = None
         rook_done = False
         if want_rook and rook_source:
@@ -1206,9 +1323,6 @@ def _collect(arguments: Sequence[str]) -> int:
                 allow_skip=mode == "auto",
             )
             rook_done = (workdir / "cluster" / "rook" / "pods-wide.txt").is_file()
-            if rook_status != 0:
-                with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
-                    errors.write(f"rook collection exited {rook_status}\n")
         missing_cluster_source = False
         if mode == "cephadm" and not ceph_done:
             _write_cluster_skip_once(
@@ -1232,6 +1346,16 @@ def _collect(arguments: Sequence[str]) -> int:
                     workdir, "rook", "no kubectl-capable node in inventory (auto)"
                 )
             missing_cluster_source = not ceph_done and not rook_done
+
+        # One annotation for the whole cluster stage, as the reference records it:
+        # a partial layer, or a source that was never found, both land here while
+        # the layer's own SKIPPED.txt names which one it was.
+        cluster_exit_code = (
+            2 if ceph_status or rook_status or missing_cluster_source else 0
+        )
+        if cluster_exit_code != 0:
+            with (workdir / "errors.log").open("a", encoding="utf-8") as errors:
+                errors.write(f"cluster collection exited {cluster_exit_code}\n")
 
         prometheus: PrometheusCollectionResult | None = None
         if prom_url:
@@ -1299,9 +1423,6 @@ def _collect(arguments: Sequence[str]) -> int:
         prometheus_status = prometheus.exit_code if prometheus is not None else None
         node_ok = sum(result.exit_code == 0 for _, result in node_results)
         node_failed = len(node_results) - node_ok
-        cluster_exit_code = (
-            2 if ceph_status or rook_status or missing_cluster_source else 0
-        )
         exit_code = (
             2
             if (
@@ -1323,6 +1444,7 @@ def _collect(arguments: Sequence[str]) -> int:
             f"seed={ceph_seed}",
             f"since={options['since']}",
             f"timeout={options['timeout']}",
+            f"git_commit={_collector_commit()}",
             f"ceph_source={ceph_source or '<none>'}",
             f"ceph_runner={ceph_runner or '<none>'}",
             f"rook_source={rook_source or '<none>'}",
@@ -1335,12 +1457,13 @@ def _collect(arguments: Sequence[str]) -> int:
                 ]
             )
         summary = [
-            f"created_utc={created}",
-            f"mode={mode}",
-            f"seed={ceph_seed}",
-            f"cluster_status={cluster_exit_code}",
-            f"node_ok={node_ok}",
-            f"node_failed={node_failed}",
+            "Ceph incident bundle summary",
+            f"created_utc: {created}",
+            f"mode: {mode}",
+            f"seed: {ceph_seed}",
+            f"cluster_status: {cluster_exit_code}",
+            f"node_ok: {node_ok}",
+            f"node_failed: {node_failed}",
         ]
         if rook_status is not None:
             environment.extend(
@@ -1359,13 +1482,14 @@ def _collect(arguments: Sequence[str]) -> int:
                         f"prom_jobs={' '.join(prometheus.jobs_matched) or '<none>'}",
                     ]
                 )
-        summary.append(f"final_status={exit_code}")
+        summary.append(f"final_status: {exit_code}")
         (workdir / "environment.txt").write_text(
             "".join(f"{line}\n" for line in environment), encoding="utf-8"
         )
         (workdir / "summary.txt").write_text(
             "".join(f"{line}\n" for line in summary), encoding="utf-8"
         )
+        _write_bundle_catalog(workdir)
         progress("verifying collected evidence")
         _verify_bundle_path(workdir)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

@@ -7,7 +7,9 @@
 ## Contract Sources
 
 - `docs/behavior-contract.md` 是現有 shell observable behaviour 的逐項基準。
-- `docs/test-scenario-inventory.md` 是測試移植 ledger：共 137 個 shell scenarios，其中 127 個 behaviour-bearing scenarios 必須有 Python coverage；10 個 shell implementation details（R1、R2、R7、C1、C2、C20、C22、C23、P4、P8）不照搬。
+- `docs/test-scenario-inventory.md` 是 shell scenario 盤點：共 138 個 shell scenarios（原始盤點 137 個，#15 之後補入 `P6a`），其中 128 個 behaviour-bearing scenarios 必須有 Python coverage；10 個 shell implementation details（R1、R2、R7、C1、C2、C20、C22、C23、P4、P8）不照搬。
+- `docs/test-scenario-ledger.md` 是逐項覆蓋對照：每個情境指向覆蓋它的 Python test，或指向未移植／blocked 的理由；由 `tests/test_python_scenario_ledger.py` 機械檢查。
+- `docs/differential-normalizer.md` 是 offline differential gate 的 normalizer 合約：明列共享 fake world 的組成、被比較的 observable contract 與被批准忽略的非語意差異。
 - `CONTEXT.md` 與 `docs/adr/` 定義 domain language 與已鎖定的設計決策。
 - `docs/read-only-safety.md` 定義 operationally read-only contract 與 proof obligations。
 - `docs/lab-validation-runbook.md` 定義 agent-friendly、fail-closed 的 lab workflow。
@@ -38,14 +40,20 @@ Rook 只在明確指定 `--kube-mode` 時收集，這和 #13 的 Ceph 層只在�
 
 #17 在公開入口加入單一、可獨立移除的 Content Safety seam，忠實保留 `--redact`／`--no-redact` 的預設與後出現者生效語意、text 與 gz／xz／bz2／zst 壓縮 evidence 的行級遮蔽、permission mode、解壓／重壓失敗 disposition、Prometheus metric dump 與 node raw opaque evidence 排除，以及 redaction 後的 per-node log cap。壓縮 evidence 的展開量受明確 ceiling 與本機可用空間 headroom 約束；超限時會終止並等待 decoder、保留原 artifact、留下 `NOT redacted` 記錄並使 bundle partial，不會先耗盡 collector workspace。`Verify` 仍把長期 Structural Verification 與暫時的 secret path／content scan 分開：目錄與封存檔都檢查必要 metadata、cluster/node evidence、路徑與 member type／collision／hierarchy、payload ceiling、gzip／tar 完整性及 tar end markers；封存檔先以 no-follow、有限大小的私有 snapshot 固定輸入，再由兩種檢查讀取同一份 bytes。公開 `collect` 在 packaging 前驗 workdir、packaging 後驗 archive；任一驗證失敗都保留可診斷 workdir、把 final status 改為 fatal，並移除或不發布 archive。離線黑箱案例覆蓋 redaction modes、所有支援 codec 與失敗處置、opaque／Prometheus exclusion、post-redaction cap、secret path／content、malicious／truncated archive 與雙階段驗證失敗。
 
+#18 建立 offline observable-contract equivalence gate：`make test-differential`（已納入 `make validate`）讓 shell reference 與 Python candidate 在同一個 fake world 執行 13 個代表性 scenario——cephadm／direct、runner fallback、單一 Ceph 指令失敗、Rook remote／local、auto 無來源、Prometheus enabled／disabled、node partial／archive 無 manifest、node timeout、content-safety redact／no-redact、verify 失敗與 SIGINT cleanup，其中兩個 mixed full collection 一次涵蓋 Ceph、Rook、Prometheus、兩個 node 與 `/var/log`。兩邊共用同一組 fake executables（fake `ssh` 同時服務 shell 的 `collect-node.sh` 與 Python 的 stdin bootstrap）、同一份 inventory、同一組 scenario knobs 與 payload limits，以及同一份 Node Evidence Archive；normalizer 只忽略 `docs/differential-normalizer.md` 明列並附理由的非語意差異，其餘 artifacts、status、manifest、command policy 與 lifecycle 差異都會讓 gate 失敗。`docs/test-scenario-ledger.md` 逐項對照 inventory 的每個情境與覆蓋它的 Python test，並由 `tests/test_python_scenario_ledger.py` 機械檢查。
+
+這個 gate 找出並修正的 contract gaps：candidate 原本缺 `CONTENTS.md`、`environment.txt` 缺 `git_commit`、`summary.txt` 與 `README-FIRST.txt` 格式與 reference 不同、cluster 層 partial 時 `errors.log` 少一筆彙總紀錄、node timeout／transport 失敗時沒有留下 `ssh-debug` log、usage 未列出 `--out`／`--timeout`／`--node-timeout`。這些都已修正並納入比較。
+
+Gate 的覆蓋邊界要誠實記錄：fake `ssh` 站在 SSH 邊界，因此 differential 比較的是工作機端契約；node collector 自身的 evidence surface 仍只移植了 #11 的七個 basic commands 與 #12 的 `/var/log`／journal。ledger 中 N2、N3、N4、N5、N7、N8、N9、N10、N13 因此標為 blocked，由 #36 承接——它另外牽動一個必須回到 #8 裁定的契約問題（shell 複製 `/etc` 與 `/var/lib/ceph` 設定時不寫 manifest，而 Python 的 archive acceptance 要求 manifest 與 evidence 一對一）。在 #36 完成前，只能宣稱工作機端已達 observable contract equivalence。
+
 這仍是有明確限制的 Python candidate，不是 feature-complete Collect／Verify 契約，也不是 real-lab qualification evidence。
 
 - #17 已完成 Content Safety 與完整 Structural Verification 的 Python candidate；Content Safety 尚未移除，任何移除仍須在 Python cutover 完成後另立變更。
 - #23 已修正 shell Node Evidence Archive 的 pre-extraction acceptance boundary；shell reference 仍須通過 #19／#20 的其餘 qualification gates。
 - #17 的 malicious final Incident Bundle 黑箱案例已收斂 Python Verify 對 link、special member、member collision、hierarchy、truncation 與 tar end markers 的接受邊界；#23 只處理 shell 收到 Node Evidence Archive 後、解壓前的窄幅安全邊界。
-- #18 的 offline observable-contract equivalence gate 與 #19／#20 real-lab gates 尚未完成，因此目前仍不能宣稱 feature-complete、observable-equivalent 或 qualification-ready。
+- #18 已建立 offline differential gate、normalizer 合約與 scenario ledger，並修正 gate 找出的工作機端 contract gaps；node evidence surface 的 9 個情境仍為 blocked（#36），因此仍不能宣稱整體 observable-equivalent。#19 已建立 Lab Profile、status/discovery/activation workflow 與 strict identity preflight；#20 的 dual-run full-collect gate 尚未完成，因此 real-lab qualification 仍未通過。
 
-本階段的 Python 3.11 baseline 由 Makefile 的 offline gate 在任何測試前 fail fast；#11 已完成 node runtime negotiation 與 graceful-skip seam，#12 已完成 `/var/log` forensic evidence，#13、#14 與 #15 已分別完成 direct Ceph、Rook 與 Prometheus cluster evidence，#16 已完成多 node、source/runner selection 與 multi-source orchestration，#17 已完成 Content Safety 與完整 Structural Verification。下一個 implementation blocker 是 #18 的 offline observable-contract equivalence gate；在 offline differential gate 與 real-lab gates 完成前，本 candidate 仍不可宣稱 feature-complete、observable-equivalent 或 qualification-ready。
+本階段的 Python 3.11 baseline 由 Makefile 的 offline gate 在任何測試前 fail fast；#11 已完成 node runtime negotiation 與 graceful-skip seam，#12 已完成 `/var/log` forensic evidence，#13、#14 與 #15 已分別完成 direct Ceph、Rook 與 Prometheus cluster evidence，#16 已完成多 node、source/runner selection 與 multi-source orchestration，#17 已完成 Content Safety 與完整 Structural Verification，#18 已完成 offline differential gate 與逐項 ledger。下一個 implementation blocker 是 #36 的 node evidence surface；在它與 real-lab gates 完成前，本 candidate 仍不可宣稱 feature-complete、observable-equivalent 或 qualification-ready。
 
 ## Locked Design
 
@@ -121,10 +129,10 @@ shell 的 `node_copy_file` 複製 evidence 時不寫 manifest entry，`lib/colle
 
 `make validate` 必須保持離線且可重複，包含：
 
-- 既有 shell tests（cutover 前）。
-- Python tests，涵蓋 127 個必移植情境。
-- 約 8–12 個代表性黑箱 differential scenarios。
-- Python 3.11 compatibility 與靜態檢查。
+- 既有 shell tests（cutover 前）：`make test`。
+- Python tests（含 scenario ledger 檢查）：`make test-python`；覆蓋狀態逐項見 `docs/test-scenario-ledger.md`。
+- 代表性黑箱 differential scenarios：`make test-differential`，目前 13 個（8–12 的指示範圍加一個，把 runner fallback 與 partial-capture 語意分開診斷）。
+- Python 3.11 compatibility（`make check-python`）與靜態檢查（`make shellcheck`）。
 
 ### Real-lab gate
 

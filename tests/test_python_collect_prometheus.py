@@ -510,7 +510,7 @@ class PrometheusUnavailableTests(PrometheusFixture, unittest.TestCase):
             errors = self.text_of(contents, "errors.log")
             self.assertIn("prometheus dump skipped", errors)
             self.assertIn("prometheus collection exited 2", errors)
-            self.assertIn("final_status=2", self.text_of(contents, "summary.txt"))
+            self.assertIn("final_status: 2", self.text_of(contents, "summary.txt"))
             # Only the connectivity probe runs; nothing else is attempted.
             self.assertEqual(len(self.curl_commands(curl_ledger)), 1)
             self.assert_bundle_verifies(bundle)

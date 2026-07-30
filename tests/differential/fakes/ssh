@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""The one fake ssh both the shell reference and the Python candidate talk to.
+
+Equivalence only means something when both implementations face the same remote
+world, so this adapter answers *both* remote command shapes from a single
+whitelist: the shell reference unpacks and runs `lib/collect-node.sh`, the Python
+candidate bootstraps `ceph_incident_node.py` over stdin, and every other remote
+operation (capability probe, Ceph runner probe, Ceph read command, remote
+kubectl) is byte-identical between them.
+
+Nothing is answered on argv shape alone.  The shared SSH option vector is
+matched exactly, each remote invocation must match a whitelisted shape, and
+anything else exits 99 — so a collector that grows a new command surface, a
+`cephadm shell` fallback or a `kubectl exec` fails the gate immediately instead
+of quietly diverging.  Every invocation is appended to the ledgers so the tests
+can compare the two command policies directly.
+
+This deliberately overlaps `tests/fixtures/python-ceph/bin/ssh` rather than
+sharing code with it.  That fixture serves one implementation and pins the node
+bootstrap by digest; this one has to answer both implementations' node
+invocations, and the streamed source is asserted by the differential test
+instead.  Merging them would force one adapter to be lenient about the other's
+shape, which is exactly the leniency the gate is supposed to remove.
+"""
+
+from __future__ import annotations
+
+import base64
+import gzip
+import hashlib
+import io
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tarfile
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import node_archive  # noqa: E402  (fixture-local module, resolved above)
+
+
+CEPH_RESPONSES = {
+    "status --format json-pretty": '{"health":"HEALTH_OK","fsid":"fsid-1"}',
+    "status": "cluster is healthy",
+    "health detail --format json-pretty": '{"checks":[{"severity":"HEALTH_OK"}]}',
+    "health detail": "HEALTH_OK",
+    "versions --format json-pretty": '{"mon":"19.2.3","mgr":"19.2.3"}',
+    "df detail --format json-pretty": '{"stats":{"total_bytes":100}}',
+    "osd tree --format json-pretty": '{"nodes":[{"id":0,"name":"osd.0"}]}',
+    "osd tree": "ID CLASS WEIGHT TYPE NAME STATUS",
+    "osd df --format json-pretty": '{"nodes":[{"id":0,"utilization":10}]}',
+    "osd dump --format json-pretty": '{"osds":[{"osd":0,"state":["up","in"]}]}',
+    "osd perf --format json-pretty": '{"osd_perf_infos":[{"id":0}]}',
+    "osd blocked-by --format json-pretty": '{"blocked_by":[]}',
+    "pg stat --format json-pretty": '{"pg_summary":{"num_pgs":33}}',
+    "pg dump --format json-pretty": '{"pg_map":{"version":7}}',
+    "pg dump_stuck --format json-pretty": '{"stuck":[]}',
+    "mon dump --format json-pretty": '{"mons":[{"name":"a"}]}',
+    "quorum_status --format json-pretty": '{"quorum":[0,1,2]}',
+    "mgr dump --format json-pretty": '{"active_name":"a"}',
+    "orch host ls --format json-pretty": '[{"hostname":"monitor01"}]',
+    "orch ps --format json-pretty": '[{"daemon_type":"mon"}]',
+    "orch ps": "NAME HOST STATUS",
+    "orch device ls --wide --format json-pretty": '[{"path":"/dev/sdb"}]',
+    "config dump --format json-pretty": '[{"who":"mon.a","value":"1"}]',
+}
+SECRET_CONFIG_DUMP = '[{"who":"mon.a","key":"AQBclustersecret==","value":"1"}]'
+
+# Twelve ids including the sanitisation collision pair, so both implementations
+# have to apply the same ten-crash limit and the same collision-safe naming.
+CRASH_IDS = (
+    "crash-01",
+    "crash/02",
+    "crash:02",
+    "crash-04",
+    "crash-05",
+    "crash-06",
+    "crash-07",
+    "crash-08",
+    "crash-09",
+    "crash-10",
+    "crash-11",
+    "crash-12",
+)
+
+CAPABILITY_PROBE = (
+    'caps=""; command -v cephadm >/dev/null 2>&1 && caps="$caps cephadm"; '
+    'command -v ceph >/dev/null 2>&1 && caps="$caps ceph"; '
+    'command -v kubectl >/dev/null 2>&1 && caps="$caps kubectl"; '
+    'printf "%s\\n" "$caps"'
+)
+
+IDENTITY_PATH = re.compile(r"[^-\s]\S*")
+CONNECT_TIMEOUT = re.compile(r"ConnectTimeout=[1-9][0-9]*")
+ALIVE_INTERVAL = re.compile(r"ServerAliveInterval=[1-9][0-9]*")
+KNOWN_HOSTS_FILE = re.compile(r"UserKnownHostsFile=[^\s][^\n]*")
+SSH_TARGET = re.compile(
+    r"(?:[A-Za-z0-9._%+-]+@)?(?:\[[0-9A-Fa-f:]+\]|[A-Za-z0-9._:-]+)"
+)
+
+BASE_OPTIONS = (
+    "-i",
+    IDENTITY_PATH,
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "IdentitiesOnly=yes",
+    "-o",
+    "IdentityAgent=none",
+    "-o",
+    "LogLevel=ERROR",
+    "-o",
+    CONNECT_TIMEOUT,
+    "-o",
+    ALIVE_INTERVAL,
+    "-o",
+    "ServerAliveCountMax=1",
+)
+TRUSTED_HOST_KEY_OPTIONS = (
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    KNOWN_HOSTS_FILE,
+)
+
+# The shell reference's remote node command: a mktemp'd workspace, a self-cleaning
+# trap, the streamed collector, then the archive on stdout.  Each fixed part is
+# required, so a new remote token cannot slip into the differential unnoticed.
+SHELL_NODE_PROLOGUE = (
+    'set -u; tmp=$(mktemp -d "${TMPDIR:-/tmp}/ceph-incident-node.XXXXXXXX")'
+)
+SHELL_NODE_UNPACK = 'gzip -dc | tar -xf - -C "$tmp"; out="$tmp/out"'
+SHELL_NODE_COLLECTOR = 'bash "$tmp/lib/collect-node.sh" --out "$out"'
+SHELL_NODE_EPILOGUE = 'exit "$rc"'
+SHELL_NODE_OPTIONS = re.compile(
+    r"--host-alias '(?P<alias>[^']*)' --since '(?P<since>[^']*)' "
+    r"--timeout '(?P<timeout>[^']*)' --var-log-max-bytes '(?P<cap>[^']*)'"
+    r"(?P<flags>(?: --skip-logs| --keep-original-logs)*);"
+)
+# Tokens no node invocation may carry: the read-only contract forbids privilege
+# escalation and container/Pod entry on the collected node.
+FORBIDDEN_NODE_TOKENS = ("sudo", "cephadm", "kubectl", "curl", "chmod", "systemctl")
+PYTHON_NODE_COMMAND = re.compile(r"^python3 -c ")
+
+arguments = sys.argv[1:]
+
+
+def log(path_variable: str, record: object) -> None:
+    path = os.environ.get(path_variable)
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as output:
+        output.write(json.dumps(record) + "\n")
+
+
+def reject(reason: str) -> None:
+    sys.stderr.write(f"unexpected ssh command ({reason}): {shlex.join(arguments)}\n")
+    raise SystemExit(99)
+
+
+def matches(expected: object, actual: str) -> bool:
+    if isinstance(expected, re.Pattern):
+        return expected.fullmatch(actual) is not None
+    return expected == actual
+
+
+def matches_all(expected: tuple[object, ...], actual: list[str]) -> bool:
+    return len(actual) == len(expected) and all(
+        matches(item, actual[index]) for index, item in enumerate(expected)
+    )
+
+
+def emit(payload: str, code: int = 0) -> None:
+    sys.stdout.write(payload if payload.endswith("\n") else payload + "\n")
+    raise SystemExit(code)
+
+
+def selection(variable: str, target: str) -> str | None:
+    """Look up a `key=value` scenario knob by substring match on the SSH target."""
+
+    for item in os.environ.get(variable, "").split():
+        key, _, value = item.partition("=")
+        if key and key in target:
+            return value
+    return None
+
+
+def matches_any(variable: str, target: str) -> bool:
+    return any(item in target for item in os.environ.get(variable, "").split())
+
+
+def remaining_after_base_options(argv: list[str]) -> list[str]:
+    if not matches_all(BASE_OPTIONS, argv[: len(BASE_OPTIONS)]):
+        reject("base SSH options")
+    rest = argv[len(BASE_OPTIONS) :]
+    if rest[:1] == ["-o"]:
+        if not matches_all(TRUSTED_HOST_KEY_OPTIONS, rest[:4]):
+            reject("host key options")
+        rest = rest[4:]
+    return rest
+
+
+def serve_debug_probe(rest: list[str]) -> None:
+    if not matches_all(("-vvv", "-o", "LogLevel=DEBUG3", SSH_TARGET, "true"), rest):
+        reject("debug probe argv")
+    sys.stdout.write("debug1: fake verbose ssh probe\ndebug3: fake verbose detail\n")
+    sys.stderr.write("debug1: connection closed by fixture\n")
+    raise SystemExit(255)
+
+
+def serve_capability_probe(target: str) -> None:
+    # Capabilities are comma-joined in the knob so one target can advertise
+    # several without colliding with the space-separated knob grammar.
+    emit((selection("FAKE_CAPS", target) or "").replace(",", " "))
+
+
+def serve_ceph_probe(runner: list[str], target: str) -> None:
+    if runner == ["ceph"]:
+        if matches_any("FAKE_CEPH_DIRECT_FAIL_TARGETS", target):
+            raise SystemExit(17)
+        raise SystemExit(0)
+    if runner == ["sudo", "-n", "ceph"]:
+        if matches_any("FAKE_CEPH_SUDO_FAIL_TARGETS", target):
+            raise SystemExit(17)
+        raise SystemExit(0)
+    # `sudo -n cephadm shell -- ceph` lands here: default-off means unreachable.
+    reject("ceph runner probe")
+
+
+def serve_ceph(words: list[str]) -> None:
+    remote = " ".join(words)
+
+    if matches_any("FAKE_CEPH_CONNECT_FAIL_COMMANDS", remote):
+        sys.stderr.write("ssh: connect to host port 22: Connection refused\n")
+        raise SystemExit(255)
+    fail_on = os.environ.get("FAKE_CEPH_FAIL_ON")
+    if fail_on and fail_on in remote:
+        sys.stderr.write(f"simulated failure for {fail_on}\n")
+        raise SystemExit(17)
+    if remote == "config dump --format json-pretty" and os.environ.get(
+        "FAKE_CEPH_SECRET_CONFIG"
+    ):
+        emit(SECRET_CONFIG_DUMP)
+    if remote in CEPH_RESPONSES:
+        emit(CEPH_RESPONSES[remote])
+    if remote == "crash ls --format json-pretty":
+        if os.environ.get("FAKE_CEPH_CRASH_LS_BROKEN"):
+            emit("{not-json")
+        emit(json.dumps([{"crash_id": item} for item in CRASH_IDS], indent=2))
+    if remote.startswith("crash info "):
+        crash_id = remote.removeprefix("crash info ")
+        if crash_id in CRASH_IDS[:10]:
+            emit(json.dumps({"crash_id": crash_id, "detail": f"detail for {crash_id}"}))
+    reject("remote ceph command is not whitelisted")
+
+
+def serve_kubectl(words: list[str]) -> None:
+    kubectl = os.environ.get("FAKE_KUBECTL_BIN")
+    if not kubectl:
+        # A node without kubectl: the transport succeeds and the remote shell
+        # reports the missing command, exactly as OpenSSH would relay it.
+        sys.stderr.write("bash: kubectl: command not found\n")
+        raise SystemExit(127)
+    os.execv(kubectl, [kubectl, *words])
+
+
+def read_stdin() -> bytes:
+    stream = getattr(sys.stdin, "buffer", None)
+    if stream is None:
+        return b""
+    return stream.read()
+
+
+def node_request(implementation: str, options: dict[str, object], stdin: bytes) -> None:
+    """Answer one node collection, logging what each implementation asked for."""
+
+    alias = str(options["host_alias"])
+    record = {
+        "implementation": implementation,
+        "host_alias": alias,
+        "since": options["since"],
+        "command_timeout": options["command_timeout"],
+        "var_log_max_bytes": options["var_log_max_bytes"],
+        "skip_logs": options["skip_logs"],
+        "keep_original_logs": options["keep_original_logs"],
+        "payload_sha256": hashlib.sha256(stdin).hexdigest(),
+        "payload_members": node_payload_members(stdin),
+    }
+    log("FAKE_NODE_LEDGER", record)
+
+    sleep_for = selection("FAKE_NODE_SLEEPS", alias)
+    if sleep_for:
+        time.sleep(float(sleep_for))
+    case = selection("FAKE_NODE_CASES", alias) or "normal"
+    sys.stdout.buffer.write(
+        node_archive.node_archive_bytes(
+            alias, skip_logs=bool(options["skip_logs"]), case=case
+        )
+    )
+    sys.stdout.buffer.flush()
+    raise SystemExit(int(selection("FAKE_NODE_EXITS", alias) or 0))
+
+
+def node_payload_members(stdin: bytes) -> list[str]:
+    """Name what was streamed to the node: tar members, or a single source file."""
+
+    try:
+        with tarfile.open(fileobj=io.BytesIO(gzip.decompress(stdin)), mode="r") as tar:
+            return sorted(member.name for member in tar.getmembers())
+    except (OSError, tarfile.TarError, EOFError):
+        return ["<python-node-source>"]
+
+
+def shell_node_options(remote_command: str) -> "re.Match[str] | None":
+    """Recognise the shell reference's node invocation, or nothing."""
+
+    if not remote_command.startswith(SHELL_NODE_PROLOGUE):
+        return None
+    for required in (SHELL_NODE_UNPACK, SHELL_NODE_COLLECTOR):
+        if required not in remote_command:
+            reject(f"node remote command is missing {required!r}")
+    if not remote_command.endswith(SHELL_NODE_EPILOGUE):
+        reject("node remote command epilogue")
+    for token in FORBIDDEN_NODE_TOKENS:
+        if token in remote_command:
+            reject(f"node remote command contains {token!r}")
+    match = SHELL_NODE_OPTIONS.search(remote_command)
+    if match is None:
+        reject("node collector options")
+    return match
+
+
+def serve_shell_node(match: "re.Match[str]") -> None:
+    flags = match.group("flags").split()
+    node_request(
+        "shell",
+        {
+            "host_alias": match.group("alias"),
+            "since": match.group("since"),
+            "command_timeout": int(match.group("timeout")),
+            "var_log_max_bytes": _cap(match.group("cap")),
+            "skip_logs": "--skip-logs" in flags,
+            "keep_original_logs": "--keep-original-logs" in flags,
+        },
+        read_stdin(),
+    )
+
+
+def serve_python_node(remote_command: str) -> None:
+    try:
+        words = shlex.split(remote_command)
+    except ValueError:
+        reject("unparseable remote command")
+    if len(words) != 4 or words[:2] != ["python3", "-c"]:
+        reject("node bootstrap remote command")
+    padding = "=" * (-len(words[3]) % 4)
+    try:
+        config = json.loads(base64.urlsafe_b64decode(words[3] + padding))
+        if not isinstance(config, dict):
+            raise TypeError
+    except (ValueError, TypeError):
+        reject("node bootstrap configuration")
+    log(
+        "FAKE_BOOTSTRAP_LEDGER",
+        {
+            "source_sha256": hashlib.sha256(words[2].encode()).hexdigest(),
+            "configuration_keys": sorted(config),
+        },
+    )
+    node_request(
+        "python",
+        {
+            "host_alias": config.get("host_alias", ""),
+            "since": config.get("since", ""),
+            "command_timeout": config.get("command_timeout", 0),
+            "var_log_max_bytes": config.get("var_log_max_bytes", 0),
+            "skip_logs": bool(config.get("skip_logs")),
+            "keep_original_logs": bool(config.get("keep_original_logs")),
+        },
+        read_stdin(),
+    )
+
+
+def _cap(value: str) -> object:
+    return value if value == "unlimited" else int(value)
+
+
+log("FAKE_SSH_LOG", arguments)
+tail = remaining_after_base_options(arguments)
+
+if "-vvv" in tail:
+    serve_debug_probe(tail)
+
+if not tail or SSH_TARGET.fullmatch(tail[0]) is None:
+    reject("SSH target")
+ssh_target = tail[0]
+tail = tail[1:]
+
+if len(tail) == 1:
+    if tail[0] == CAPABILITY_PROBE:
+        serve_capability_probe(ssh_target)
+    shell_node = shell_node_options(tail[0])
+    if shell_node is not None:
+        serve_shell_node(shell_node)
+    if PYTHON_NODE_COMMAND.match(tail[0]) is not None:
+        serve_python_node(tail[0])
+    reject("single-word remote command")
+
+if tail[-3:] == ["--connect-timeout", "5", "-s"]:
+    serve_ceph_probe(tail[:-3], ssh_target)
+
+if tail[:1] == ["ceph"]:
+    serve_ceph(tail[1:])
+if tail[:3] == ["sudo", "-n", "ceph"]:
+    serve_ceph(tail[3:])
+if tail[:1] == ["kubectl"]:
+    serve_kubectl(tail[1:])
+
+reject("remote command shape")

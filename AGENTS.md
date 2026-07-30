@@ -32,3 +32,12 @@ The non-negotiable rules are:
 - Ordinary `make validate` must remain offline. Real-lab execution always requires a separate explicit opt-in and a reviewed active Lab Profile.
 
 `make lab-status`, `make lab-profile-discover`, `make lab-profile-activate` and `make lab-preflight` are implemented (issue #19); start from `make lab-status LAB_PROFILE=/absolute/path/to/lab.toml` and follow its single `next_action`. `make validate-lab` — the dual-run full-collect gate — is still owned by issue #20 and does not exist. A passing `lab-preflight` proves lab identity only; until #20 lands, do not invent ad-hoc replacements or claim that the automated real-lab gate exists.
+
+## Equivalence claims
+
+`make validate` includes the offline observable-contract equivalence gate (`make test-differential`): the shell reference and the Python candidate run the same scenarios in one shared fake world and their normalized contracts are compared. Before changing either implementation or the normalizer, read:
+
+- `docs/differential-normalizer.md` — the only list of differences the gate may ignore. Widening it needs the same review as changing behaviour.
+- `docs/test-scenario-ledger.md` — which shell scenario each Python test covers, and which are still blocked.
+
+The gate compares the workstation side. The node collector's own evidence surface is only partly ported (#36), so do not claim the candidate is observable-equivalent, feature-complete or qualification-ready.

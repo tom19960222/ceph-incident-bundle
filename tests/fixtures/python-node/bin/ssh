@@ -39,7 +39,13 @@ if mode == "missing-python":
 if mode == "corrupt":
     sys.stdout.buffer.write(b"not a gzip stream\n")
     raise SystemExit(0)
-if mode in ("missing-manifest", "unsafe", "unmanifested", "duplicate-manifest"):
+if mode in (
+    "missing-manifest",
+    "unsafe",
+    "unmanifested",
+    "duplicate-manifest",
+    "nonnumeric-exit-code",
+):
     archive_buffer = io.BytesIO()
     with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
         files = {
@@ -59,6 +65,10 @@ if mode in ("missing-manifest", "unsafe", "unmanifested", "duplicate-manifest"):
                 "started": "2026-07-29T00:00:00Z",
                 "ended": "2026-07-29T00:00:01Z",
             }
+            if mode == "nonnumeric-exit-code":
+                # Manifest integrity: an exit code that is not a number is not a
+                # manifest entry, however well-formed the rest of the line is.
+                entry["exit_code"] = "0"
             manifest_lines = [json.dumps(entry)]
             if mode == "duplicate-manifest":
                 manifest_lines.append(json.dumps(entry))

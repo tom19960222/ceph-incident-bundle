@@ -1,4 +1,4 @@
-.PHONY: test check-python test-python shellcheck validate \
+.PHONY: test check-python test-python test-differential shellcheck validate \
 	lab-status lab-profile-discover lab-profile-activate lab-preflight
 
 PYTHON ?= python3
@@ -12,10 +12,16 @@ check-python:
 test-python: check-python
 	$(PYTHON) -m unittest discover -s tests -p 'test_python_*.py' -v
 
+# Offline observable-contract equivalence gate: the shell reference and the
+# Python candidate run the same scenarios in the same fake world and their
+# normalized contracts are compared. See docs/differential-normalizer.md.
+test-differential: check-python
+	$(PYTHON) -m unittest discover -s tests -p 'test_differential_*.py' -v
+
 shellcheck:
 	shellcheck lib/*.sh run/*.sh tests/*.sh tests/fixtures/*.sh tests/fixtures/python-node/bin/codec-command tests/fixtures/python-node/bin/node-command tests/fixtures/python-node/bin/tar-wrapper
 
-validate: check-python test test-python shellcheck
+validate: check-python test test-python test-differential shellcheck
 
 # Real-lab workflow.  `lab-status` is local-only; the other three are explicit
 # opt-ins that touch a lab or the trusted profile, and none of them is reachable

@@ -137,6 +137,20 @@ class CollectSingleNodeCliTests(unittest.TestCase):
             *extra_arguments,
         ]
 
+    def var_log_manifest_exit_codes(self, archive: tarfile.TarFile) -> dict[str, int]:
+        """Manifest exit codes for the generated /var/log tree, keyed by artifact."""
+
+        manifest = archive.extractfile("./nodes/monitor01/manifest.jsonl")
+        self.assertIsNotNone(manifest)
+        tree = "/logs/var-log/"
+        exit_codes: dict[str, int] = {}
+        for line in manifest.read().splitlines():
+            entry = json.loads(line)
+            _, separator, relative = entry["artifact"].partition(tree)
+            if separator:
+                exit_codes[relative] = entry["exit_code"]
+        return exit_codes
+
     def test_public_collect_streams_one_node_and_saves_basic_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -264,6 +278,93 @@ class CollectSingleNodeCliTests(unittest.TestCase):
                 self.assertFalse(
                     any("/logs/var-log/original/" in name for name in archive.getnames())
                 )
+
+    def test_journal_failure_leaves_complete_log_entries_marked_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            environment["FAKE_JOURNALCTL_TIMEOUT"] = "1"
+            var_log = root / "var-log"
+            (var_log / "syslog").write_text("current line\n", encoding="utf-8")
+            (var_log / "syslog.1").write_text("older line\n", encoding="utf-8")
+
+            result = self.run_collect(root, environment)
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            bundle = Path(result.stdout.removeprefix("bundle: ").strip())
+            with tarfile.open(bundle, "r:gz") as archive:
+                exit_codes = self.var_log_manifest_exit_codes(archive)
+            self.assertEqual(
+                exit_codes,
+                {
+                    "journal-all-since.txt": 124,
+                    "INDEX.tsv": 0,
+                    "PAYLOAD-BYTES.txt": 0,
+                    "merged/tree/files/syslog.merged": 0,
+                },
+            )
+
+    def test_merge_read_failure_marks_only_the_affected_merged_family(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            real_gzip = shutil.which("gzip")
+            self.assertIsNotNone(real_gzip)
+            var_log = root / "var-log"
+            with gzip.open(var_log / "app.log.1.gz", "wb") as output:
+                output.write(b"rotated text\n")
+            (var_log / "app.log").write_text("active text\n", encoding="utf-8")
+            (var_log / "other.log").write_text("unaffected\n", encoding="utf-8")
+            # app.log.1.gz is the only gz source, so its three `gzip -dc` runs
+            # are measure, inspect, then merge. Failing the third means the
+            # rotation is preserved raw and never reaches the merged family.
+            fake_gzip = root / "bin" / "gzip"
+            fake_gzip.unlink()
+            fake_gzip.write_text(
+                "#!/bin/sh\n"
+                "set -eu\n"
+                "if [ \"${1:-}\" != \"-dc\" ]; then exec \"$REAL_GZIP\" \"$@\"; fi\n"
+                "count=0\n"
+                "[ ! -f \"$GZIP_COUNTER\" ] || count=$(sed -n '1p' \"$GZIP_COUNTER\")\n"
+                "count=$((count + 1))\n"
+                "printf '%s\\n' \"$count\" >\"$GZIP_COUNTER\"\n"
+                "if [ \"$count\" -eq 3 ]; then printf 'partial decode\\n'; exit 7; fi\n"
+                "exec \"$REAL_GZIP\" \"$@\"\n",
+                encoding="utf-8",
+            )
+            fake_gzip.chmod(0o755)
+            environment["REAL_GZIP"] = real_gzip
+            environment["GZIP_COUNTER"] = str(root / "gzip-count")
+
+            result = self.run_collect(root, environment)
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            bundle = Path(result.stdout.removeprefix("bundle: ").strip())
+            with tarfile.open(bundle, "r:gz") as archive:
+                errors = archive.extractfile(
+                    "./nodes/monitor01/logs/var-log/ERRORS.tsv"
+                )
+                self.assertIsNotNone(errors)
+                self.assertIn(b"merge-read-failed", errors.read())
+                exit_codes = self.var_log_manifest_exit_codes(archive)
+            self.assertEqual(
+                exit_codes["merged/tree/files/app.log.merged"], 2, exit_codes
+            )
+            self.assertEqual(
+                {
+                    relative: code
+                    for relative, code in exit_codes.items()
+                    if relative != "merged/tree/files/app.log.merged"
+                },
+                {
+                    "journal-all-since.txt": 0,
+                    "INDEX.tsv": 0,
+                    "ERRORS.tsv": 0,
+                    "PAYLOAD-BYTES.txt": 0,
+                    "raw/app.log.1.gz": 0,
+                    "merged/tree/files/other.log.merged": 0,
+                },
+            )
 
     def test_skip_logs_writes_only_the_explicit_skip_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -534,6 +635,11 @@ class CollectSingleNodeCliTests(unittest.TestCase):
                         for name in names
                     )
                 )
+                exit_codes = self.var_log_manifest_exit_codes(archive)
+            # The scan stopped at the first entry, so the index that was
+            # written is not a full listing of /var/log either.
+            self.assertEqual(exit_codes["SCAN-LIMIT.txt"], 2, exit_codes)
+            self.assertEqual(exit_codes["INDEX.tsv"], 2, exit_codes)
 
     def test_manifest_limit_discards_high_cardinality_payload_as_partial(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -581,6 +687,10 @@ class CollectSingleNodeCliTests(unittest.TestCase):
                 manifest_payload = manifest.read()
                 self.assertLessEqual(len(manifest_payload), 16384)
                 self.assertIn(b"MANIFEST-LIMIT.txt", manifest_payload)
+                exit_codes = self.var_log_manifest_exit_codes(archive)
+                self.assertEqual(exit_codes["MANIFEST-LIMIT.txt"], 2, exit_codes)
+                self.assertEqual(exit_codes["INDEX.tsv"], 0, exit_codes)
+                self.assertEqual(exit_codes["journal-all-since.txt"], 0, exit_codes)
 
     def test_insufficient_owned_workspace_space_is_partial_before_log_reads(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -611,6 +721,11 @@ class CollectSingleNodeCliTests(unittest.TestCase):
                         for name in names
                     )
                 )
+                exit_codes = self.var_log_manifest_exit_codes(archive)
+            # Nothing was scanned, so neither the marker nor the header-only
+            # index is complete evidence.
+            self.assertEqual(exit_codes["INSUFFICIENT-SPACE.txt"], 2, exit_codes)
+            self.assertEqual(exit_codes["INDEX.tsv"], 2, exit_codes)
 
     def test_insufficient_space_after_estimation_discards_log_payload(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -697,6 +812,48 @@ class CollectSingleNodeCliTests(unittest.TestCase):
                     if entry["artifact"].endswith("journal-all-since.txt")
                 )
                 self.assertEqual(journal_entry["exit_code"], 75)
+                exit_codes = self.var_log_manifest_exit_codes(archive)
+                self.assertEqual(exit_codes["OVER-LIMIT.txt"], 2, exit_codes)
+                self.assertEqual(exit_codes["INDEX.tsv"], 0, exit_codes)
+
+    def test_combined_cap_discard_marks_the_journal_entry_incomplete(self) -> None:
+        # The journal command itself succeeds here; only the combined total
+        # breaks the cap, so the payload is discarded after a clean capture.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            environment["FAKE_JOURNALCTL_LARGE"] = "1"
+            (root / "var-log" / "messages").write_text(
+                "small log\n", encoding="utf-8"
+            )
+
+            result = self.run_collect(
+                root,
+                environment,
+                extra_arguments=("--var-log-max-bytes", "2200"),
+            )
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            bundle = Path(result.stdout.removeprefix("bundle: ").strip())
+            with tarfile.open(bundle, "r:gz") as archive:
+                marker = archive.extractfile(
+                    "./nodes/monitor01/logs/var-log/OVER-LIMIT.txt"
+                )
+                self.assertIsNotNone(marker)
+                self.assertIn(
+                    b"status=not-collected-combined-payload-exceeded-cap",
+                    marker.read(),
+                )
+                journal = archive.extractfile(
+                    "./nodes/monitor01/logs/var-log/journal-all-since.txt"
+                )
+                self.assertIsNotNone(journal)
+                self.assertIn(
+                    b"combined /var/log and journal text exceeded", journal.read()
+                )
+                exit_codes = self.var_log_manifest_exit_codes(archive)
+            self.assertEqual(exit_codes["journal-all-since.txt"], 2, exit_codes)
+            self.assertEqual(exit_codes["OVER-LIMIT.txt"], 2, exit_codes)
 
     def test_journal_timeout_preserves_bounded_partial_output_and_manifest_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -939,7 +1096,7 @@ class CollectSingleNodeCliTests(unittest.TestCase):
                     )
                     summary = archive.extractfile("./summary.txt")
                     self.assertIsNotNone(summary)
-                    self.assertIn(b"final_status=2", summary.read())
+                    self.assertIn(b"final_status: 2", summary.read())
                 self.assertIn(diagnostic, result.stderr)
                 self.assertEqual(list((root / "remote-tmp").iterdir()), [])
 
@@ -987,6 +1144,7 @@ class CollectSingleNodeCliTests(unittest.TestCase):
             "unsafe": "unsafe archive member",
             "unmanifested": "archive contains evidence without a manifest mapping",
             "duplicate-manifest": "duplicates an artifact mapping",
+            "nonnumeric-exit-code": "invalid exit_code",
         }
         for mode, expected_reason in expected_reasons.items():
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary_directory:
@@ -1142,7 +1300,7 @@ class CollectSingleNodeCliTests(unittest.TestCase):
             workdirs = list((root / "results").glob("tmp.*"))
             self.assertEqual(len(workdirs), 1)
             summary = (workdirs[0] / "summary.txt").read_text(encoding="utf-8")
-            self.assertIn("final_status=1\n", summary)
+            self.assertIn("final_status: 1\n", summary)
 
     def test_packaging_interruption_removes_reserved_archive_and_workdir(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
