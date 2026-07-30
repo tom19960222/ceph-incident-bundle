@@ -5,6 +5,17 @@ command_name=${0##*/}
 if [ -n "${FAKE_NODE_COMMAND_LOG:-}" ]; then
   printf '%s %s\n' "$command_name" "$*" >>"$FAKE_NODE_COMMAND_LOG"
 fi
+# Argument boundaries matter for the node evidence surface (`pvs --separator ' '`
+# ends in a single-space argument), so record a lossless bracketed ledger too.
+if [ -n "${FAKE_NODE_ARGV_LOG:-}" ]; then
+  {
+    printf '%s' "$command_name"
+    for argument in "$@"; do
+      printf ' <%s>' "$argument"
+    done
+    printf '\n'
+  } >>"$FAKE_NODE_ARGV_LOG"
+fi
 if [ "${FAKE_NODE_SIGNAL_PARENT:-}" = "HUP" ]; then
   kill -HUP "$PPID"
   sleep 60
@@ -54,10 +65,105 @@ case "$command_name" in
     fi
     ;;
   ip) printf '1: lo: <LOOPBACK>\n' ;;
-  systemctl) printf '0 loaded units listed\n' ;;
+  systemctl)
+    case "$*" in
+      "status systemd-timesyncd --no-pager --plain")
+        if [ "${FAKE_TIMESYNCD_MISSING:-}" = "1" ]; then
+          printf 'Unit systemd-timesyncd.service could not be found.\n' >&2
+          exit 3
+        fi
+        printf 'systemd-timesyncd.service - Network Time Synchronization\n'
+        printf 'Active: active (running)\n'
+        ;;
+      "--failed --no-pager --plain") printf '0 loaded units listed\n' ;;
+      *) printf 'unexpected fake systemctl argv: %s\n' "$*" >&2; exit 64 ;;
+    esac
+    ;;
+  lsblk)
+    [ "$*" = "-a -o NAME,MAJ:MIN,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,SERIAL" ] \
+      || { printf 'unexpected fake lsblk argv: %s\n' "$*" >&2; exit 64; }
+    printf 'NAME MAJ:MIN SIZE TYPE FSTYPE MOUNTPOINT MODEL SERIAL\n'
+    printf 'sda 8:0 100G disk    FAKEDISK FAKESERIAL\n'
+    ;;
+  dmesg)
+    [ "$*" = "-T" ] \
+      || { printf 'unexpected fake dmesg argv: %s\n' "$*" >&2; exit 64; }
+    printf 'fake kernel ring buffer\n'
+    ;;
+  iostat)
+    [ "$*" = "-xz 1 3" ] \
+      || { printf 'unexpected fake iostat argv: %s\n' "$*" >&2; exit 64; }
+    printf 'Device r/s w/s\nsda 1.00 2.00\n'
+    ;;
+  chronyc)
+    case "$*" in
+      "tracking") printf 'Reference ID : C0A81201 (192.168.18.1)\n' ;;
+      "sources -v") printf '^* 192.168.18.1 2 6 377 21 +12us\n' ;;
+      *) printf 'unexpected fake chronyc argv: %s\n' "$*" >&2; exit 64 ;;
+    esac
+    ;;
+  ntpq)
+    [ "$*" = "-pn" ] \
+      || { printf 'unexpected fake ntpq argv: %s\n' "$*" >&2; exit 64; }
+    printf '     remote           refid      st t when poll reach\n'
+    ;;
+  timedatectl)
+    if [ "${FAKE_TIMESYNCD_MISSING:-}" = "1" ]; then
+      printf 'systemd-timesyncd unavailable for %s\n' "$*" >&2
+      exit 1
+    fi
+    case "$*" in
+      "status") printf 'System clock synchronized: yes\nNTP service: active\n' ;;
+      "show-timesync --all") printf 'ServerName=192.168.18.1\nPollIntervalUSec=34min 8s\n' ;;
+      "timesync-status") printf 'Server: 192.168.18.1\nPoll interval: 34min 8s\n' ;;
+      *) printf 'unexpected fake timedatectl argv: %s\n' "$*" >&2; exit 64 ;;
+    esac
+    ;;
+  pvs|vgs|lvs)
+    [ "$#" -eq 3 ] && [ "$1" = "--noheadings" ] && [ "$2" = "--separator" ] \
+      && [ "$3" = " " ] \
+      || { printf 'unexpected fake %s argv: %s\n' "$command_name" "$*" >&2; exit 64; }
+    printf 'fake %s report\n' "$command_name"
+    ;;
+  podman)
+    [ "$*" = "ps -a" ] \
+      || { printf 'unexpected fake podman argv: %s\n' "$*" >&2; exit 64; }
+    printf 'CONTAINER ID IMAGE\nabc ceph/ceph:v18\n'
+    ;;
+  docker)
+    [ "$*" = "ps -a" ] \
+      || { printf 'unexpected fake docker argv: %s\n' "$*" >&2; exit 64; }
+    # A node with podman but no working docker daemon is the common shape, and
+    # an optional tool that fails must still not make the node partial.
+    printf 'Cannot connect to the Docker daemon\n' >&2
+    exit 1
+    ;;
+  cephadm)
+    [ "$*" = "ls --format json-pretty" ] \
+      || { printf 'unexpected fake cephadm argv: %s\n' "$*" >&2; exit 64; }
+    printf '[{"name":"mon.a","style":"cephadm"}]\n'
+    ;;
   journalctl)
-    [ "$#" -eq 3 ] && [ "$1" = "--since" ] && [ "$3" = "--no-pager" ] \
-      || { printf 'unexpected fake journalctl argv: %s\n' "$*" >&2; exit 64; }
+    case "$*" in
+      "--since "*" -u ceph* --no-pager")
+        if [ "${FAKE_JOURNALCTL_NO_CEPH:-}" = "1" ]; then
+          printf 'no entries\n'
+          exit 1
+        fi
+        printf 'ceph journal line\n'
+        exit 0
+        ;;
+      "--since "*" -u systemd-timesyncd --no-pager")
+        if [ "${FAKE_TIMESYNCD_MISSING:-}" = "1" ]; then
+          printf 'No journal files were found for systemd-timesyncd\n' >&2
+          exit 1
+        fi
+        printf 'systemd-timesyncd journal line\n'
+        exit 0
+        ;;
+      "--since "*" --no-pager") ;;
+      *) printf 'unexpected fake journalctl argv: %s\n' "$*" >&2; exit 64 ;;
+    esac
     if [ "${FAKE_JOURNALCTL_TIMEOUT:-}" = "1" ]; then
       printf 'partial journal before timeout\n'
       exit 124
@@ -68,8 +174,16 @@ case "$command_name" in
     fi
     ;;
   find)
-    [ "${2:-}" = "-type" ] && [ "${3:-}" = "f" ] && [ "${4:-}" = "-print0" ] \
-      || { printf 'unexpected fake find argv: %s\n' "$*" >&2; exit 64; }
+    # Only the collector's own scans are answered: the `/var/log` discovery, the
+    # two config scans and the `/var/lib/ceph` listing.  Anything else is a
+    # command-policy drift and fails loudly instead of being executed.
+    case "$*" in
+      *" -type f -print0") ;;
+      *" -maxdepth 1 -type f -name *.conf -print0") ;;
+      *" -maxdepth 4 "*" -prune -o -type f "*" -print0") ;;
+      *" -maxdepth 3 "*" -prune -o -exec sh -c "*" sh {} +") ;;
+      *) printf 'unexpected fake find argv: %s\n' "$*" >&2; exit 64 ;;
+    esac
     exec "$FAKE_REAL_FIND" "$@"
     ;;
   sudo)
@@ -77,7 +191,7 @@ case "$command_name" in
       || { printf 'unexpected fake sudo argv: %s\n' "$*" >&2; exit 64; }
     shift
     case "${1:-}" in
-      dd|find|journalctl) ;;
+      dd|find|journalctl|lsblk|dmesg|cephadm) ;;
       *)
         printf 'unexpected fake sudo command: %s\n' "${1:-<missing>}" >&2
         exit 64

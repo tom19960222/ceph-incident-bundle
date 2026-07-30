@@ -10,8 +10,8 @@
 
 | 狀態 | 數量 | 意義 |
 |---|---|---|
-| ported | 119 | 已有通過的 Python test 覆蓋該情境語意 |
-| blocked | 9 | Python 實作尚未移植該行為，測試無從撰寫（見下方 blocked 清單） |
+| ported | 128 | 已有通過的 Python test 覆蓋該情境語意 |
+| blocked | 0 | Python 實作尚未移植該行為，測試無從撰寫 |
 | not-ported | 10 | inventory 分類為 shell 實作細節，移植後失去意義 |
 | **合計** | **138** | inventory 全部情境 |
 
@@ -77,18 +77,18 @@
 | ID | 情境 | 狀態 | Python 覆蓋 / 理由 | differential |
 |---|---|---|---|---|
 | N1 | Happy path 全套執行 → exit 0（失敗時傾印 errors.log 供除錯） | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_public_collect_streams_one_node_and_saves_basic_evidence` | — |
-| N2 | 產出固定 artifact 清單：system/、resources/、storage/、… | blocked | blocked: node evidence surface not ported yet (#36); shell 端仍是唯一實作 | — |
-| N3 | 各 artifact 內容來自對應指令輸出（cephadm-ls 的 `"style":"… | blocked | blocked: node evidence surface not ported yet (#36); shell 端仍是唯一實作 | — |
-| N4 | optional 指令不存在（ntpq）→ artifact 寫 `SKIPPED: co… | blocked | blocked: node evidence surface not ported yet (#36); shell 端仍是唯一實作 | — |
-| N5 | timesyncd 設定檔與 conf.d 逐檔複製進 `time/systemd-tim… | blocked | blocked: node evidence surface not ported yet (#36); shell 端仍是唯一實作 | — |
+| N2 | 產出固定 artifact 清單：system/、resources/、storage/、… | ported | `test_python_collect_node.NodeEvidenceSurfaceTests.test_the_node_evidence_surface_is_complete_and_indexed` | — |
+| N3 | 各 artifact 內容來自對應指令輸出（cephadm-ls 的 `"style":"… | ported | `test_python_collect_node.NodeEvidenceSurfaceTests.test_the_node_evidence_surface_is_complete_and_indexed`<br>`test_python_collect_node.NodeEvidenceSurfaceTests.test_an_absent_var_lib_ceph_is_a_marker_not_a_failure` | — |
+| N4 | optional 指令不存在（ntpq）→ artifact 寫 `SKIPPED: co… | ported | `test_python_collect_node.NodeEvidenceSurfaceTests.test_a_missing_optional_tool_is_skipped_without_failing_the_node` | — |
+| N5 | timesyncd 設定檔與 conf.d 逐檔複製進 `time/systemd-tim… | ported | `test_python_collect_node.NodeEvidenceSurfaceTests.test_timesyncd_config_is_copied_file_by_file`<br>`test_python_collect_node.NodeEvidenceSurfaceTests.test_a_failed_copy_names_the_evidence_it_lost` | — |
 | N6 | log family 合併：`ceph.log.2.gz`＋`.1`＋現行檔合併為 `.m… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_var_log_rotations_and_supported_codecs_merge_oldest_to_newest` | — |
-| N7 | `var-lib-ceph-configs/` 複製 config、**排除 keyrin… | blocked | blocked: node evidence surface not ported yet (#36); shell 端仍是唯一實作 | — |
-| N8 | optional 工具收到正確 argv（`iostat -xz 1 3`、`pvs/vg… | blocked | blocked: node evidence surface not ported yet (#36); shell 端仍是唯一實作 | — |
-| N9 | dmesg 經 `sudo -n` 執行 | blocked | blocked: node evidence surface not ported yet (#36); shell 端仍是唯一實作 | — |
-| N10 | dmesg 與 ceph journal 用加重 timeout（120s，非 `--ti… | blocked | blocked: node evidence surface not ported yet (#36); shell 端仍是唯一實作 | — |
+| N7 | `var-lib-ceph-configs/` 複製 config、**排除 keyrin… | ported | `test_python_collect_node.NodeEvidenceSurfaceTests.test_var_lib_ceph_configs_are_copied_without_credentials` | — |
+| N8 | optional 工具收到正確 argv（`iostat -xz 1 3`、`pvs/vg… | ported | `test_python_collect_node.NodeEvidenceSurfaceTests.test_optional_tools_receive_their_exact_argv` | — |
+| N9 | dmesg 經 `sudo -n` 執行 | ported | `test_python_collect_node.NodeEvidenceSurfaceTests.test_privileged_reads_go_through_noninteractive_sudo`<br>`test_python_collect_node.NodeEvidenceSurfaceTests.test_privileged_reads_without_sudo_are_skipped_not_faked` | — |
+| N10 | dmesg 與 ceph journal 用加重 timeout（120s，非 `--ti… | ported | `test_python_collect_node.NodeEvidenceSurfaceTests.test_dmesg_and_the_ceph_journal_get_the_heavier_timeout` | — |
 | N11 | journal 匯出＋/var/log 共用同一 byte cap；溢出 → exit 2… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_var_log_and_journal_share_one_fail_closed_payload_cap`<br>`test_python_collect_node.CollectSingleNodeCliTests.test_var_log_cap_discards_all_payload_instead_of_truncating` | node-collection-timeout |
-| N12 | 非 ceph 節點沒有 ceph journal（journalctl exit 1）→ … | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_finite_cap_without_sudo_marks_missing_journal_partial`<br>`test_python_collect_node.CollectSingleNodeCliTests.test_skip_logs_writes_only_the_explicit_skip_artifact` | node-partial-and-unusable-archive |
-| N13 | timesyncd 全缺（timedatectl/systemctl/journalctl… | blocked | blocked: node evidence surface not ported yet (#36); shell 端仍是唯一實作 | — |
+| N12 | 非 ceph 節點沒有 ceph journal（journalctl exit 1）→ … | ported | `test_python_collect_node.NodeEvidenceSurfaceTests.test_a_node_without_a_ceph_journal_is_not_partial`<br>`test_python_collect_node.CollectSingleNodeCliTests.test_finite_cap_without_sudo_marks_missing_journal_partial`<br>`test_python_collect_node.CollectSingleNodeCliTests.test_skip_logs_writes_only_the_explicit_skip_artifact` | node-partial-and-unusable-archive |
+| N13 | timesyncd 全缺（timedatectl/systemctl/journalctl… | ported | `test_python_collect_node.NodeEvidenceSurfaceTests.test_a_node_without_timesyncd_stays_complete` | — |
 
 ## 5. `tests/test-var-log-collector.sh`
 
@@ -205,23 +205,20 @@
 | O35 | 中斷處理（Ctrl-C 契約）：`on_interrupt` → exit 130、ann… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_interruption_cleans_remote_and_workstation_workspaces`<br>`test_python_collect_node.CollectSingleNodeCliTests.test_packaging_interruption_removes_reserved_archive_and_workdir` | interrupt-cleans-up |
 | O36 | `--keep-workdir` 時中斷處理保留 workdir（`CLEANUP_KEE… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_keep_workdir_preserves_the_workstation_workspace_on_interrupt` | — |
 
-## Blocked：node evidence surface 尚未移植
+## Blocked：目前沒有 blocked 情境
 
-以下 9 個情境（N2, N3, N4, N5, N7, N8, N9, N10, N13）沒有對應的 Python test，
-原因不是測試缺漏，而是 Python node collector 目前只實作 #11 的七個 basic
-commands 加上 #12 的 `/var/log`／journal。shell node collector 另外收集
-`lsblk`、`dmesg`（加重 timeout）、ceph journal、`iostat`、`chronyc`、`ntpq`、
-`timedatectl` 三連發、`systemd-timesyncd` status／journal／config、`pvs`／`vgs`／
-`lvs`、`podman`／`docker ps`、`cephadm ls`、`/etc` 檔案與 `/var/lib/ceph` 設定
-（排除 keyring）——這些行為在 Python candidate 沒有實作路徑。
+#36 移植了 node evidence surface 的其餘部分（`lsblk`、`dmesg`、ceph journal、
+`iostat`、`chronyc`、`ntpq`、`timedatectl` 三連發、`systemd-timesyncd`
+status／journal／config、`pvs`／`vgs`／`lvs`、`podman`／`docker ps`、`cephadm ls`、
+`/etc` 檔案與 `/var/lib/ceph` 設定），因此 N2、N3、N4、N5、N7、N8、N9、N10、N13
+從 blocked 變成 ported，見上表指向的 `NodeEvidenceSurfaceTests`。
 
-移植它至少牽動一個尚未裁定的契約問題：shell 的 `node_copy_file` 複製檔案時
-**不寫 manifest**，而 Python 的 node archive acceptance 要求 manifest 與
-evidence 一對一。要嘛 Python 為複製檔補 manifest（與 shell 的 manifest 內容
-不同），要嘛放寬 acceptance（降低安全邊界）。依 `docs/python-rewrite-plan.md`
-的規定，這種等價／安全條件的取捨必須回到 parent spec #8 裁定，不能在本 gate
-內自行決定，因此本 gate 只把它記錄成 blocked，並由 #36 承接。
+移植過程中的契約問題（shell 的 `node_copy_file` 不寫 manifest，而 Python 的
+archive acceptance 要求 manifest 與 evidence 一對一）已由 #8 裁定，記錄於
+`docs/adr/0010-manifest-as-evidence-index.md` 與 `docs/python-rewrite-plan.md`
+的 `## Contract Adjudications`。
 
-在這些情境移植完成前，offline gate 只能宣稱：**工作機端**（cluster evidence、
-orchestration、content safety、verify、bundle lifecycle）已達 observable
-contract equivalence；node evidence surface 尚未等價。
+inventory 的 138 個情境現在只剩兩種狀態：128 個 ported、10 個分類為 shell 實作
+細節的 not-ported。offline gate 的覆蓋邊界仍受 `docs/differential-normalizer.md`
+限制——differential run 比較的是工作機端契約，node 端等價性由上表的 N 系列
+（黑箱 fake-command 測試）負責，而不是由 differential run 負責。

@@ -22,15 +22,55 @@ ENTRYPOINT = ROOT / "ceph_incident_bundle.py"
 NODE_COLLECTOR = ROOT / "ceph_incident_node.py"
 
 
-class CollectSingleNodeCliTests(unittest.TestCase):
+# Every external command the node collector may reach for.  All of them are
+# answered by the whitelisting fake, and the node's own PATH is replaced with the
+# fake world (`FAKE_REMOTE_PATH`), so a tool that happens to exist on the
+# developer's workstation can neither be executed nor make a "missing tool"
+# assertion pass by accident.
+FAKE_NODE_COMMANDS = (
+    "hostname",
+    "uname",
+    "uptime",
+    "free",
+    "df",
+    "ip",
+    "systemctl",
+    "dd",
+    "journalctl",
+    "find",
+    "sudo",
+    "lsblk",
+    "dmesg",
+    "iostat",
+    "chronyc",
+    "ntpq",
+    "timedatectl",
+    "pvs",
+    "vgs",
+    "lvs",
+    "podman",
+    "docker",
+    "cephadm",
+)
+# The few genuinely real binaries the fake world is built out of: the node runs
+# Python, packages its evidence with tar, and the fakes themselves are shell
+# scripts.  Nothing else is reachable from the node's PATH.
+REAL_NODE_COMMANDS = ("python3", "sh", "tar", "cat", "awk", "sed", "sleep")
+
+
+class NodeCollectorFixture:
+    """The offline fake world both node-collector test classes run inside."""
+
     def make_fake_environment(self, root: Path) -> tuple[dict[str, str], Path, Path]:
         real_commands = {
             command: shutil.which(command)
-            for command in ("gzip", "xz", "bzip2", "zstd", "find")
+            for command in ("gzip", "xz", "bzip2", "zstd", "find", *REAL_NODE_COMMANDS)
         }
-        self.assertTrue(all(real_commands.values()))
+        self.assertTrue(all(real_commands.values()), real_commands)
         fake_bin = root / "bin"
         fake_bin.mkdir()
+        real_bin = root / "real-bin"
+        real_bin.mkdir()
         ssh_log = root / "ssh-argv.json"
         payload_log = root / "ssh-stdin.py"
         remote_tmp = root / "remote-tmp"
@@ -43,34 +83,30 @@ class CollectSingleNodeCliTests(unittest.TestCase):
         (fake_bin / "kubectl").symlink_to(
             ROOT / "tests" / "fixtures" / "python-rook" / "bin" / "kubectl"
         )
-        for command in (
-            "hostname",
-            "uname",
-            "uptime",
-            "free",
-            "df",
-            "ip",
-            "systemctl",
-            "dd",
-            "journalctl",
-            "find",
-            "sudo",
-        ):
+        for command in FAKE_NODE_COMMANDS:
             (fake_bin / command).symlink_to(fixture_bin / "node-command")
         for command in ("gzip", "xz", "bzip2", "zstd"):
             (fake_bin / command).symlink_to(fixture_bin / "codec-command")
+        for command in REAL_NODE_COMMANDS:
+            (real_bin / command).symlink_to(real_commands[command])
         (remote_bin / "tar").symlink_to(fixture_bin / "node-command")
 
         environment = {
             **os.environ,
             "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_REMOTE_PATH": f"{fake_bin}{os.pathsep}{real_bin}",
             "TMPDIR": str(remote_tmp),
             "FAKE_SSH_LOG": str(ssh_log),
             "FAKE_SSH_PAYLOAD": str(payload_log),
             "FAKE_REMOTE_BIN": str(remote_bin),
             "CEPH_INCIDENT_VAR_LOG_DIR": str(root / "var-log"),
+            "CEPH_INCIDENT_ETC_DIR": str(root / "etc"),
+            "CEPH_INCIDENT_VAR_LIB_CEPH_DIR": str(root / "var-lib-ceph"),
+            "CEPH_INCIDENT_TIMESYNCD_CONF": str(root / "timesyncd.conf"),
+            "CEPH_INCIDENT_TIMESYNCD_CONF_D_DIR": str(root / "timesyncd.conf.d"),
             "CEPH_INCIDENT_TEST_ALLOW_ATIME_READ": "1",
             "FAKE_NODE_COMMAND_LOG": str(root / "node-command.log"),
+            "FAKE_NODE_ARGV_LOG": str(root / "node-argv.log"),
             "FAKE_REAL_GZIP": str(real_commands["gzip"]),
             "FAKE_REAL_XZ": str(real_commands["xz"]),
             "FAKE_REAL_BZIP2": str(real_commands["bzip2"]),
@@ -78,6 +114,7 @@ class CollectSingleNodeCliTests(unittest.TestCase):
             "FAKE_REAL_FIND": str(real_commands["find"]),
         }
         (root / "var-log").mkdir()
+        (root / "etc").mkdir()
         return environment, ssh_log, payload_log
 
     def run_collect(
@@ -151,6 +188,8 @@ class CollectSingleNodeCliTests(unittest.TestCase):
                 exit_codes[relative] = entry["exit_code"]
         return exit_codes
 
+
+class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
     def test_public_collect_streams_one_node_and_saves_basic_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -1364,6 +1403,506 @@ class CollectSingleNodeCliTests(unittest.TestCase):
                 self.assertFalse(ssh_log.exists())
                 self.assertFalse((root / "should-not-exist").exists())
                 self.assertFalse((root / "results").exists())
+
+
+class NodeEvidenceSurfaceTests(NodeCollectorFixture, unittest.TestCase):
+    """The node evidence surface beyond the basic commands and `/var/log`.
+
+    Covers the shell scenarios N2, N3, N4, N5, N7, N8, N9, N10 and N13: the fixed
+    artifact list, each artifact's provenance, the optional/privileged/absent
+    dispositions, per-file config copies and the heavier timeout the kernel ring
+    and the ceph journal get.
+    """
+
+    # Everything the node evidence surface must produce, `/var/log` aside.
+    EXPECTED_ARTIFACTS = frozenset(
+        {
+            "system/hostname.txt",
+            "system/uname.txt",
+            "system/uptime.txt",
+            "system/os-release",
+            "system/hosts",
+            "system/resolv.conf",
+            "resources/free.txt",
+            "resources/iostat.txt",
+            "storage/df.txt",
+            "storage/lsblk.txt",
+            "storage/pvs.txt",
+            "storage/vgs.txt",
+            "storage/lvs.txt",
+            "network/ip-addr.txt",
+            "kernel/dmesg.txt",
+            "systemd/failed-units.txt",
+            "systemd/journal-ceph.txt",
+            "time/chronyc-tracking.txt",
+            "time/chronyc-sources.txt",
+            "time/ntpq-peers.txt",
+            "time/timedatectl-status.txt",
+            "time/timedatectl-show-timesync.txt",
+            "time/timedatectl-timesync-status.txt",
+            "time/systemd-timesyncd-status.txt",
+            "time/systemd-timesyncd-journal.txt",
+            "time/systemd-timesyncd-config/timesyncd.conf",
+            "time/systemd-timesyncd-config/timesyncd.conf.d/10-lab.conf",
+            "containers/podman-ps.txt",
+            "containers/docker-ps.txt",
+            "cephadm/cephadm-ls.json",
+            "cephadm/var-lib-ceph-listing.txt",
+            "cephadm/var-lib-ceph-configs/fsid/mon.a/config",
+        }
+    )
+
+    def make_fake_environment(self, root: Path) -> tuple[dict[str, str], Path, Path]:
+        """The fake world plus the node-side files the evidence surface reads."""
+
+        environment, ssh_log, payload_log = super().make_fake_environment(root)
+        (root / "var-log" / "messages").write_text("current log\n", encoding="utf-8")
+        etc = root / "etc"
+        (etc / "os-release").write_text('NAME="Fake Linux"\n', encoding="utf-8")
+        (etc / "hosts").write_text("127.0.0.1 localhost\n", encoding="utf-8")
+        # Most systemd hosts ship `/etc/resolv.conf` as a symlink, and the shell
+        # reference follows it.
+        (etc / "resolv-target").write_text("nameserver 10.0.0.53\n", encoding="utf-8")
+        (etc / "resolv.conf").symlink_to(etc / "resolv-target")
+        (root / "timesyncd.conf").write_text(
+            "[Time]\nNTP=192.168.18.1\n", encoding="utf-8"
+        )
+        conf_directory = root / "timesyncd.conf.d"
+        conf_directory.mkdir()
+        (conf_directory / "10-lab.conf").write_text(
+            "[Time]\nFallbackNTP=time.cloudflare.com\n", encoding="utf-8"
+        )
+        (conf_directory / "notes.txt").write_text(
+            "not a drop-in\n", encoding="utf-8"
+        )
+        ceph_daemon = root / "var-lib-ceph" / "fsid" / "mon.a"
+        ceph_daemon.mkdir(parents=True)
+        (ceph_daemon / "config").write_text("fsid = fake\n", encoding="utf-8")
+        (ceph_daemon / "keyring").write_text(
+            "must never be collected\n", encoding="utf-8"
+        )
+        return environment, ssh_log, payload_log
+
+    def node_evidence(self, bundle: Path) -> dict[str, bytes]:
+        """Every node artifact outside the `/var/log` tree, keyed by relative path."""
+
+        prefix = "./nodes/monitor01/"
+        evidence: dict[str, bytes] = {}
+        with tarfile.open(bundle, "r:gz") as archive:
+            for member in archive.getmembers():
+                if not member.isfile() or not member.name.startswith(prefix):
+                    continue
+                relative = member.name.removeprefix(prefix)
+                if relative.startswith("logs/") or relative in (
+                    "manifest.jsonl",
+                    "errors.log",
+                ):
+                    continue
+                payload = archive.extractfile(member)
+                self.assertIsNotNone(payload)
+                evidence[relative] = payload.read()
+        return evidence
+
+    def node_manifest(self, bundle: Path) -> dict[str, tuple[str, int]]:
+        """Node manifest as artifact -> (command, exit_code), `/var/log` aside."""
+
+        entries: dict[str, tuple[str, int]] = {}
+        with tarfile.open(bundle, "r:gz") as archive:
+            manifest = archive.extractfile("./nodes/monitor01/manifest.jsonl")
+            self.assertIsNotNone(manifest)
+            for line in manifest.read().splitlines():
+                entry = json.loads(line)
+                relative = entry["artifact"].split("/out/", 1)[-1]
+                if relative.startswith("logs/"):
+                    continue
+                entries[relative] = (entry["command"], entry["exit_code"])
+        return entries
+
+    def collect_node_evidence(
+        self,
+        root: Path,
+        environment: dict[str, str],
+        *,
+        expected_exit: int = 0,
+        extra_arguments: tuple[str, ...] = (),
+    ) -> Path:
+        result = self.run_collect(
+            root, environment, extra_arguments=extra_arguments
+        )
+        self.assertEqual(result.returncode, expected_exit, result.stderr)
+        return Path(result.stdout.removeprefix("bundle: ").strip())
+
+    def test_the_node_evidence_surface_is_complete_and_indexed(self) -> None:
+        """N2, N3: the fixed artifact list, each carrying its command's output."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+
+            bundle = self.collect_node_evidence(root, environment)
+
+            evidence = self.node_evidence(bundle)
+            self.assertEqual(set(evidence), self.EXPECTED_ARTIFACTS)
+            # ADR 0010: the manifest indexes every artifact in the archive, so a
+            # copied config and a skip marker are both traceable to a source.
+            self.assertEqual(set(self.node_manifest(bundle)), self.EXPECTED_ARTIFACTS)
+            self.assertIn(b'"style":"cephadm"', evidence["cephadm/cephadm-ls.json"])
+            self.assertIn(b"fake kernel ring buffer", evidence["kernel/dmesg.txt"])
+            self.assertIn(b"ceph journal line", evidence["systemd/journal-ceph.txt"])
+            self.assertIn(b"FAKESERIAL", evidence["storage/lsblk.txt"])
+            self.assertIn(
+                b"System clock synchronized: yes",
+                evidence["time/timedatectl-status.txt"],
+            )
+            self.assertIn(
+                b"ServerName=192.168.18.1",
+                evidence["time/timedatectl-show-timesync.txt"],
+            )
+            self.assertIn(
+                b"Poll interval", evidence["time/timedatectl-timesync-status.txt"]
+            )
+            self.assertIn(
+                b"Network Time Synchronization",
+                evidence["time/systemd-timesyncd-status.txt"],
+            )
+            self.assertIn(
+                b"systemd-timesyncd journal line",
+                evidence["time/systemd-timesyncd-journal.txt"],
+            )
+            self.assertIn(b"nameserver 10.0.0.53", evidence["system/resolv.conf"])
+            self.assertIn(b'NAME="Fake Linux"', evidence["system/os-release"])
+            # An optional tool that fails is still evidence, and still leaves the
+            # node complete: a node without a docker daemon is a normal node.
+            self.assertIn(
+                b"Cannot connect to the Docker daemon",
+                evidence["containers/docker-ps.txt"],
+            )
+            self.assertEqual(
+                self.node_manifest(bundle)["containers/docker-ps.txt"],
+                ("docker ps -a", 1),
+            )
+
+    def test_optional_tools_receive_their_exact_argv(self) -> None:
+        """N8: argument boundaries survive, including the single-space separator."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+
+            self.collect_node_evidence(root, environment)
+
+            ledger = (root / "node-argv.log").read_text(encoding="utf-8").splitlines()
+            self.assertIn("iostat <-xz> <1> <3>", ledger)
+            self.assertIn("chronyc <tracking>", ledger)
+            self.assertIn("chronyc <sources> <-v>", ledger)
+            self.assertIn("ntpq <-pn>", ledger)
+            self.assertIn("timedatectl <show-timesync> <--all>", ledger)
+            for report in ("pvs", "vgs", "lvs"):
+                with self.subTest(report=report):
+                    self.assertIn(
+                        f"{report} <--noheadings> <--separator> < >", ledger
+                    )
+            self.assertIn("podman <ps> <-a>", ledger)
+            self.assertIn("docker <ps> <-a>", ledger)
+            self.assertIn("cephadm <ls> <--format> <json-pretty>", ledger)
+
+    def test_a_missing_optional_tool_is_skipped_without_failing_the_node(self) -> None:
+        """N4: an absent optional tool leaves a marker, not a partial node."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            (root / "bin" / "ntpq").unlink()
+            (root / "bin" / "cephadm").unlink()
+
+            bundle = self.collect_node_evidence(root, environment)
+
+            evidence = self.node_evidence(bundle)
+            self.assertEqual(
+                evidence["time/ntpq-peers.txt"],
+                b"SKIPPED: command not found: ntpq\n",
+            )
+            self.assertEqual(
+                evidence["cephadm/cephadm-ls.json"],
+                b"SKIPPED: command not found: cephadm\n",
+            )
+            manifest = self.node_manifest(bundle)
+            self.assertEqual(manifest["time/ntpq-peers.txt"], ("ntpq -pn", 127))
+            self.assertEqual(
+                manifest["cephadm/cephadm-ls.json"],
+                ("cephadm ls --format json-pretty", 127),
+            )
+            ledger = (root / "node-argv.log").read_text(encoding="utf-8")
+            self.assertNotIn("ntpq", ledger)
+            self.assertNotIn("cephadm", ledger)
+
+    def test_privileged_reads_go_through_noninteractive_sudo(self) -> None:
+        """N9: the kernel ring and the ceph journal are read as root, or not at all."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+
+            bundle = self.collect_node_evidence(root, environment)
+
+            ledger = (root / "node-argv.log").read_text(encoding="utf-8").splitlines()
+            self.assertIn("sudo <-n> <dmesg> <-T>", ledger)
+            self.assertIn(
+                "sudo <-n> <lsblk> <-a> <-o> "
+                "<NAME,MAJ:MIN,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,SERIAL>",
+                ledger,
+            )
+            self.assertIn(
+                "sudo <-n> <journalctl> <--since> <-24h> <-u> <ceph*> <--no-pager>",
+                ledger,
+            )
+            manifest = self.node_manifest(bundle)
+            self.assertEqual(
+                manifest["kernel/dmesg.txt"], ("sudo -n dmesg -T", 0)
+            )
+            self.assertEqual(
+                manifest["systemd/journal-ceph.txt"],
+                ("sudo -n journalctl --since -24h -u 'ceph*' --no-pager", 0),
+            )
+
+    def test_privileged_reads_without_sudo_are_skipped_not_faked(self) -> None:
+        """A node that grants no sudo yields markers, never an unprivileged read."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            environment["CEPH_INCIDENT_TEST_FORCE_NO_SUDO"] = "1"
+
+            # An uncapped payload keeps the missing all-journal export out of the
+            # node's status, so this asserts only the privileged-read policy.
+            bundle = self.collect_node_evidence(
+                root, environment, extra_arguments=("--var-log-max-bytes", "unlimited")
+            )
+
+            evidence = self.node_evidence(bundle)
+            self.assertEqual(
+                evidence["kernel/dmesg.txt"],
+                b"SKIPPED: sudo command not found for privileged read: dmesg\n",
+            )
+            self.assertEqual(
+                evidence["storage/lsblk.txt"],
+                b"SKIPPED: sudo command not found for privileged read: lsblk\n",
+            )
+            self.assertEqual(
+                evidence["systemd/journal-ceph.txt"],
+                b"SKIPPED: command not found: sudo\n",
+            )
+            ledger = (root / "node-argv.log").read_text(encoding="utf-8")
+            self.assertNotIn("dmesg", ledger)
+            self.assertNotIn("lsblk", ledger)
+            self.assertEqual(
+                self.node_manifest(bundle)["kernel/dmesg.txt"],
+                ("dmesg -T", 127),
+            )
+
+    def test_a_node_without_a_ceph_journal_is_not_partial(self) -> None:
+        """N12: a node that runs no ceph unit still collects, and still passes."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            environment["FAKE_JOURNALCTL_NO_CEPH"] = "1"
+
+            bundle = self.collect_node_evidence(root, environment)
+
+            evidence = self.node_evidence(bundle)
+            self.assertIn(b"no entries", evidence["systemd/journal-ceph.txt"])
+            self.assertEqual(
+                self.node_manifest(bundle)["systemd/journal-ceph.txt"][1], 1
+            )
+
+    def test_dmesg_and_the_ceph_journal_get_the_heavier_timeout(self) -> None:
+        """N10: a heavy read is bounded at 120s, not by the per-command timeout."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+
+            bundle = self.collect_node_evidence(root, environment)
+
+            evidence = self.node_evidence(bundle)
+            self.assertIn(b"# timeout: 120s\n", evidence["kernel/dmesg.txt"])
+            self.assertIn(b"# timeout: 120s\n", evidence["systemd/journal-ceph.txt"])
+            # The per-command timeout still bounds everything else.
+            self.assertIn(b"# timeout: 3s\n", evidence["storage/lsblk.txt"])
+            self.assertIn(
+                b"# timeout: 3s\n", evidence["time/systemd-timesyncd-journal.txt"]
+            )
+
+    def test_timesyncd_config_is_copied_file_by_file(self) -> None:
+        """N5: the config and every `conf.d` drop-in land as their own artifacts."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            (root / "timesyncd.conf.d" / "20-pool.conf").write_text(
+                "[Time]\nNTP=pool.example\n", encoding="utf-8"
+            )
+
+            bundle = self.collect_node_evidence(root, environment)
+
+            evidence = self.node_evidence(bundle)
+            configuration = "time/systemd-timesyncd-config"
+            self.assertEqual(
+                evidence[f"{configuration}/timesyncd.conf"],
+                b"[Time]\nNTP=192.168.18.1\n",
+            )
+            self.assertEqual(
+                evidence[f"{configuration}/timesyncd.conf.d/10-lab.conf"],
+                b"[Time]\nFallbackNTP=time.cloudflare.com\n",
+            )
+            self.assertEqual(
+                evidence[f"{configuration}/timesyncd.conf.d/20-pool.conf"],
+                b"[Time]\nNTP=pool.example\n",
+            )
+            # `conf.d` is a drop-in directory: only `*.conf` is configuration.
+            self.assertNotIn(
+                f"{configuration}/timesyncd.conf.d/notes.txt", evidence
+            )
+            manifest = self.node_manifest(bundle)
+            self.assertEqual(
+                manifest[f"{configuration}/timesyncd.conf"],
+                (f"collect-node copy {root / 'timesyncd.conf'}", 0),
+            )
+
+    def test_a_node_without_timesyncd_stays_complete(self) -> None:
+        """N13: no time daemon at all is a normal node, fully accounted for."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            environment["FAKE_TIMESYNCD_MISSING"] = "1"
+            (root / "timesyncd.conf").unlink()
+            shutil.rmtree(root / "timesyncd.conf.d")
+
+            bundle = self.collect_node_evidence(root, environment)
+
+            evidence = self.node_evidence(bundle)
+            self.assertIn(
+                b"systemd-timesyncd unavailable",
+                evidence["time/timedatectl-status.txt"],
+            )
+            self.assertIn(
+                b"Unit systemd-timesyncd.service could not be found.",
+                evidence["time/systemd-timesyncd-status.txt"],
+            )
+            self.assertIn(
+                b"No journal files were found for systemd-timesyncd",
+                evidence["time/systemd-timesyncd-journal.txt"],
+            )
+            skipped = evidence["time/systemd-timesyncd-config/SKIPPED.txt"]
+            self.assertIn(b"systemd-timesyncd config not found at", skipped)
+            self.assertIn(str(root / "timesyncd.conf").encode(), skipped)
+            self.assertNotIn(
+                "time/systemd-timesyncd-config/timesyncd.conf", evidence
+            )
+            self.assertEqual(
+                self.node_manifest(bundle)[
+                    "time/systemd-timesyncd-config/SKIPPED.txt"
+                ][1],
+                2,
+            )
+
+    def test_var_lib_ceph_configs_are_copied_without_credentials(self) -> None:
+        """N7: configs are collected, keyrings are pruned before they are seen."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            osd = root / "var-lib-ceph" / "fsid" / "osd.1"
+            osd.mkdir()
+            (osd / "unit.run").write_text("podman run ...\n", encoding="utf-8")
+            (osd / "ceph.conf").write_text("[global]\n", encoding="utf-8")
+            (osd / "osd_private_key").write_text("never\n", encoding="utf-8")
+            secrets = root / "var-lib-ceph" / "fsid" / ".ssh"
+            secrets.mkdir()
+            (secrets / "config").write_text("never\n", encoding="utf-8")
+
+            bundle = self.collect_node_evidence(root, environment)
+
+            evidence = self.node_evidence(bundle)
+            configs = "cephadm/var-lib-ceph-configs"
+            self.assertEqual(
+                evidence[f"{configs}/fsid/mon.a/config"], b"fsid = fake\n"
+            )
+            self.assertEqual(evidence[f"{configs}/fsid/osd.1/ceph.conf"], b"[global]\n")
+            # `unit.run` is not configuration, and nothing under a pruned path or
+            # matching a credential name is copied or even listed.
+            self.assertNotIn(f"{configs}/fsid/osd.1/unit.run", evidence)
+            for forbidden in (
+                f"{configs}/fsid/mon.a/keyring",
+                f"{configs}/fsid/osd.1/osd_private_key",
+                f"{configs}/fsid/.ssh/config",
+            ):
+                with self.subTest(artifact=forbidden):
+                    self.assertNotIn(forbidden, evidence)
+            listing = evidence["cephadm/var-lib-ceph-listing.txt"]
+            self.assertIn(b"d ", listing)
+            self.assertIn(b"/fsid/mon.a/config\n", listing)
+            # The prune stops at the credential itself: `.ssh` is named as a
+            # directory, but nothing inside it is enumerated.
+            for forbidden in (b"keyring", b"private_key", b"/.ssh/"):
+                with self.subTest(entry=forbidden):
+                    self.assertNotIn(forbidden, listing)
+            self.assertEqual(
+                self.node_manifest(bundle)["cephadm/var-lib-ceph-listing.txt"],
+                (f"collect-node list {root / 'var-lib-ceph'}", 0),
+            )
+
+    def test_an_absent_var_lib_ceph_is_a_marker_not_a_failure(self) -> None:
+        """A kube-only node has no `/var/lib/ceph`, and that is not an error."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            shutil.rmtree(root / "var-lib-ceph")
+
+            bundle = self.collect_node_evidence(root, environment)
+
+            evidence = self.node_evidence(bundle)
+            self.assertIn(
+                b"is not a readable directory on this node",
+                evidence["cephadm/var-lib-ceph-listing.txt"],
+            )
+            self.assertFalse(
+                any(
+                    name.startswith("cephadm/var-lib-ceph-configs/")
+                    for name in evidence
+                )
+            )
+
+    def test_a_failed_copy_names_the_evidence_it_lost(self) -> None:
+        """ADR 0010: a copy that fails leaves a marker and a partial node."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            environment["FAKE_DD_FAIL_MATCH"] = "timesyncd.conf.d/10-lab.conf"
+
+            bundle = self.collect_node_evidence(root, environment, expected_exit=2)
+
+            evidence = self.node_evidence(bundle)
+            artifact = (
+                "time/systemd-timesyncd-config/timesyncd.conf.d/10-lab.conf"
+            )
+            self.assertIn(b"SKIPPED: copy failed: ", evidence[artifact])
+            command, exit_code = self.node_manifest(bundle)[artifact]
+            self.assertEqual(
+                command,
+                f"collect-node copy "
+                f"{root / 'timesyncd.conf.d' / '10-lab.conf'}",
+            )
+            self.assertEqual(exit_code, 2)
+            # The rest of the surface is still collected.
+            self.assertEqual(
+                evidence["time/systemd-timesyncd-config/timesyncd.conf"],
+                b"[Time]\nNTP=192.168.18.1\n",
+            )
 
 
 if __name__ == "__main__":
