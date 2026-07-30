@@ -1,0 +1,42 @@
+# Lab Profile bootstrap example — placeholder values only, safe to commit.
+#
+# A bootstrap profile carries the connection entry points an operator already
+# knows and leaves lab identity blank.  `make lab-profile-discover` reads it,
+# performs read-only discovery, and writes a separate Lab Profile Candidate with
+# the observed SSH fingerprints, Ceph/Rook FSIDs and hostnames filled in.
+#
+# A bootstrap profile is never usable for real-lab qualification: it carries no
+# reviewed identity, so strict preflight fails closed on it.
+
+schema_version = 1
+
+[profile]
+name = "example-lab"
+state = "bootstrap"
+
+[ssh]
+user = "operator"
+key_path = "/home/operator/.ssh/ceph-lab-ed25519"
+
+[ceph]
+seed = "monitor01"
+
+[rook]
+kubeconfig_path = "/home/operator/.kube/ceph-lab.config"
+namespace = "rook-ceph"
+operator_namespace = "rook-ceph"
+
+[prometheus]
+url = "http://198.51.100.11:9095"
+
+[[hosts]]
+name = "monitor01"
+address = "198.51.100.11"
+
+[[hosts]]
+name = "mon02"
+address = "198.51.100.12"
+
+[[hosts]]
+name = "osd01"
+address = "198.51.100.21"

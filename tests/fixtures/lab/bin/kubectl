@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Whitelist fake kubectl for the fake lab's Rook identity probe.
+
+Exactly one read-only invocation is answered, matched in full:
+``--kubeconfig PATH -n NAMESPACE get cephclusters.ceph.rook.io -o json``.  A
+mutating verb, ``exec`` or an extra token exits 99 before any knob applies, so a
+probe that grows a side-effecting command surface fails the suite immediately.
+
+Knobs (env):
+  FAKE_LAB_KUBECTL_LOG  append each invocation's argv here as one JSON line
+  FAKE_LAB_ROOK_FSID    the FSID the CephCluster reports
+  FAKE_LAB_ROOK_MODE    ok | empty | nostatus | two | fail | badjson
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import sys
+
+
+NAMESPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*")
+
+arguments = sys.argv[1:]
+log_path = os.environ.get("FAKE_LAB_KUBECTL_LOG")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as output:
+        output.write(json.dumps(arguments) + "\n")
+
+
+def reject(reason: str) -> None:
+    sys.stderr.write(
+        f"fake kubectl: unexpected argv ({reason}): {shlex.join(arguments)}\n"
+    )
+    raise SystemExit(99)
+
+
+if len(arguments) != 8:
+    reject("argument count")
+if arguments[0] != "--kubeconfig" or not arguments[1]:
+    reject("kubeconfig option")
+if arguments[2] != "-n" or NAMESPACE.fullmatch(arguments[3]) is None:
+    reject("namespace option")
+if arguments[4:] != ["get", "cephclusters.ceph.rook.io", "-o", "json"]:
+    reject("read-only get")
+if not os.path.isfile(arguments[1]):
+    sys.stderr.write(f"error: stat {arguments[1]}: no such file or directory\n")
+    raise SystemExit(1)
+
+fsid = os.environ.get("FAKE_LAB_ROOK_FSID", "3f2b1c8e-0000-4a1d-8b7e-000000000002")
+mode = os.environ.get("FAKE_LAB_ROOK_MODE", "ok")
+
+
+def cluster(name: str, cluster_fsid: str | None) -> dict[str, object]:
+    status: dict[str, object] = {"phase": "Ready"}
+    if cluster_fsid is not None:
+        status["ceph"] = {"fsid": cluster_fsid, "health": "HEALTH_OK"}
+    return {"kind": "CephCluster", "metadata": {"name": name}, "status": status}
+
+
+if mode == "fail":
+    sys.stderr.write("error: the server could not find the requested resource\n")
+    raise SystemExit(1)
+if mode == "badjson":
+    sys.stdout.write("{not json\n")
+    raise SystemExit(0)
+if mode == "empty":
+    items: list[dict[str, object]] = []
+elif mode == "nostatus":
+    items = [cluster("rook-ceph", None)]
+elif mode == "two":
+    items = [
+        cluster("rook-ceph", fsid),
+        cluster("rook-ceph-other", "3f2b1c8e-0000-4a1d-8b7e-0000000000ff"),
+    ]
+else:
+    items = [cluster("rook-ceph", fsid)]
+sys.stdout.write(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}) + "\n")
+raise SystemExit(0)

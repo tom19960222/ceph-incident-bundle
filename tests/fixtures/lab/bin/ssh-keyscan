@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Whitelist fake ssh-keyscan for the fake lab.
+
+Only the one bounded argv shape the prober is allowed to issue is answered:
+``-T <seconds> -- <address>``.  Anything else exits 99, so a probe that grows an
+extra token or drops the ``--`` guard fails the suite immediately.
+
+Knobs (env):
+  FAKE_LAB_KEYSCAN_LOG      append each invocation's argv here as one JSON line
+  FAKE_LAB_HOST_KEYS        JSON {address: [[key_type, key_seed], ...]}
+  FAKE_LAB_KEYSCAN_SILENT   space-separated addresses that offer no key
+  FAKE_LAB_KEYSCAN_JUNK     space-separated addresses that also emit scan noise
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import shlex
+import sys
+
+
+TIMEOUT = re.compile(r"[1-9][0-9]*")
+ADDRESS = re.compile(r"[A-Za-z0-9._:-]+|\[[0-9A-Fa-f:]+\]")
+
+arguments = sys.argv[1:]
+log_path = os.environ.get("FAKE_LAB_KEYSCAN_LOG")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as output:
+        output.write(json.dumps(arguments) + "\n")
+
+
+def reject(reason: str) -> None:
+    sys.stderr.write(
+        f"fake ssh-keyscan: unexpected argv ({reason}): {shlex.join(arguments)}\n"
+    )
+    raise SystemExit(99)
+
+
+if len(arguments) != 4:
+    reject("argument count")
+if arguments[0] != "-T" or TIMEOUT.fullmatch(arguments[1]) is None:
+    reject("timeout option")
+if arguments[2] != "--":
+    reject("missing option terminator")
+address = arguments[3]
+if ADDRESS.fullmatch(address) is None:
+    reject("address")
+
+if address in os.environ.get("FAKE_LAB_KEYSCAN_SILENT", "").split():
+    sys.stderr.write(f"getaddrinfo {address}: nodename nor servname provided\n")
+    raise SystemExit(1)
+
+keys = json.loads(os.environ.get("FAKE_LAB_HOST_KEYS", "{}")).get(
+    address, [["ssh-ed25519", f"fake-host-key-{address}"]]
+)
+if address in os.environ.get("FAKE_LAB_KEYSCAN_JUNK", "").split():
+    sys.stdout.write(f"# {address}:22 SSH-2.0-OpenSSH_9.6\n")
+    sys.stdout.write(f"@cert-authority {address} ssh-ed25519 AAAAjunk\n")
+    sys.stdout.write(f"{address} ssh-ed25519 not-base64!! extra-field\n")
+for key_type, seed in keys:
+    blob = base64.b64encode(seed.encode("utf-8")).decode("ascii")
+    sys.stdout.write(f"{address} {key_type} {blob}\n")
+raise SystemExit(0)

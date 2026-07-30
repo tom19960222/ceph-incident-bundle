@@ -31,7 +31,7 @@ The non-negotiable rules are:
 - Profiles and reports may reference credential paths, but must never contain private keys, keyrings, passwords, tokens, or other credential contents.
 - Ordinary `make validate` must remain offline. Real-lab execution always requires a separate explicit opt-in and a reviewed active Lab Profile.
 
-The `lab-status`, `lab-profile-discover`, and `validate-lab` targets described by the runbook are planned interfaces owned by issues #19 and #20. Until those tickets land, do not invent ad-hoc replacements or claim that the automated real-lab gate exists.
+`make lab-status`, `make lab-profile-discover`, `make lab-profile-activate` and `make lab-preflight` are implemented (issue #19); start from `make lab-status LAB_PROFILE=/absolute/path/to/lab.toml` and follow its single `next_action`. `make validate-lab` — the dual-run full-collect gate — is still owned by issue #20 and does not exist. A passing `lab-preflight` proves lab identity only; until #20 lands, do not invent ad-hoc replacements or claim that the automated real-lab gate exists.
 
 ## Equivalence claims
 

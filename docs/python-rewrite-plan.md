@@ -51,7 +51,7 @@ Gate 的覆蓋邊界要誠實記錄：fake `ssh` 站在 SSH 邊界，因此 diff
 - #17 已完成 Content Safety 與完整 Structural Verification 的 Python candidate；Content Safety 尚未移除，任何移除仍須在 Python cutover 完成後另立變更。
 - #23 已修正 shell Node Evidence Archive 的 pre-extraction acceptance boundary；shell reference 仍須通過 #19／#20 的其餘 qualification gates。
 - #17 的 malicious final Incident Bundle 黑箱案例已收斂 Python Verify 對 link、special member、member collision、hierarchy、truncation 與 tar end markers 的接受邊界；#23 只處理 shell 收到 Node Evidence Archive 後、解壓前的窄幅安全邊界。
-- #18 已建立 offline differential gate、normalizer 合約與 scenario ledger，並修正 gate 找出的工作機端 contract gaps；node evidence surface 的 9 個情境仍為 blocked（#36），因此仍不能宣稱整體 observable-equivalent。#19／#20 real-lab gates 尚未完成。
+- #18 已建立 offline differential gate、normalizer 合約與 scenario ledger，並修正 gate 找出的工作機端 contract gaps；node evidence surface 的 9 個情境仍為 blocked（#36），因此仍不能宣稱整體 observable-equivalent。#19 已建立 Lab Profile、status/discovery/activation workflow 與 strict identity preflight；#20 的 dual-run full-collect gate 尚未完成，因此 real-lab qualification 仍未通過。
 
 本階段的 Python 3.11 baseline 由 Makefile 的 offline gate 在任何測試前 fail fast；#11 已完成 node runtime negotiation 與 graceful-skip seam，#12 已完成 `/var/log` forensic evidence，#13、#14 與 #15 已分別完成 direct Ceph、Rook 與 Prometheus cluster evidence，#16 已完成多 node、source/runner selection 與 multi-source orchestration，#17 已完成 Content Safety 與完整 Structural Verification，#18 已完成 offline differential gate 與逐項 ledger。下一個 implementation blocker 是 #36 的 node evidence surface；在它與 real-lab gates 完成前，本 candidate 仍不可宣稱 feature-complete、observable-equivalent 或 qualification-ready。
 
@@ -94,7 +94,7 @@ shell 的 `node_copy_file` 複製 evidence 時不寫 manifest entry，`lib/colle
 
 - 建立 Python test runner 與 bundle normalizer。
 - 建立 shell/Python differential harness 骨架。
-- 定義 TOML Lab Profile、profile candidate、status/discover workflow 與 Lab Validation Report schema。
+- 定義 TOML Lab Profile、profile candidate、status/discover workflow 與 Lab Validation Report schema（#19 完成，見 `validation/`）。
 - Production shell 保持不變。
 
 ### 3. Node collector
@@ -151,7 +151,7 @@ shell 的 `node_copy_file` 複製 evidence 時不寫 manifest entry，`lib/colle
 - Agent 或操作人員檢查 candidate 後明確啟用，再執行 strict preflight 與 full validation。
 - Repository 不硬編碼 endpoints、credentials 或即時 cluster identity。
 
-> Current status: `lab-status`、`lab-profile-discover` 與 `validate-lab` 是已鎖定但尚未實作的公開操作介面。#19 負責 profile/status/discovery，#20 負責 dual-run real-lab harness；#9 不提供暫時性的 ad-hoc 替代品。
+> Current status: #19 已實作 `lab-status`、`lab-profile-discover`、`lab-profile-activate` 與 `lab-preflight`，並固定 Lab Validation Report schema；程式在 `validation/` package，不屬於三個 production modules。`validate-lab` 仍由 #20 負責，尚未實作，因此 `lab-preflight` 通過只證明 lab identity，不是 qualification evidence。
 
 ## Out of Scope
 
