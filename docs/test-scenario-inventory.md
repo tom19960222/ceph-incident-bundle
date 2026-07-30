@@ -27,10 +27,14 @@
 | `tests/test-node-collector.sh` | 13 | 13 | 0 |
 | `tests/test-var-log-collector.sh` | 14 | 14 | 0 |
 | `tests/test-rook-collector.sh` | 10 | 10 | 0 |
-| `tests/test-prom-collector.sh` | 18 | 16 | 2 |
+| `tests/test-prom-collector.sh` | 19 | 17 | 2 |
 | `tests/test-verify-bundle.sh` | 11 | 11 | 0 |
 | `tests/test-collect.sh` | 36 | 36 | 0 |
-| **合計** | **137** | **127** | **10** |
+| **合計** | **138** | **128** | **10** |
+
+> 原始盤點（issue #7）為 137／127／10；#15 之後補入 `P6a`（Prometheus 憑證邊界），
+> 因此實際列數為 138／128／10。逐項覆蓋狀態見 `docs/test-scenario-ledger.md`，
+> 該對照由 `tests/test_python_scenario_ledger.py` 機械檢查，總數不一致會失敗。
 
 ---
 

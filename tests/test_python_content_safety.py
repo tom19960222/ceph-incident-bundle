@@ -57,6 +57,32 @@ class CollectContentSafetyTests(DirectCephFixture, unittest.TestCase):
                     self.assertEqual(config_dump.splitlines()[-1], "[REDACTED]")
                     self.assertNotIn(secret, config_dump)
 
+    def test_ceph_key_material_and_private_key_blocks_are_redacted(self) -> None:
+        """Key material, both spellings, plus a whole PEM block; safe lines stay."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _ = self.make_fake_environment(
+                root, FAKE_CEPH_KEY_MATERIAL_CONFIG="1"
+            )
+
+            result = self.run_collect(root, environment)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            contents = self.extract(self.bundle_of(result))
+            config_dump = contents["cluster/ceph/json/config-dump.json"]
+            for secret in (
+                "AQBn0123456789012345678901234567890123456==",
+                "BEGIN OPENSSH PRIVATE KEY",
+                "END OPENSSH PRIVATE KEY",
+                "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB",
+            ):
+                with self.subTest(secret=secret):
+                    self.assertNotIn(secret, config_dump)
+            self.assertIn("mon_host = 10.0.0.1", config_dump)
+            self.assertIn("osd_pool_default_size = 3", config_dump)
+            self.assertEqual(config_dump.count("[REDACTED]"), 5)
+
     def test_no_redact_keeps_sensitive_text_and_still_writes_the_log(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -437,7 +463,7 @@ class CollectContentSafetyTests(DirectCephFixture, unittest.TestCase):
             workdirs = list((root / "results").glob("tmp.*"))
             self.assertEqual(len(workdirs), 1)
             self.assertIn(
-                "final_status=1\n",
+                "final_status: 1\n",
                 (workdirs[0] / "summary.txt").read_text(encoding="utf-8"),
             )
             errors = (workdirs[0] / "errors.log").read_text(encoding="utf-8")

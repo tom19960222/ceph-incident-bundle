@@ -102,9 +102,9 @@ class MultiSourceOrchestrationTests(unittest.TestCase):
                 "nodes/storage01/logs/var-log/INDEX.tsv",
             ):
                 self.assertIn(expected, names)
-            self.assertIn("node_ok=2\n", summary)
-            self.assertIn("node_failed=0\n", summary)
-            self.assertIn("final_status=0\n", summary)
+            self.assertIn("node_ok: 2\n", summary)
+            self.assertIn("node_failed: 0\n", summary)
+            self.assertIn("final_status: 0\n", summary)
             configs = [
                 json.loads(line)
                 for line in (root / "node-config.jsonl").read_text(
@@ -183,9 +183,9 @@ class CephRunnerSelectionTests(DirectCephFixture, unittest.TestCase):
             contents = self.extract(self.bundle_of(result))
             self.assertIn("nodes/monitor01/system/hostname.txt", contents)
             self.assertIn("nodes/storage01/system/hostname.txt", contents)
-            self.assertIn("node_ok=1\n", contents["summary.txt"])
-            self.assertIn("node_failed=1\n", contents["summary.txt"])
-            self.assertIn("final_status=2\n", contents["summary.txt"])
+            self.assertIn("node_ok: 1\n", contents["summary.txt"])
+            self.assertIn("node_failed: 1\n", contents["summary.txt"])
+            self.assertIn("final_status: 2\n", contents["summary.txt"])
 
     def test_an_unreachable_explicit_seed_never_falls_back_to_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -228,7 +228,33 @@ class CephRunnerSelectionTests(DirectCephFixture, unittest.TestCase):
             contents = self.extract(self.bundle_of(result))
             self.assertIn("cluster/ceph/json/status.json", contents)
             self.assertIn("cluster/rook/SKIPPED.txt", contents)
-            self.assertIn("cluster_status=0\n", contents["summary.txt"])
+            self.assertIn("cluster_status: 0\n", contents["summary.txt"])
+
+    def test_auto_mode_without_any_capable_node_is_partial_but_still_collects_nodes(
+        self,
+    ) -> None:
+        """No cluster source at all: both layers skip, the nodes still land."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _ = self.make_fake_environment(root, FAKE_NODE_CAPS="")
+
+            result = self.run_collect(
+                root,
+                environment,
+                seed=None,
+                extra_arguments=("--mode", "auto", "--kube-mode", "remote"),
+            )
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            contents = self.extract(self.bundle_of(result))
+            self.assertIn("cluster/ceph/SKIPPED.txt", contents)
+            self.assertIn("cluster/rook/SKIPPED.txt", contents)
+            self.assertNotIn("cluster/ceph/json/status.json", contents)
+            self.assertIn("nodes/monitor01/system/hostname.txt", contents)
+            self.assertIn("cluster_status: 2\n", contents["summary.txt"])
+            self.assertIn("ceph_source=<none>\n", contents["environment.txt"])
+            self.assertIn("rook_source=<none>\n", contents["environment.txt"])
 
     def test_ceph_only_mode_does_not_validate_remote_rook_since(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

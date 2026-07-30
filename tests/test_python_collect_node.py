@@ -939,7 +939,7 @@ class CollectSingleNodeCliTests(unittest.TestCase):
                     )
                     summary = archive.extractfile("./summary.txt")
                     self.assertIsNotNone(summary)
-                    self.assertIn(b"final_status=2", summary.read())
+                    self.assertIn(b"final_status: 2", summary.read())
                 self.assertIn(diagnostic, result.stderr)
                 self.assertEqual(list((root / "remote-tmp").iterdir()), [])
 
@@ -987,6 +987,7 @@ class CollectSingleNodeCliTests(unittest.TestCase):
             "unsafe": "unsafe archive member",
             "unmanifested": "archive contains evidence without a manifest mapping",
             "duplicate-manifest": "duplicates an artifact mapping",
+            "nonnumeric-exit-code": "invalid exit_code",
         }
         for mode, expected_reason in expected_reasons.items():
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary_directory:
@@ -1142,7 +1143,7 @@ class CollectSingleNodeCliTests(unittest.TestCase):
             workdirs = list((root / "results").glob("tmp.*"))
             self.assertEqual(len(workdirs), 1)
             summary = (workdirs[0] / "summary.txt").read_text(encoding="utf-8")
-            self.assertIn("final_status=1\n", summary)
+            self.assertIn("final_status: 1\n", summary)
 
     def test_packaging_interruption_removes_reserved_archive_and_workdir(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

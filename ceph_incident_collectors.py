@@ -1648,6 +1648,27 @@ def _write_skipped(destination: Path, reason: str) -> None:
     )
 
 
+def _write_node_ssh_debug_log(
+    *,
+    workspace: Path,
+    host_alias: str,
+    target: str,
+    ssh_key: Path,
+    connection_timeout: int,
+    known_hosts_file: Path | None,
+) -> None:
+    """Keep the reference collector's per-node transport diagnostic."""
+
+    write_ssh_debug_log(
+        workdir=workspace,
+        label=f"node-{host_alias}",
+        target=target,
+        ssh_key=ssh_key,
+        connection_timeout=connection_timeout,
+        known_hosts_file=known_hosts_file,
+    )
+
+
 def collect_single_node(
     *,
     workspace: Path,
@@ -1708,6 +1729,14 @@ def collect_single_node(
                 sys.stderr.buffer.write(stderr)
             candidate.unlink(missing_ok=True)
             reason = f"node collection timed out after {node_timeout}s from {target}"
+            _write_node_ssh_debug_log(
+                workspace=workspace,
+                host_alias=host_alias,
+                target=target,
+                ssh_key=ssh_key,
+                connection_timeout=connection_timeout,
+                known_hosts_file=known_hosts_file,
+            )
             _write_skipped(destination, reason)
             return NodeCollectionResult(2, 124, False, reason, invocation_id)
         except KeyboardInterrupt as error:
@@ -1718,6 +1747,16 @@ def collect_single_node(
     if stderr:
         sys.stderr.buffer.write(stderr)
     remote_exit_code = process.returncode
+    if _exit_code_of(remote_exit_code) in (255, 137):
+        # A transport-level failure explains itself only with a verbose probe.
+        _write_node_ssh_debug_log(
+            workspace=workspace,
+            host_alias=host_alias,
+            target=target,
+            ssh_key=ssh_key,
+            connection_timeout=connection_timeout,
+            known_hosts_file=known_hosts_file,
+        )
     try:
         if candidate.stat().st_size == 0:
             if remote_exit_code in (75, 127):
