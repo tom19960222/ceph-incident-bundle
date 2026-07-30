@@ -228,6 +228,25 @@ class PreflightCommandTests(CliTestCase):
         self.assertEqual(document["status"], "preflight-pass")
         self.assertIn("#20", self.next_action(completed))
 
+    def test_an_unusable_profile_still_leaves_a_report(self) -> None:
+        broken = self.lab.profiles / "broken.toml"
+        broken.write_text("this is not a lab profile\n", encoding="utf-8")
+        completed = self.run_cli(
+            "preflight",
+            "--profile",
+            str(broken),
+            "--runs-dir",
+            str(self.runs),
+            CEPH_INCIDENT_LAB_CONFIRM="1",
+        )
+        self.assertEqual(completed.returncode, 2)
+        latest = (self.runs / "LATEST").read_text(encoding="utf-8").strip()
+        document = json.loads((self.runs / latest / "report.json").read_text("utf-8"))
+        self.assertEqual(document["status"], "profile-invalid")
+        self.assertIsNone(document["profile"]["hash"])
+        self.assertEqual(document["preflight"][0]["name"], "profile-load")
+        self.assertIn("lab-preflight", self.next_action(completed))
+
     def test_a_mismatch_exits_two_and_still_writes_a_report(self) -> None:
         profile = self.lab.write_profile()
         completed = self.run_cli(

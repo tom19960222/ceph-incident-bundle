@@ -15,10 +15,17 @@ reviewable while silently disabling the check its blank field was meant to carry
 from __future__ import annotations
 
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from validation.lab_local import utc_timestamp, write_owner_only
+from validation.lab_commands import (
+    ACTIVATE_TARGET,
+    DISCOVER_TARGET,
+    activate_command,
+    discover_command,
+)
+from validation.lab_output import utc_timestamp, write_owner_only
 from validation.lab_probe import HostKeyScan, LabProber, ProbeOutcome
 from validation.lab_profile import LabProfile, LabProfileError, load_profile, safe_display_path
 
@@ -124,7 +131,7 @@ def discover(
             findings=findings,
             next_action=(
                 f"Fix {first.subject} ({first.detail}), then re-run "
-                f"make lab-profile-discover LAB_PROFILE={profile_path}"
+                f"{discover_command(profile_path)}"
             ),
             blocked_reason=f"could not read {first.subject}",
         )
@@ -146,12 +153,15 @@ def discover(
             blocked_reason=str(error),
             next_action=(
                 f"Fix the discovered lab identity ({error}), then re-run "
-                f"make lab-profile-discover LAB_PROFILE={profile_path}"
+                f"{discover_command(profile_path)}"
             ),
         )
 
     differences, note = _compare(profile, candidate)
-    write_owner_only(destination, _candidate_document(candidate, profile_path))
+    write_owner_only(
+        destination,
+        _candidate_document(candidate, profile_path, findings, differences, note),
+    )
     return DiscoveryResult(
         input_path=profile_path,
         candidate_path=destination,
@@ -226,14 +236,14 @@ def _blocking_reason(
     if destination == profile_path:
         return (
             "the candidate path is the discovery input",
-            "Re-run make lab-profile-discover with a distinct "
-            "--candidate-out path so the input profile is preserved",
+            f"Re-run make {DISCOVER_TARGET} with a distinct "
+            "LAB_ARGS='--candidate-out <path>' so the input profile is preserved",
         )
     if not destination.parent.is_dir():
         return (
             f"the candidate directory does not exist: {safe_display_path(destination.parent)}",
-            f"Create {safe_display_path(destination.parent)} and re-run "
-            f"make lab-profile-discover LAB_PROFILE={profile_path}",
+            f"Create {destination.parent} and re-run "
+            f"{discover_command(profile_path)}",
         )
     if not destination.exists():
         return None
@@ -248,14 +258,14 @@ def _blocking_reason(
         )
         return (
             f"{safe_display_path(destination)} is {described}",
-            "Choose a --candidate-out path that is not an active or unreadable "
-            f"profile and re-run make lab-profile-discover LAB_PROFILE={profile_path}",
+            "Choose a LAB_ARGS='--candidate-out <path>' that is not an active or "
+            f"unreadable profile and re-run {discover_command(profile_path)}",
         )
     if not replace_candidate:
         return (
             f"{safe_display_path(destination)} already exists",
-            f"Review {safe_display_path(destination)}, then re-run "
-            "make lab-profile-discover with --replace-candidate to replace it",
+            f"Review {destination}, then re-run "
+            f"{discover_command(profile_path, replace_candidate=True)}",
         )
     return None
 
@@ -327,19 +337,40 @@ def _review_action(
     )
     return (
         f"Review {subject} {destination} against the expected topology, then run "
-        f"make lab-profile-activate LAB_PROFILE={profile_path} "
-        f"LAB_CANDIDATE={destination} CEPH_INCIDENT_LAB_ACTIVATE=1"
+        f"{activate_command(profile_path, destination)}"
     )
 
 
-def _candidate_document(candidate: LabProfile, source: Path) -> str:
-    """Render the candidate with a provenance header the loader ignores."""
+def _candidate_document(
+    candidate: LabProfile,
+    source: Path,
+    findings: Sequence[DiscoveryFinding],
+    differences: Sequence[str],
+    note: str,
+) -> str:
+    """Render the candidate with the review record this file must carry.
 
-    return (
-        "# Lab Profile Candidate — NOT trusted, NOT usable for qualification.\n"
-        f"# Produced by make lab-profile-discover at {utc_timestamp()}\n"
-        f"# Discovery input: {source}\n"
-        "# Review this identity, then activate it explicitly with\n"
-        "# make lab-profile-activate.  This file is local-only; never commit it.\n"
-        "\n" + candidate.render()
-    )
+    The header holds what the reviewer needs and the terminal would otherwise be
+    the only copy of: when discovery ran, what it read from the lab, and every
+    difference from the input profile.  It is comment text, so the loader ignores
+    it and the profile hash does not depend on it.
+    """
+
+    header = [
+        "# Lab Profile Candidate — NOT trusted, NOT usable for qualification.",
+        f"# Produced by make {DISCOVER_TARGET} at {utc_timestamp()}",
+        f"# Discovery input: {source}",
+        "# Review this identity, then activate it explicitly with",
+        f"# make {ACTIVATE_TARGET}.  This file is local-only; never commit it.",
+        "#",
+        "# Observed:",
+    ]
+    header += [
+        f"#   {finding.subject}: {finding.observed or finding.detail}"
+        for finding in findings
+    ]
+    header += ["#", f"# Comparison: {note}"]
+    header += [f"#   difference: {difference}" for difference in differences] or [
+        "#   no differences from the discovery input"
+    ]
+    return "\n".join(header) + "\n\n" + candidate.render()

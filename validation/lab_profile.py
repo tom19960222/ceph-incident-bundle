@@ -41,12 +41,15 @@ SAFE_PROMETHEUS_URL = re.compile(r"https?://[^\s\x00-\x1f\x7f]+\Z")
 # OpenSSH prints SHA256 host key fingerprints as unpadded base64 of 32 bytes.
 SSH_FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
 FSID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
-# Markers scanned for over the raw profile text, comments included: a profile
-# that carries any of these has credential content in it and is rejected whole
-# rather than partially trusted.
+# Text that means credential material is present.  One list, shared by everything
+# in the lab workflow that has to keep credentials out of a file it writes or a
+# diagnostic it repeats: the profile loader rejects a profile carrying any of
+# these, the probe layer redacts a diagnostic containing one, and the report
+# writer refuses to persist a report with one.  Three copies would drift apart.
 CREDENTIAL_MARKERS = (
     "-----BEGIN",
     "PRIVATE KEY",
+    "Authorization:",
     "ssh-rsa AAAA",
     "ssh-ed25519 AAAA",
     "ecdsa-sha2-nistp256 AAAA",
@@ -114,6 +117,18 @@ class LabProfile:
 
     def ssh_target(self, host: LabHost) -> str:
         return f"{self.ssh_user}@{host.address}"
+
+    def credential_paths(self) -> tuple[tuple[str, Path], ...]:
+        """The credential files this profile references, labelled by profile key.
+
+        A profile records paths, never content.  Both the preflight and the local
+        status check the same set, so the set is defined once here.
+        """
+
+        return (
+            ("ssh key_path", self.ssh_key_path),
+            ("rook kubeconfig_path", self.rook_kubeconfig_path),
+        )
 
     def missing_identity(self) -> tuple[str, ...]:
         """Name every identity field a trusted profile must carry but does not."""

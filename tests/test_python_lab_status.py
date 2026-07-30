@@ -10,9 +10,8 @@ from unittest import mock
 from tests.lab_fixture import OTHER_FSID, FakeLab
 from validation.lab_activation import activate
 from validation.lab_discovery import discover
-from validation.lab_local import CodeIdentity
 from validation.lab_preflight import preflight
-from validation.lab_report import report_from_preflight, write_report
+from validation.lab_report import CodeIdentity, report_from_preflight, write_report
 from validation.lab_status import lab_status
 
 
@@ -199,6 +198,22 @@ class ReportHistoryTests(StatusTestCase):
         status = self.status(profile)
         self.assertEqual(status.state, "ready-for-preflight")
         self.assertIn("lab-preflight", status.next_action)
+
+    def test_a_report_without_a_usable_next_action_falls_back_to_a_local_one(self) -> None:
+        profile = self.lab.write_profile()
+        self.record_preflight(profile, FAKE_LAB_PROM_MODE="down")
+        latest = (self.runs / "LATEST").read_text(encoding="utf-8").strip()
+        report_path = self.runs / latest / "report.json"
+        document = json.loads(report_path.read_text(encoding="utf-8"))
+        for damaged in (None, "", "first\nsecond"):
+            with self.subTest(next_action=damaged):
+                document["next_action"] = damaged
+                report_path.write_text(json.dumps(document), encoding="utf-8")
+                status = self.status(profile)
+                self.assertEqual(status.state, "last-attempt-failed")
+                self.assertNotIn("None", status.next_action)
+                self.assertIn("fix the recorded failure", status.next_action)
+                self.assertNotIn("\n", status.next_action)
 
     def test_reports_that_there_is_no_report_yet(self) -> None:
         status = self.status(self.lab.write_profile())

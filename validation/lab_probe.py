@@ -26,7 +26,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from validation.lab_profile import LabHost, LabProfile
+from validation.lab_profile import CREDENTIAL_MARKERS, LabHost, LabProfile
 
 
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10
@@ -42,8 +42,7 @@ EXIT_COMMAND_MISSING = 127
 EXIT_TIMEOUT = 124
 KEYSCAN_KEY_TYPE = re.compile(r"[a-z][a-z0-9@._-]*\Z")
 KEYSCAN_BLOB = re.compile(r"[A-Za-z0-9+/]+={0,2}\Z")
-# Markers that must never reach a report, even inside a bounded diagnostic.
-DIAGNOSTIC_REDACTIONS = ("-----BEGIN", "PRIVATE KEY", "Authorization:")
+KNOWN_HOSTS_NAME = "known_hosts"
 
 
 @dataclass(frozen=True)
@@ -92,7 +91,7 @@ def bounded_diagnostic(text: str) -> str:
         stripped = line.strip()
         if not stripped:
             continue
-        if any(marker in stripped for marker in DIAGNOSTIC_REDACTIONS):
+        if any(marker in stripped for marker in CREDENTIAL_MARKERS):
             return "[redacted diagnostic]"
         return stripped[:DIAGNOSTIC_MAX_LENGTH]
     return ""
@@ -145,13 +144,15 @@ class LabProber:
         scans: Sequence[HostKeyScan],
         *,
         accepted: Mapping[str, tuple[str, ...]] | None = None,
-        name: str = "known_hosts",
     ) -> Path:
-        """Write a collector-owned known_hosts file for the keys we may trust.
+        """Write the collector-owned known_hosts file for the keys we may trust.
 
         With `accepted`, only fingerprints the caller already trusts are written,
         so a host that rotated its key cannot be reached at all rather than being
         reached and then reported as a mismatch.
+
+        The name is fixed rather than a parameter: this file is the workspace's
+        one trust anchor, and a caller-chosen name could point outside it.
         """
 
         lines: list[str] = []
@@ -160,7 +161,7 @@ class LabProber:
             for key in scan.keys:
                 if allowed is None or key.fingerprint in allowed:
                     lines.append(key.known_hosts_line)
-        path = self.workspace / name
+        path = self.workspace / KNOWN_HOSTS_NAME
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
             for line in lines:

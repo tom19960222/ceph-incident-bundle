@@ -14,10 +14,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from validation.lab_activation import ACTIVATION_LOG_NAME
+from validation.lab_commands import (
+    activate_command,
+    discover_command,
+    preflight_command,
+    qualification_not_implemented,
+    status_command,
+)
 from validation.lab_discovery import CANDIDATE_SUFFIX
+from validation.lab_preflight import STATUS_PASS as PREFLIGHT_PASS_STATUS
 from validation.lab_preflight import credential_problem
 from validation.lab_profile import LabProfile, LabProfileError, load_profile, safe_display_path
-from validation.lab_report import latest_report
+from validation.lab_report import STATUS_PASS, latest_report
 
 
 STATE_PROFILE_MISSING = "profile-missing"
@@ -191,7 +199,7 @@ def lab_status(profile_path: Path, *, runs_directory: Path) -> LabStatus:
             if missing
             else (
                 f"Fix {safe_display_path(profile_path)} ({error}), then re-run "
-                f"make lab-status LAB_PROFILE={profile_path}"
+                f"{status_command(profile_path)}"
             ),
             candidates=candidates,
             last_activation=activation,
@@ -239,65 +247,74 @@ def _verdict(
             STATE_CREDENTIAL_PATH_INVALID,
             f"{first.label} {first.display} {first.problem}",
             f"Fix {first.label} in {path} — {first.display} {first.problem} — then "
-            f"re-run make lab-status LAB_PROFILE={path}",
+            f"re-run {status_command(path)}",
         )
     pending = [candidate for candidate in candidates if candidate.pending_review]
     if pending:
         first = pending[0]
-        replace = " --replace-active" if profile.state == "active" else ""
+        replace = profile.state == "active"
         compared = "the active profile" if profile.state == "active" else "the expected topology"
         return (
             STATE_CANDIDATE_PENDING_REVIEW,
             f"{first.display} is a Lab Profile Candidate awaiting review",
             f"Review {first.display} against {compared} and either run "
-            f"make lab-profile-activate LAB_PROFILE={path} "
-            f"LAB_CANDIDATE={first.display} CEPH_INCIDENT_LAB_ACTIVATE=1{replace}"
-            ", or remove that candidate",
+            + activate_command(path, first.path, replace_active=replace)
+            + ", or remove that candidate",
         )
     if profile.state == "bootstrap":
         return (
             STATE_PROFILE_BOOTSTRAP,
             "the profile records no reviewed lab identity",
-            f"Run make lab-profile-discover LAB_PROFILE={path} to produce a Lab "
-            "Profile Candidate",
+            f"Run {discover_command(path)} to produce a Lab Profile Candidate",
         )
     if profile.state == "candidate":
         return (
             STATE_PROFILE_CANDIDATE,
             "the profile is an unreviewed Lab Profile Candidate",
             f"Review {path} and, if the identity is accepted, run "
-            f"make lab-profile-activate LAB_PROFILE=<active profile> "
-            f"LAB_CANDIDATE={path} CEPH_INCIDENT_LAB_ACTIVATE=1",
+            + activate_command("<active profile>", path),
         )
     if report is not None and _reported_profile_hash(report) == profile.profile_hash:
         status = str(report.get("status", ""))
-        if status == "preflight-pass":
+        directory = report.get("directory")
+        if status == PREFLIGHT_PASS_STATUS:
             return (
                 STATE_PREFLIGHT_PASSED,
                 None,
-                f"Hand off {report.get('directory')}: lab identity is proven for this "
-                "profile, and the full real-lab gate (make validate-lab) is owned by "
-                "issue #20 and is not implemented yet",
+                f"Hand off {directory}: lab identity is proven for this profile, and "
+                + qualification_not_implemented(),
             )
-        if status == "pass":
+        if status == STATUS_PASS:
             return (
                 STATE_PREFLIGHT_PASSED,
                 None,
-                str(report.get("next_action"))
-                or f"Hand off {report.get('directory')}",
+                _recorded_next_action(report) or f"Hand off {directory}",
             )
         return (
             STATE_LAST_ATTEMPT_FAILED,
             f"the last attempt for this profile ended as {status}",
-            str(report.get("next_action"))
-            or f"Review {report.get('directory')} and fix the recorded failure",
+            _recorded_next_action(report)
+            or f"Review {directory} and fix the recorded failure",
         )
     return (
         STATE_READY_FOR_PREFLIGHT,
         None,
-        f"Run make lab-preflight LAB_PROFILE={path} CEPH_INCIDENT_LAB_CONFIRM=1 to "
-        "prove this workstation is talking to the recorded lab",
+        f"Run {preflight_command(path)} to prove this workstation is talking to "
+        "the recorded lab",
     )
+
+
+def _recorded_next_action(report: dict[str, object]) -> str | None:
+    """Repeat a stored report's next action, only if it really recorded one.
+
+    A hand-edited or truncated `report.json` must not turn into a next step that
+    reads `None`: an unusable recorded action falls back to a locally derived one.
+    """
+
+    action = report.get("next_action")
+    if isinstance(action, str) and action.strip() and "\n" not in action:
+        return action
+    return None
 
 
 def _reported_profile_hash(report: dict[str, object]) -> str | None:
@@ -318,18 +335,14 @@ def _reported_profile_hash(report: dict[str, object]) -> str | None:
 def _missing_profile_action(profile_path: Path) -> str:
     return (
         f"Create a local-only Lab Profile at {profile_path} — start from "
-        "validation/lab-bootstrap.example.toml, then run "
-        f"make lab-profile-discover LAB_PROFILE={profile_path}"
+        f"validation/lab-bootstrap.example.toml, then run "
+        f"{discover_command(profile_path)}"
     )
 
 
 def _credential_paths(profile: LabProfile) -> tuple[CredentialPathStatus, ...]:
-    entries = (
-        ("ssh key_path", profile.ssh_key_path),
-        ("rook kubeconfig_path", profile.rook_kubeconfig_path),
-    )
     statuses: list[CredentialPathStatus] = []
-    for label, path in entries:
+    for label, path in profile.credential_paths():
         problem = credential_problem(path)
         statuses.append(
             CredentialPathStatus(

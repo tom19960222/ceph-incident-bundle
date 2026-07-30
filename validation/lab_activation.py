@@ -14,12 +14,17 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from validation.lab_local import append_owner_only, utc_timestamp, write_owner_only
+from validation.lab_commands import (
+    ACTIVATE_TARGET,
+    activate_command,
+    discover_command,
+    status_command,
+)
+from validation.lab_output import append_owner_only, utc_timestamp, write_owner_only
 from validation.lab_profile import LabProfile, LabProfileError, load_profile, safe_display_path
 
 
 ACTIVATION_LOG_NAME = "lab-activation.log.jsonl"
-CONFIRMATION_VARIABLE = "CEPH_INCIDENT_LAB_ACTIVATE"
 STATUS_COMPLETE = "activation-complete"
 STATUS_BLOCKED = "activation-blocked"
 
@@ -35,6 +40,7 @@ class ActivationResult:
     activated: bool = False
     active_hash: str | None = None
     previous_hash: str | None = None
+    replaced_state: str | None = None
     replaced: bool = False
     log_path: Path | None = None
     blocked_reason: str | None = None
@@ -50,6 +56,7 @@ class ActivationResult:
             "activated": self.activated,
             "active_profile_hash": self.active_hash,
             "previous_profile_hash": self.previous_hash,
+            "previous_profile_state": self.replaced_state,
             "replaced_active_profile": self.replaced,
             "activation_log": safe_display_path(self.log_path) if self.log_path else None,
             "status": self.status,
@@ -79,13 +86,13 @@ def activate(
     if not confirmed:
         return blocked(
             "activation was not explicitly confirmed",
-            "Re-run make lab-profile-activate with "
-            f"{CONFIRMATION_VARIABLE}=1 once the candidate identity has been reviewed",
+            f"Re-run {activate_command(active_path, candidate_path)} once the "
+            "candidate identity has been reviewed",
         )
     if candidate_path == active_path:
         return blocked(
             "the candidate and the active profile are the same file",
-            "Re-run make lab-profile-activate with LAB_PROFILE and LAB_CANDIDATE "
+            f"Re-run make {ACTIVATE_TARGET} with LAB_PROFILE and LAB_CANDIDATE "
             "pointing at different files",
         )
     candidate = load_profile(candidate_path)
@@ -93,28 +100,32 @@ def activate(
         return blocked(
             f"{safe_display_path(candidate_path)} is a {candidate.state} profile, "
             "not a reviewed Lab Profile Candidate",
-            f"Run make lab-profile-discover LAB_PROFILE={candidate_path} to produce a "
-            "Lab Profile Candidate, review it, then activate that file",
+            f"Run {discover_command(candidate_path)} to produce a Lab Profile "
+            "Candidate, review it, then activate that file",
         )
 
     previous: LabProfile | None = None
+    replaced_state: str | None = None
     if active_path.exists():
+        replaced_state = "unreadable"
         try:
             previous = load_profile(active_path)
+            replaced_state = previous.state
         except LabProfileError as error:
             if not replace_active:
                 return blocked(
                     f"{safe_display_path(active_path)} exists but is not a readable "
                     f"Lab Profile ({error})",
-                    "Re-run make lab-profile-activate with --replace-active to replace "
-                    f"{safe_display_path(active_path)}, or move that file aside first",
+                    "Re-run "
+                    f"{activate_command(active_path, candidate_path, replace_active=True)}"
+                    f" to replace {active_path}, or move that file aside first",
                 )
         if previous is not None and previous.state == "active" and not replace_active:
             return blocked(
                 f"{safe_display_path(active_path)} is already an active Lab Profile",
                 "Compare the candidate against the active profile and re-run "
-                "make lab-profile-activate with --replace-active to accept the new "
-                "identity",
+                f"{activate_command(active_path, candidate_path, replace_active=True)}"
+                " to accept the new identity",
             )
 
     activated = candidate.with_state("active", path=active_path)
@@ -124,7 +135,9 @@ def activate(
     append_owner_only(
         log_path,
         json.dumps(
-            _audit_record(activated, candidate, candidate_path, previous_hash),
+            _audit_record(
+                activated, candidate, candidate_path, previous_hash, replaced_state
+            ),
             sort_keys=True,
         ),
     )
@@ -135,11 +148,12 @@ def activate(
         activated=True,
         active_hash=activated.profile_hash,
         previous_hash=previous_hash,
-        replaced=previous is not None,
+        replaced_state=replaced_state,
+        replaced=replaced_state is not None,
         log_path=log_path,
         next_action=(
-            f"Run make lab-status LAB_PROFILE={active_path} to confirm the activated "
-            "profile and read the next step"
+            f"Run {status_command(active_path)} to confirm the activated profile and "
+            "read the next step"
         ),
     )
 
@@ -149,8 +163,14 @@ def _audit_record(
     candidate: LabProfile,
     candidate_path: Path,
     previous_hash: str | None,
+    replaced_state: str | None,
 ) -> dict[str, object]:
-    """The activation ledger record: accepted identity only, never credentials."""
+    """The activation ledger record: accepted identity only, never credentials.
+
+    `previous_profile_state` is recorded alongside the hash because a file that
+    was replaced without being readable has no hash — the ledger still has to say
+    that something was overwritten.
+    """
 
     return {
         "activated_at": utc_timestamp(),
@@ -160,6 +180,7 @@ def _audit_record(
         "candidate_profile": safe_display_path(candidate_path),
         "candidate_profile_hash": candidate.profile_hash,
         "previous_profile_hash": previous_hash,
+        "previous_profile_state": replaced_state,
         "ceph_fsid": activated.ceph_fsid,
         "rook_fsid": activated.rook_fsid,
         "prometheus_url": activated.prometheus_url,
@@ -180,7 +201,7 @@ def _active_document(
 ) -> str:
     return (
         "# Active Lab Profile — reviewed and explicitly activated.\n"
-        f"# Activated by make lab-profile-activate at {utc_timestamp()}\n"
+        f"# Activated by make {ACTIVATE_TARGET} at {utc_timestamp()}\n"
         f"# Source candidate: {candidate_path} ({candidate.profile_hash})\n"
         "# This file is local-only; never commit it.\n"
         "\n" + activated.render()

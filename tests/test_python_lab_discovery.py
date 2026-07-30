@@ -55,6 +55,20 @@ class BootstrapDiscoveryTests(DiscoveryTestCase):
         self.assertIn("lab-profile-discover", text)
         self.assertIn("NOT trusted", text)
 
+    def test_the_candidate_records_what_discovery_observed(self) -> None:
+        bootstrap = self.lab.write_profile(state="bootstrap", identity=False)
+        result = self.run_discovery(bootstrap)
+        text = result.candidate_path.read_text(encoding="utf-8")
+        self.assertIn("# Observed:", text)
+        self.assertIn("prometheus readiness", text)
+        self.assertIn(f"host key monitor01: {host_fingerprint('10.0.0.11')}", text)
+        self.assertIn("no recorded identity", text)
+        # The review record is comment text, so it cannot change the identity hash.
+        self.assertEqual(
+            load_profile(result.candidate_path).profile_hash,
+            result.candidate.profile_hash,
+        )
+
     def test_the_candidate_is_owner_only(self) -> None:
         bootstrap = self.lab.write_profile(state="bootstrap", identity=False)
         result = self.run_discovery(bootstrap)
@@ -156,6 +170,14 @@ class IdentityDriftTests(DiscoveryTestCase):
         keys = json.dumps({"10.0.0.11": [["ssh-ed25519", "rebuilt-lab-key"]]})
         result = self.run_discovery(active, knobs={"FAKE_LAB_HOST_KEYS": keys})
         self.assertTrue(any("monitor01 host keys changed" in item for item in result.differences))
+
+    def test_the_candidate_records_every_difference_for_review(self) -> None:
+        active = self.lab.write_profile()
+        result = self.run_discovery(active, knobs={"FAKE_LAB_CEPH_FSID": OTHER_FSID})
+        text = result.candidate_path.read_text(encoding="utf-8")
+        self.assertIn(f"# Comparison: {result.comparison_note}", text)
+        for difference in result.differences:
+            self.assertIn(f"#   difference: {difference}", text)
 
     def test_reports_a_changed_hostname(self) -> None:
         active = self.lab.write_profile()

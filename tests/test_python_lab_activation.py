@@ -108,6 +108,30 @@ class AuditTrailTests(ActivationTestCase):
             record["hosts"][0]["ssh_fingerprints"], [host_fingerprint("10.0.0.11")]
         )
 
+    def test_the_ledger_says_what_was_replaced_even_when_it_had_no_hash(self) -> None:
+        bootstrap = self.bootstrap()
+        candidate = self.candidate_for(bootstrap)
+        target = self.lab.profiles / "broken.toml"
+        target.write_text("this is not a lab profile\n", encoding="utf-8")
+        result = activate(candidate, target, confirmed=True, replace_active=True)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.replaced)
+        self.assertIsNone(result.previous_hash)
+        self.assertEqual(result.replaced_state, "unreadable")
+        record = json.loads(
+            (target.parent / ACTIVATION_LOG_NAME).read_text("utf-8").splitlines()[-1]
+        )
+        self.assertEqual(record["previous_profile_state"], "unreadable")
+
+    def test_the_ledger_records_the_state_of_a_readable_replaced_profile(self) -> None:
+        bootstrap = self.bootstrap()
+        candidate = self.candidate_for(bootstrap)
+        activate(candidate, bootstrap, confirmed=True)
+        record = json.loads(
+            (bootstrap.parent / ACTIVATION_LOG_NAME).read_text("utf-8").splitlines()[0]
+        )
+        self.assertEqual(record["previous_profile_state"], "bootstrap")
+
     def test_the_audit_log_carries_no_credential_content(self) -> None:
         bootstrap = self.bootstrap()
         candidate = self.candidate_for(bootstrap)

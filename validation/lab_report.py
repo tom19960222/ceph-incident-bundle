@@ -20,12 +20,14 @@ and stay `not-run` until the dual-run harness (issue #20) fills them.
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
-from validation.lab_local import CodeIdentity, utc_run_id, utc_timestamp, write_owner_only
+from validation.lab_output import utc_timestamp, write_owner_only
 from validation.lab_preflight import PreflightResult
-from validation.lab_profile import safe_display_path
+from validation.lab_profile import CREDENTIAL_MARKERS, safe_display_path
 
 
 REPORT_SCHEMA_VERSION = 1
@@ -33,20 +35,51 @@ REPORT_JSON_NAME = "report.json"
 REPORT_MARKDOWN_NAME = "report.md"
 LATEST_NAME = "LATEST"
 NOT_RUN = "not-run"
+STATUS_PASS = "pass"
 COLLECTOR_PATHS = ("ceph", "rook", "prometheus", "nodes", "var_log")
-# A report is written from bounded diagnostics, but "bounded" is not "safe": scan
-# the finished documents and refuse to persist one that carries credentials.
-FORBIDDEN_MARKERS = (
-    "-----BEGIN",
-    "PRIVATE KEY",
-    "Authorization:",
-    "client-key-data",
-    "client-certificate-data",
-)
+RUN_ID_FORMAT = "%Y%m%dT%H%M%SZ"
+GIT_TIMEOUT_SECONDS = 10
 
 
 class ReportRejected(Exception):
     """A report was refused rather than written in an unsafe or ambiguous shape."""
+
+
+@dataclass(frozen=True)
+class CodeIdentity:
+    """Which code a lab workflow ran, so a report can be traced back to it."""
+
+    commit: str
+    dirty: bool
+
+    @property
+    def display(self) -> str:
+        return f"{self.commit}{'-dirty' if self.dirty else ''}"
+
+
+def code_identity(root: Path) -> CodeIdentity:
+    """Read the repository commit and dirty state, or report them as unknown."""
+
+    commit = _git(root, "rev-parse", "HEAD") or "unknown"
+    status = _git(root, "status", "--porcelain")
+    return CodeIdentity(commit=commit, dirty=bool(status))
+
+
+def _git(root: Path, *arguments: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=GIT_TIMEOUT_SECONDS,
+            check=False,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.strip()
 
 
 @dataclass(frozen=True)
@@ -137,9 +170,11 @@ class LabValidationReport:
     timestamp: str
     code: CodeIdentity
     profile_display: str
-    profile_hash: str
-    profile_state: str
-    profile_name: str
+    # A profile that would not load has no hash, state or name to record.  The
+    # attempt is still reported: "the profile was unusable" is the result.
+    profile_hash: str | None
+    profile_state: str | None
+    profile_name: str | None
     status: str
     next_action: str
     lab_identity: dict[str, object] = field(default_factory=dict)
@@ -152,7 +187,9 @@ class LabValidationReport:
 
     @property
     def passed(self) -> bool:
-        return self.status == "pass"
+        """Whether the whole real-lab gate passed — not merely one stage of it."""
+
+        return self.status == STATUS_PASS
 
     def document(self) -> dict[str, object]:
         return {
@@ -183,9 +220,9 @@ class LabValidationReport:
             f"- timestamp: {self.timestamp}",
             f"- code: {self.code.display}",
             f"- profile: {self.profile_display}",
-            f"- profile hash: {self.profile_hash}",
-            f"- profile state: {self.profile_state}",
-            f"- profile name: {self.profile_name}",
+            f"- profile hash: {self.profile_hash or 'unknown'}",
+            f"- profile state: {self.profile_state or 'unknown'}",
+            f"- profile name: {self.profile_name or 'unknown'}",
             "",
             "## Status",
             "",
@@ -214,7 +251,7 @@ class LabValidationReport:
             [
                 (
                     run.implementation,
-                    str(run.exit_code),
+                    "-" if run.exit_code is None else str(run.exit_code),
                     run.verify_result,
                     "complete" if run.coverage.complete else _coverage_gaps(run.coverage),
                     run.bundle_path or "-",
@@ -233,7 +270,12 @@ class LabValidationReport:
             "",
             "## Stable state",
             "",
-            f"- snapshot schema version: {self.stable_state.schema_version}",
+            "- snapshot schema version: "
+            + (
+                NOT_RUN
+                if self.stable_state.schema_version is None
+                else str(self.stable_state.schema_version)
+            ),
             f"- result: {self.stable_state.result}",
         ]
         lines += [f"- difference: {item}" for item in self.stable_state.differences]
@@ -261,6 +303,8 @@ def write_report(runs_directory: Path, report: LabValidationReport) -> ReportLoc
     _reject_unusable(report)
     document = json.dumps(report.document(), indent=2, sort_keys=True) + "\n"
     markdown = report.markdown()
+    # A report is built from bounded diagnostics, but "bounded" is not "safe":
+    # scan the finished documents and refuse to persist one that leaks.
     for rendered in (document, markdown):
         marker = _forbidden_marker(rendered)
         if marker is not None:
@@ -305,6 +349,34 @@ def report_from_preflight(
     )
 
 
+def report_from_unusable_profile(
+    profile_path: Path,
+    error: str,
+    *,
+    code: CodeIdentity,
+    status: str,
+    next_action: str,
+) -> LabValidationReport:
+    """Build a report for an attempt that never got past loading the profile.
+
+    A run that could not read its profile is still an attempt, and the runbook
+    requires every attempt to leave a report rather than only a terminal message.
+    """
+
+    return LabValidationReport(
+        timestamp=utc_timestamp(),
+        code=code,
+        profile_display=safe_display_path(profile_path),
+        profile_hash=None,
+        profile_state=None,
+        profile_name=None,
+        preflight=({"name": "profile-load", "ok": False, "detail": error},),
+        runs=(RunRecord("shell"), RunRecord("python")),
+        status=status,
+        next_action=next_action,
+    )
+
+
 def latest_report(runs_directory: Path) -> dict[str, object] | None:
     """Read the most recent report's JSON document, if there is a usable one."""
 
@@ -336,7 +408,7 @@ def _reject_unusable(report: LabValidationReport) -> None:
 
 
 def _forbidden_marker(text: str) -> str | None:
-    for marker in FORBIDDEN_MARKERS:
+    for marker in CREDENTIAL_MARKERS:
         if marker in text:
             return marker
     return None
@@ -346,7 +418,7 @@ def _reserve_run_directory(runs_directory: Path) -> Path:
     """Create a fresh run directory, without colliding with an existing run."""
 
     runs_directory.mkdir(parents=True, exist_ok=True)
-    base = utc_run_id()
+    base = datetime.now(timezone.utc).strftime(RUN_ID_FORMAT)
     candidate = runs_directory / base
     attempt = 1
     while True:

@@ -150,7 +150,9 @@ Snapshot schema 必須明確排除會自然變動的 counter、epoch、timestamp
 
 Report 不得包含 private key、keyring、password、token、Authorization header、kubeconfig credential payload、完整環境變數 dump 或 command stdin。若錯誤輸出可能帶 secret，應在寫入 report 前遮蔽，只保留定位問題所需的 bounded diagnostics。
 
-實作狀態：schema 由 issue #19 固定，writer 會在寫入前檢查兩件事並 fail closed——`next_action` 恰好一個非空單行字串，且兩種格式都不含 credential marker。Run directory 預設在 `results/lab-validation/<run-id>/`（`LAB_ARGS=--runs-dir` 可覆寫），`LATEST` 是同層記錄 run directory 名稱的檔案。Coverage、runs、comparison、stable state 與 residue 欄位已在 schema 內，但在 #20 之前一律是 `not-run`。
+實作狀態：schema 由 issue #19 固定，writer 會在寫入前檢查兩件事並 fail closed——`next_action` 恰好一個非空單行字串，且兩種格式都不含 credential marker。Run directory 預設在 `results/lab-validation/<run-id>/`（`LAB_ARGS='--runs-dir <path>'` 可覆寫），`LATEST` 是同層記錄 run directory 名稱的檔案。Coverage、runs、comparison、stable state 與 residue 欄位已在 schema 內，但在 #20 之前一律是 `not-run`。
+
+`lab-preflight` 的每一次嘗試都會留下 report，包含連 profile 都讀不進來的情況；那種 report 的 `profile.hash`／`state` 為 `null`，`preflight` 只有一筆失敗的 `profile-load`，`status` 是具體的 profile failure class。`lab-status` 只會沿用 report 記錄的 `next_action`，且只在它確實是單行非空字串時沿用；否則改用本機推導的下一步。
 
 ## Failure and Handoff Rules
 

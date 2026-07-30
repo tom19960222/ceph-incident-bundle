@@ -8,12 +8,12 @@ from pathlib import Path
 from unittest import mock
 
 from tests.lab_fixture import CEPH_FSID, ROOK_FSID, FakeLab, host_fingerprint
-from validation.lab_local import CodeIdentity
 from validation.lab_preflight import preflight
 from validation.lab_report import (
     COLLECTOR_PATHS,
     LATEST_NAME,
     REPORT_SCHEMA_VERSION,
+    CodeIdentity,
     CollectorCoverage,
     ComparisonRecord,
     LabValidationReport,
@@ -23,6 +23,7 @@ from validation.lab_report import (
     StableStateRecord,
     latest_report,
     report_from_preflight,
+    report_from_unusable_profile,
     write_report,
 )
 
@@ -278,6 +279,28 @@ class PreflightReportTests(unittest.TestCase):
         markdown = write_report(self.runs, report).markdown_path.read_text("utf-8")
         self.assertIn("prometheus-not-ready", markdown)
         self.assertIn("FAILED", markdown)
+
+    def test_an_attempt_that_could_not_load_its_profile_still_reports(self) -> None:
+        report = report_from_unusable_profile(
+            Path("/labs/lab.toml"),
+            "missing lab profile: /labs/lab.toml",
+            code=CODE,
+            status="profile-invalid",
+            next_action="Create the profile and re-run the preflight",
+        )
+        location = write_report(self.runs, report)
+        document = json.loads(location.json_path.read_text(encoding="utf-8"))
+        self.assertEqual(document["status"], "profile-invalid")
+        self.assertIsNone(document["profile"]["hash"])
+        self.assertIsNone(document["profile"]["state"])
+        self.assertEqual(document["preflight"][0]["name"], "profile-load")
+        self.assertFalse(document["preflight"][0]["ok"])
+        self.assertFalse(report.passed)
+        markdown = location.markdown_path.read_text(encoding="utf-8")
+        self.assertIn("profile-load", markdown)
+        self.assertIn("no lab identity was verified", markdown)
+        self.assertIn("- profile hash: unknown", markdown)
+        self.assertNotIn("None", markdown)
 
     def test_the_written_report_carries_no_credential_content(self) -> None:
         with mock.patch.dict(os.environ, self.lab.environment()):

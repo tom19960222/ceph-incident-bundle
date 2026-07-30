@@ -20,6 +20,11 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from validation.lab_commands import (
+    activate_command,
+    discover_command,
+    qualification_not_implemented,
+)
 from validation.lab_probe import LabProber
 from validation.lab_profile import LabProfile, load_profile, safe_display_path
 
@@ -36,8 +41,7 @@ FAILURE_PROMETHEUS = "prometheus-not-ready"
 # The gate that consumes a passing preflight does not exist yet.  Saying so is
 # part of the contract: a passing preflight is not qualification evidence.
 PASS_NEXT_ACTION = (
-    "Hand off this preflight report: the full real-lab gate (make validate-lab) "
-    "is owned by issue #20 and is not implemented yet"
+    f"Hand off this preflight report: {qualification_not_implemented()}"
 )
 
 
@@ -158,13 +162,12 @@ class _Preflight:
         if self.profile.state == "candidate":
             action = (
                 f"Review {self.profile_path} and, if the identity is accepted, run "
-                f"make lab-profile-activate LAB_PROFILE=<active profile> "
-                f"LAB_CANDIDATE={self.profile_path} CEPH_INCIDENT_LAB_ACTIVATE=1"
+                + activate_command("<active profile>", self.profile_path)
             )
         else:
             action = (
-                f"Run make lab-profile-discover LAB_PROFILE={self.profile_path} to "
-                "produce a Lab Profile Candidate, then review and activate it"
+                f"Run {discover_command(self.profile_path)} to produce a Lab Profile "
+                "Candidate, then review and activate it"
             )
         return self._failed(
             "profile-state",
@@ -177,18 +180,15 @@ class _Preflight:
     def _check_credential_paths(self) -> PreflightResult | None:
         """Prove the credential files exist and are private, never read them."""
 
-        for label, path in (
-            ("ssh key_path", self.profile.ssh_key_path),
-            ("rook kubeconfig_path", self.profile.rook_kubeconfig_path),
-        ):
+        for label, path in self.profile.credential_paths():
             problem = credential_problem(path)
             if problem is not None:
                 return self._failed(
                     "credential-paths",
                     f"{label} {safe_display_path(path)} {problem}",
                     FAILURE_CREDENTIAL_PATH,
-                    f"Fix {label} in {self.profile_path} — "
-                    f"{safe_display_path(path)} {problem} — then re-run the preflight",
+                    f"Fix {label} in {self.profile_path} — {path} {problem} — then "
+                    "re-run the preflight",
                 )
         self._passed(
             "credential-paths",
@@ -220,9 +220,9 @@ class _Preflight:
                 "ssh-fingerprints",
                 "; ".join(problems),
                 FAILURE_FINGERPRINT,
-                f"Run make lab-profile-discover LAB_PROFILE={self.profile_path} to "
-                "record the offered host keys, review the difference, then activate "
-                "the candidate — never edit the recorded fingerprints to match",
+                f"Run {discover_command(self.profile_path)} to record the offered "
+                "host keys, review the difference, then activate the candidate — "
+                "never edit the recorded fingerprints to match",
             )
         # Only keys the active profile already trusts reach the pinned known_hosts,
         # so every later probe is talking to a host that proved a trusted key.
@@ -292,9 +292,9 @@ class _Preflight:
                 f"{self.profile.ceph_seed} reports Ceph FSID {outcome.value}; "
                 f"profile records {self.profile.ceph_fsid}",
                 FAILURE_CEPH_IDENTITY,
-                f"This is a different Ceph cluster: run make lab-profile-discover "
-                f"LAB_PROFILE={self.profile_path}, review the new identity, and "
-                "activate the candidate before any collect",
+                "This is a different Ceph cluster: run "
+                f"{discover_command(self.profile_path)}, review the new identity, "
+                "and activate the candidate before any collect",
             )
         self.identity["ceph_fsid"] = outcome.value
         self._passed("ceph-identity", f"Ceph FSID matches via {outcome.detail}")
@@ -317,9 +317,9 @@ class _Preflight:
                 f"namespace {self.profile.rook_namespace} reports Rook FSID "
                 f"{outcome.value}; profile records {self.profile.rook_fsid}",
                 FAILURE_ROOK_IDENTITY,
-                f"This is a different Rook cluster: run make lab-profile-discover "
-                f"LAB_PROFILE={self.profile_path}, review the new identity, and "
-                "activate the candidate before any collect",
+                "This is a different Rook cluster: run "
+                f"{discover_command(self.profile_path)}, review the new identity, "
+                "and activate the candidate before any collect",
             )
         self.identity["rook_fsid"] = outcome.value
         self._passed("rook-identity", f"Rook FSID matches via {outcome.detail}")

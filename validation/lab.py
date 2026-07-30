@@ -25,18 +25,28 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from validation.lab_activation import CONFIRMATION_VARIABLE, activate
+from validation.lab_activation import activate
+from validation.lab_commands import (
+    ACTIVATION_CONFIRMATION_VARIABLE,
+    PREFLIGHT_CONFIRMATION_VARIABLE,
+    preflight_command,
+    status_command,
+)
 from validation.lab_discovery import discover
-from validation.lab_local import code_identity
 from validation.lab_preflight import preflight
 from validation.lab_profile import LabProfileError
-from validation.lab_report import ReportRejected, report_from_preflight, write_report
+from validation.lab_report import (
+    ReportRejected,
+    code_identity,
+    report_from_preflight,
+    report_from_unusable_profile,
+    write_report,
+)
 from validation.lab_status import lab_status
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUNS_DIRECTORY = REPOSITORY_ROOT / "results" / "lab-validation"
-PREFLIGHT_CONFIRMATION_VARIABLE = "CEPH_INCIDENT_LAB_CONFIRM"
 COMMANDS = ("status", "discover", "activate", "preflight")
 USAGE = """Usage:
   python3 -m validation.lab status --profile PATH [--runs-dir PATH] [--json]
@@ -65,9 +75,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
     try:
         return _dispatch(options)
     except LabProfileError as error:
+        profile: Path = options["profile"]  # type: ignore[assignment]
         sys.stderr.write(f"error: {error}\n")
         sys.stderr.write(
-            f"next action: fix {options['profile']} and re-run this command\n"
+            f"next action: fix {profile} ({error}), then run {status_command(profile)}\n"
         )
         return EXIT_BLOCKED
     except ReportRejected as error:
@@ -126,7 +137,7 @@ def _activate(options: dict[str, object]) -> int:
     result = activate(
         options["candidate"],  # type: ignore[arg-type]
         options["profile"],  # type: ignore[arg-type]
-        confirmed=os.environ.get(CONFIRMATION_VARIABLE) == "1",
+        confirmed=os.environ.get(ACTIVATION_CONFIRMATION_VARIABLE) == "1",
         replace_active=bool(options["replace_active"]),
     )
     lines = [
@@ -158,13 +169,19 @@ def _preflight(options: dict[str, object]) -> int:
         )
         return EXIT_USAGE
     profile_path: Path = options["profile"]  # type: ignore[assignment]
-    result = preflight(profile_path)
+    runs_directory: Path = options["runs_directory"]  # type: ignore[assignment]
+    try:
+        result = preflight(profile_path)
+    except LabProfileError as error:
+        # An unusable profile is still an attempt, so it still leaves a report for
+        # the next agent rather than only a message on this terminal.
+        return _report_unusable_profile(profile_path, error, runs_directory)
     report = report_from_preflight(
         result,
         code=code_identity(REPOSITORY_ROOT),
         hosts=tuple(host.name for host in result.profile.hosts),
     )
-    location = write_report(options["runs_directory"], report)  # type: ignore[arg-type]
+    location = write_report(runs_directory, report)
     lines = ["Lab identity preflight"]
     for check in result.checks:
         lines.append(
@@ -181,6 +198,33 @@ def _preflight(options: dict[str, object]) -> int:
     summary["report_directory"] = str(location.directory)
     _emit(summary, "\n".join(lines) + "\n", as_json=bool(options["as_json"]))
     return EXIT_OK if result.ok else EXIT_BLOCKED
+
+
+def _report_unusable_profile(
+    profile_path: Path, error: LabProfileError, runs_directory: Path
+) -> int:
+    next_action = (
+        f"Fix {profile_path} ({error}), then re-run {preflight_command(profile_path)}"
+    )
+    location = write_report(
+        runs_directory,
+        report_from_unusable_profile(
+            profile_path,
+            str(error),
+            code=code_identity(REPOSITORY_ROOT),
+            status=error.failure_class,
+            next_action=next_action,
+        ),
+    )
+    sys.stderr.write(f"error: {error}\n")
+    sys.stdout.write(
+        f"Lab identity preflight\n"
+        f"  profile-load: FAILED ({error})\n"
+        f"  status:    {error.failure_class}\n"
+        f"  report:    {location.directory}\n"
+        f"\nnext action: {next_action}\n"
+    )
+    return EXIT_BLOCKED
 
 
 def _emit(document: dict[str, object], text: str, *, as_json: bool) -> None:

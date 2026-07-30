@@ -118,7 +118,7 @@ class HostnameProbeTests(ProbeTestCase):
 
     def test_an_unpinned_host_cannot_be_reached(self) -> None:
         prober = self.prober()
-        empty = prober.write_known_hosts([], name="empty_known_hosts")
+        empty = prober.write_known_hosts([])
         outcome = prober.read_hostname(self.profile.host("monitor01"), empty)
         self.assertFalse(outcome.ok)
         self.assertIn("Host key verification failed", outcome.detail)
