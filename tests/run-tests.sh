@@ -19,6 +19,7 @@ run_and_capture() {
 
 for path in \
   "$ROOT/run/collect.sh" \
+  "$ROOT/run/hosts-to-inventory.sh" \
   "$ROOT/lib/common.sh" \
   "$ROOT/lib/collect-cluster-cephadm.sh" \
   "$ROOT/lib/collect-cluster-rook.sh" \
@@ -35,6 +36,7 @@ for path in \
   "$ROOT/tests/test-rook-collector.sh" \
   "$ROOT/tests/test-prom-collector.sh" \
   "$ROOT/tests/test-verify-bundle.sh" \
+  "$ROOT/tests/test-hosts-to-inventory.sh" \
   "$ROOT/tests/export-shell-collect-fixture.sh" \
   "$ROOT/tests/fixtures/shell-collect-environment.sh" \
   "$ROOT/tests/fixtures/make-node-archive.py"; do
@@ -43,6 +45,7 @@ done
 
 for path in \
   "$ROOT/run/collect.sh" \
+  "$ROOT/run/hosts-to-inventory.sh" \
   "$ROOT/lib/verify-bundle.sh" \
   "$ROOT/tests/export-shell-collect-fixture.sh" \
   "$ROOT/tests/test-node-archive-acceptance.sh"; do
@@ -112,6 +115,11 @@ prom_collector_args="$(run_and_capture "$ROOT/tests/test-prom-collector.sh")"
 prom_collector_status="${prom_collector_args%%$'\n'*}"
 prom_collector_output="${prom_collector_args#*$'\n'}"
 [[ "$prom_collector_status" == "0" ]] || fail "test-prom-collector.sh failed: $prom_collector_output"
+
+hosts_to_inventory_args="$(run_and_capture "$ROOT/tests/test-hosts-to-inventory.sh")"
+hosts_to_inventory_status="${hosts_to_inventory_args%%$'\n'*}"
+hosts_to_inventory_output="${hosts_to_inventory_args#*$'\n'}"
+[[ "$hosts_to_inventory_status" == "0" ]] || fail "test-hosts-to-inventory.sh failed: $hosts_to_inventory_output"
 
 collect_args="$(run_and_capture "$ROOT/tests/test-collect.sh")"
 collect_status="${collect_args%%$'\n'*}"
