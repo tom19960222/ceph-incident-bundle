@@ -87,7 +87,7 @@ shell 的 `node_copy_file` 複製 evidence 時不寫 manifest entry，`lib/colle
 7. **移植期間補列的兩類（由 #36 提出，等 #8 確認）。** 兩者都是第 1 項「manifest 是 archive 內全部 evidence 的索引」的機械後果，不是新的取捨，但既然第 6 項是逐類列舉，就必須明寫：
 
    - **未執行指令留下的 SKIPPED marker** 也要有 entry：optional 工具不存在、privileged 讀取沒有 sudo、`cephadm` 不存在、複製來源不存在。`command` 記本來要執行的 argv，`exit_code` 記 127（指令不存在）或 2（來源不存在／複製失敗）。marker 檔本身寫得完整，它代表的證據卻不完整，所以一律非 0。timesyncd config 的 marker 同時代表兩個來源，`command` 因此記 `collect-node copy <conf> <conf.d>`。
-   - **`/var/lib/ceph` listing 的 `command` 記 `collect-node list <目錄絕對路徑>`**，理由同第 2 項（`find` 與 `sudo -n find` 兩種形狀），另加一個第 2 項沒有的理由：真實 find expression 內含 `*keyring*`／`*private_key*`，逐字記錄會讓 content safety 把整行 manifest 遮成 `[REDACTED]`，該 artifact 反而失去 index entry。代價是 manifest 不再顯示這條掃描是否 privileged，因此改由 `NodeEvidenceSurfaceTests.test_privileged_reads_go_through_noninteractive_sudo` 的 argv ledger 斷言 `sudo -n find` 守住 command policy。
+   - **`/var/lib/ceph` listing 的 `command` 記 `collect-node list <目錄絕對路徑>`**，理由同第 2 項：實際掃描是 `find` 或 `sudo -n find`，隨 EUID 與 sudo 可用性改變，不是穩定契約。代價是 manifest 不再顯示這條掃描是否 privileged，因此改由 `NodeEvidenceSurfaceTests.test_privileged_reads_go_through_noninteractive_sudo` 的 argv ledger 斷言 `sudo -n find` 守住 command policy。另有一個繫在暫時 content safety 上的附帶理由，記於 ADR 0010 的括號註腳；該層移除後註腳失效，本條不受影響。
 
 ## Delivery Phases
 
