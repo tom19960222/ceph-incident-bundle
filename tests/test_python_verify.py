@@ -344,15 +344,18 @@ class VerifyCliTests(unittest.TestCase):
                     self.assertEqual(list(process_cwd.iterdir()), [])
 
     def test_secret_paths_are_rejected_for_directory_and_archive(self) -> None:
-        for relative_path in (
-            Path("nodes/monitor01/keyring"),
-            Path("nodes/monitor01/.ssh/config"),
-            Path("nodes/monitor01/id_ed25519"),
-            Path("nodes/monitor01/private_key"),
-            Path("nodes/monitor01/client.pem"),
+        # Each pattern is named in the failure, not merely counted: a reader has
+        # to learn which path made verification fail.  A secret directory is
+        # named as the directory, because that is what may not be in a bundle.
+        for relative_path, named in (
+            (Path("nodes/monitor01/keyring"), "nodes/monitor01/keyring"),
+            (Path("nodes/monitor01/.ssh/config"), "nodes/monitor01/.ssh"),
+            (Path("nodes/monitor01/id_ed25519"), "nodes/monitor01/id_ed25519"),
+            (Path("nodes/monitor01/private_key"), "nodes/monitor01/private_key"),
+            (Path("nodes/monitor01/client.pem"), "nodes/monitor01/client.pem"),
         ):
             self.assert_content_rejected_for_directory_and_archive(
-                relative_path, b"not secret by content\n", "forbidden path"
+                relative_path, b"not secret by content\n", f"forbidden path: {named}"
             )
 
     def test_private_key_and_ceph_key_content_are_rejected(self) -> None:
