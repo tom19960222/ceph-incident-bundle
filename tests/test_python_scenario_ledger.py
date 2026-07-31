@@ -6,12 +6,23 @@ documented reason for not porting it, or a blocked entry with an issue.  This
 test is what makes that claim checkable: a renamed test, a new inventory row, a
 quietly relaxed `not-ported` classification or an undocumented blocked entry all
 fail here.
+
+What no mechanical check can decide is whether a referenced test asserts every
+clause of the row it is pointed at.  That is a reading, done by hand, and
+recorded in `docs/test-scenario-audit.md`.  What *is* mechanical is knowing when
+that reading went stale: each audit entry pins a fingerprint of both sides of
+the reading — the inventory row that states the clauses, and the ledger's
+coverage cell that answers them.  Rewording a scenario, changing its fixture
+technique, reclassifying it, or repointing it at a different test all fail here
+until someone re-reads the row.
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import re
+import sys
 import unittest
 from pathlib import Path
 
@@ -19,11 +30,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 INVENTORY = ROOT / "docs" / "test-scenario-inventory.md"
 LEDGER = ROOT / "docs" / "test-scenario-ledger.md"
+AUDIT = ROOT / "docs" / "test-scenario-audit.md"
 
 SCENARIO_ID = re.compile(r"^\|\s*([A-Z]{1,2}[0-9]+[a-z]?)\s*\|(.*)$")
 STATUSES = ("ported", "blocked", "not-ported")
 TEST_REFERENCE = re.compile(r"`(test_python_[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+){2})`")
 OVERVIEW_ROW = re.compile(r"^\|\s*(?:\*\*)?([a-z-]+|合計)(?:\*\*)?\s*\|\s*(?:\*\*)?(\d+)")
+AUDIT_DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+# The scenario's meaning and how it is faked, but not the shell line numbers:
+# unrelated edits to a shell test file move those without changing what the row
+# claims, and a stale-audit signal nobody believes is worse than none.
+AUDITED_COLUMNS = (0, 1, 3)
 
 
 def inventory_scenarios() -> dict[str, bool]:
@@ -35,6 +52,55 @@ def inventory_scenarios() -> dict[str, bool]:
         if match is not None:
             scenarios[match.group(1)] = "不移植" in line
     return scenarios
+
+
+def audited_fingerprints() -> dict[str, str]:
+    """Every scenario id, mapped to the fingerprint of what was audited.
+
+    Both sides of the reading are covered: the inventory row states the clauses,
+    the ledger's status and coverage cell answer them.  A change to either is a
+    reason to read the row again.
+    """
+
+    fingerprints: dict[str, str] = {}
+    coverage = {
+        identifier: f"{status}\x1f{detail}"
+        for identifier, (status, detail, _) in ledger_rows().items()
+    }
+    for line in INVENTORY.read_text(encoding="utf-8").splitlines():
+        match = SCENARIO_ID.match(line)
+        if match is None:
+            continue
+        cells = [cell.strip() for cell in match.group(2).split("|")]
+        if len(cells) <= max(AUDITED_COLUMNS):
+            continue
+        identifier = match.group(1)
+        audited = "\x1f".join(
+            [
+                identifier,
+                *(cells[column] for column in AUDITED_COLUMNS),
+                coverage.get(identifier, "<no ledger row>"),
+            ]
+        )
+        fingerprints[identifier] = hashlib.sha256(
+            audited.encode("utf-8")
+        ).hexdigest()[:16]
+    return fingerprints
+
+
+def audit_records() -> dict[str, tuple[str, str, str]]:
+    """Every audit record: id -> (audit date, fingerprint, finding)."""
+
+    records: dict[str, tuple[str, str, str]] = {}
+    for line in AUDIT.read_text(encoding="utf-8").splitlines():
+        match = SCENARIO_ID.match(line)
+        if match is None:
+            continue
+        cells = [cell.strip() for cell in match.group(2).split("|")]
+        if len(cells) < 4 or AUDIT_DATE.match(cells[0]) is None:
+            continue
+        records[match.group(1)] = (cells[0], cells[1], cells[2])
+    return records
 
 
 def ledger_rows() -> dict[str, tuple[str, str, str]]:
@@ -138,6 +204,27 @@ class ScenarioLedgerTests(unittest.TestCase):
             with self.subTest(scenario=identifier):
                 self.assertIn(differential, names)
 
+    def test_every_scenario_has_a_clause_level_audit_record(self) -> None:
+        self.assertEqual(set(audit_records()), set(self.inventory))
+
+    def test_no_audit_record_outlived_the_row_it_was_made_against(self) -> None:
+        """A reworded, reclassified or repointed row needs re-reading."""
+
+        fingerprints = audited_fingerprints()
+        self.assertEqual(set(fingerprints), set(self.inventory))
+        for identifier, (audited_on, fingerprint, finding) in sorted(
+            audit_records().items()
+        ):
+            with self.subTest(scenario=identifier):
+                self.assertEqual(
+                    fingerprint,
+                    fingerprints[identifier],
+                    f"{identifier} changed since it was audited on {audited_on}; "
+                    f"re-read the row against its tests and update "
+                    f"docs/test-scenario-audit.md",
+                )
+                self.assertTrue(finding, "an audit record needs its finding")
+
     def resolve(self, reference: str) -> object | None:
         module_name, class_name, method_name = reference.rsplit(".", 2)
         try:
@@ -151,4 +238,9 @@ class ScenarioLedgerTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    if "--fingerprints" in sys.argv:
+        # Regenerating the fingerprint column of docs/test-scenario-audit.md.
+        for scenario_id, digest in audited_fingerprints().items():
+            print(f"{scenario_id}\t{digest}")
+    else:
+        unittest.main()

@@ -39,6 +39,7 @@ The non-negotiable rules are:
 
 - `docs/differential-normalizer.md` — the only list of differences the gate may ignore. Widening it needs the same review as changing behaviour.
 - `docs/test-scenario-ledger.md` — which shell scenario each Python test covers, plus the gate declaration and its exact scope.
+- `docs/test-scenario-audit.md` — the by-hand reading of whether those tests assert every clause of the row they are pointed at: the audit method, the per-row findings, and the fingerprints that force a re-audit whenever the inventory row or the ledger's coverage cell changes. It records a reading; it does not enforce one.
 
 The gate was declared passed on 2026-07-30 for the workstation-side contract (#18). That declaration is not qualification: it says the two implementations agree offline, nothing about a real lab.
 

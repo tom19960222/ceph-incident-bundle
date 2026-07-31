@@ -16,6 +16,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from ceph_incident_collectors import (  # noqa: E402
+    _prometheus_auto_step,
+    mask_prometheus_url,
+    prometheus_duration_seconds,
+)
+
 ENTRYPOINT = ROOT / "ceph_incident_bundle.py"
 SHELL_VERIFIER = ROOT / "lib" / "verify-bundle.sh"
 # The Prometheus HTTP boundary is faked by the very same whitelist curl the
@@ -174,6 +180,61 @@ class PrometheusFixture:
         )
         self.assertEqual(shell_verify.returncode, 0, shell_verify.stderr)
         self.assertIn("VERIFY PASS", shell_verify.stdout)
+
+
+class PrometheusGrammarTests(unittest.TestCase):
+    """P1, P2, P3 at the seam the shell reference tests them: pure functions.
+
+    The end-to-end cases each exercise one window, one step and one URL shape,
+    so the conversion table, the step floor and the no-credential case of the
+    masker are only covered here.
+    """
+
+    def test_the_duration_grammar_converts_every_documented_unit(self) -> None:
+        for value, expected in (
+            ("90", 90),
+            ("45s", 45),
+            ("30m", 1800),
+            ("24h", 86400),
+            ("7d", 604800),
+            ("2w", 1209600),
+            # A pasted leading zero is base ten, not octal.
+            ("010h", 36000),
+            ("008", 8),
+        ):
+            with self.subTest(since=value):
+                self.assertEqual(prometheus_duration_seconds(value), expected)
+
+    def test_the_duration_grammar_rejects_what_it_cannot_mean(self) -> None:
+        for value in ("yesterday", "5x", "", "0", "000", "-1", "1.5h", "24 h"):
+            with self.subTest(since=value):
+                self.assertIsNone(prometheus_duration_seconds(value))
+
+    def test_the_auto_step_keeps_a_floor_and_bounds_the_point_count(self) -> None:
+        # Short windows would ask for a sub-second step, so the floor applies.
+        for window in (60, 3600, 86400):
+            with self.subTest(window=window):
+                self.assertEqual(_prometheus_auto_step(window), 15)
+        # ceil(604800 / 10000) keeps a week under the 11k point limit.
+        self.assertEqual(_prometheus_auto_step(604800), 61)
+        self.assertEqual(_prometheus_auto_step(1209600), 121)
+
+    def test_masking_hides_a_password_and_leaves_everything_else_alone(self) -> None:
+        self.assertEqual(
+            mask_prometheus_url("http://u:sekrit@h"), "http://u:***@h"
+        )
+        self.assertEqual(
+            mask_prometheus_url("http://u:s3cr@t@h:9090/x"),
+            "http://u:***@h:9090/x",
+        )
+        # A URL without credentials is recorded exactly as it was given.
+        for url in (
+            "http://prom.example:9090",
+            "https://prom.example/prefix",
+            "http://prom.example:9090/path@notauth",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(mask_prometheus_url(url), url)
 
 
 class PrometheusHappyPathTests(PrometheusFixture, unittest.TestCase):
@@ -457,6 +518,21 @@ class PrometheusQueryShapeTests(PrometheusFixture, unittest.TestCase):
                 "no scrape job matched",
                 self.text_of(contents, "cluster/prometheus/SKIPPED.txt"),
             )
+            # The filter is a pattern, never an option: the matcher receives it
+            # after `--`, so a dash-leading regex matches nothing instead of
+            # being read as an option.  Asserting the argv is the only way to
+            # see this — the matcher's own diagnostics are discarded, so a
+            # "stderr says nothing about grep" assertion could never fail.
+            grep_invocations = [
+                json.loads(line)
+                for line in (root / "grep-argv.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertTrue(grep_invocations)
+            for arguments in grep_invocations:
+                self.assertEqual(arguments[:2], ["-qiE", "--"])
+                self.assertEqual(arguments[2], "-zzz")
 
     def test_the_job_filter_uses_the_shell_posix_ere_dialect(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

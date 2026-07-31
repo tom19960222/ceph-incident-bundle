@@ -249,6 +249,12 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
                 check=True,
             )
             (app / "service.log").write_text("active\n", encoding="utf-8")
+            # N6: a log far larger than any buffer is collected whole, never
+            # truncated to a head or a tail.
+            oversized = b"".join(
+                f"bulk line {index:07d}\n".encode() for index in range(60_000)
+            )
+            (var_log / "bulk.log").write_bytes(oversized)
 
             result = self.run_collect(root, environment)
 
@@ -272,6 +278,13 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
                 self.assertLess(service_payload.index(b"xz recent"), service_payload.index(b"bz2 newer"))
                 self.assertLess(service_payload.index(b"bz2 newer"), service_payload.index(b"zstd newest"))
                 self.assertLess(service_payload.index(b"zstd newest"), service_payload.index(b"active"))
+                bulk = archive.extractfile(
+                    "./nodes/monitor01/logs/var-log/merged/tree/files/bulk.log.merged"
+                )
+                self.assertIsNotNone(bulk)
+                # Merged families carry a provenance header, so the payload is
+                # asserted whole rather than as the entire artifact.
+                self.assertIn(oversized, bulk.read())
                 index = archive.extractfile(
                     "./nodes/monitor01/logs/var-log/INDEX.tsv"
                 )
@@ -487,9 +500,25 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
             outside = root / "outside-secret"
             outside.write_text("outside sentinel\n", encoding="utf-8")
             (var_log / "follow-me.log").symlink_to(outside)
-            (var_log / "server.pem").write_text(
-                "private material\n", encoding="utf-8"
-            )
+            # The reference's forbidden-path rule is `*.<ext>` or `*.<ext>.*`,
+            # so a sensitive name stays sensitive through the compressed and
+            # numeric-rotation variants of every extension it names.
+            for name in (
+                "server.pem",
+                "server.key.1",
+                "client.crt",
+                "store.p12",
+            ):
+                (var_log / name).write_bytes(b"private material\n")
+            with gzip.open(var_log / "server.pem.gz", "wb") as output:
+                output.write(b"compressed private material\n")
+            sensitive = {
+                var_log / "server.pem",
+                var_log / "server.key.1",
+                var_log / "client.crt",
+                var_log / "store.p12",
+                var_log / "server.pem.gz",
+            }
             before_hashes = {
                 path: hashlib.sha256(payload).hexdigest()
                 for path, payload in sources.items()
@@ -519,21 +548,38 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
                 self.assertNotIn(
                     "./nodes/monitor01/logs/var-log/raw/follow-me.log", names
                 )
-                self.assertNotIn(
-                    "./nodes/monitor01/logs/var-log/raw/server.pem", names
-                )
                 skipped = archive.extractfile(
                     "./nodes/monitor01/logs/var-log/SKIPPED-sensitive.txt"
                 )
                 self.assertIsNotNone(skipped)
-                self.assertIn(b"server.pem", skipped.read())
+                skipped_payload = skipped.read()
+                for path in sorted(sensitive):
+                    with self.subTest(sensitive=path.name):
+                        # Neither copied anywhere in the tree, nor merged as
+                        # text, but named as the path that was declined.
+                        self.assertFalse(
+                            any(path.name in name for name in names), sorted(names)
+                        )
+                        self.assertIn(path.name.encode(), skipped_payload)
                 opaque = archive.extractfile(
                     "./nodes/monitor01/logs/var-log/UNREDACTED-OPAQUE.txt"
                 )
                 self.assertIsNotNone(opaque)
                 opaque_payload = opaque.read()
-                self.assertIn(b"support.zip", opaque_payload)
-                self.assertIn(b"wtmp", opaque_payload)
+                for path in sources:
+                    with self.subTest(opaque=path.name):
+                        self.assertIn(path.name.encode(), opaque_payload)
+                        # Opaque evidence is preserved raw, never merged.
+                        self.assertFalse(
+                            any(
+                                name.startswith(
+                                    "./nodes/monitor01/logs/var-log/merged/"
+                                )
+                                and path.name in name
+                                for name in names
+                            ),
+                            sorted(names),
+                        )
 
             after_metadata = {
                 path: (
@@ -555,7 +601,11 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
                 all("iflag=noatime,nofollow" in line for line in dd_invocations)
             )
             self.assertFalse(any("follow-me.log" in line for line in dd_invocations))
-            self.assertFalse(any("server.pem" in line for line in dd_invocations))
+            for path in sorted(sensitive):
+                with self.subTest(unread=path.name):
+                    self.assertFalse(
+                        any(path.name in line for line in dd_invocations)
+                    )
 
     def test_safe_read_failure_is_partial_without_an_unsafe_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -639,27 +689,46 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
                 self.assertIn(b"sudo command not found", journal.read())
 
     def test_keep_original_logs_is_opt_in_and_preserves_stored_bytes(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            environment, _, _ = self.make_fake_environment(root)
-            var_log = root / "var-log"
-            (var_log / "messages").write_text("new\n", encoding="utf-8")
-            with gzip.open(var_log / "messages.1.gz", "wb") as output:
-                output.write(b"old\n")
+        """V4: `original/` exists only with the flag, and then byte for byte."""
 
-            result = self.run_collect(
-                root, environment, extra_arguments=("--keep-original-logs",)
-            )
+        for extra_arguments, expect_originals in (
+            ((), False),
+            (("--keep-original-logs",), True),
+        ):
+            with self.subTest(extra_arguments=extra_arguments), tempfile.TemporaryDirectory() as temporary_directory:
+                root = Path(temporary_directory)
+                environment, _, _ = self.make_fake_environment(root)
+                var_log = root / "var-log"
+                (var_log / "messages").write_text("new\n", encoding="utf-8")
+                with gzip.open(var_log / "messages.1.gz", "wb") as output:
+                    output.write(b"old\n")
 
-            self.assertEqual(result.returncode, 0, result.stderr)
-            bundle = Path(result.stdout.removeprefix("bundle: ").strip())
-            with tarfile.open(bundle, "r:gz") as archive:
-                for name in ("messages", "messages.1.gz"):
-                    original = archive.extractfile(
-                        f"./nodes/monitor01/logs/var-log/original/{name}"
-                    )
-                    self.assertIsNotNone(original)
-                    self.assertEqual(original.read(), (var_log / name).read_bytes())
+                result = self.run_collect(
+                    root, environment, extra_arguments=extra_arguments
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                bundle = Path(result.stdout.removeprefix("bundle: ").strip())
+                with tarfile.open(bundle, "r:gz") as archive:
+                    names = set(archive.getnames())
+                    if not expect_originals:
+                        self.assertFalse(
+                            any(
+                                "/logs/var-log/original/" in name for name in names
+                            ),
+                            sorted(names),
+                        )
+                        continue
+                    # Both the plain file and the compressed rotation are kept
+                    # exactly as they were stored on the node.
+                    for name in ("messages", "messages.1.gz"):
+                        original = archive.extractfile(
+                            f"./nodes/monitor01/logs/var-log/original/{name}"
+                        )
+                        self.assertIsNotNone(original)
+                        self.assertEqual(
+                            original.read(), (var_log / name).read_bytes()
+                        )
 
     def test_var_log_metadata_scan_limit_fails_closed_before_payload_reads(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -967,7 +1036,7 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
                 if case == "corrupt":
                     source = var_log / "broken.log.1.gz"
                     source.write_bytes(b"not gzip\n")
-                    expected_error = b"decode-failed"
+                    expected_error = b"broken.log.1.gz\tdecode-failed"
                 else:
                     source = var_log / "service.log.1.zst"
                     source.write_bytes(b"opaque zstd bytes\n")
@@ -975,7 +1044,9 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
                         f"{root / 'bin'}:{Path(sys.executable).parent}:/usr/bin:/bin"
                     )
                     (root / "bin" / "zstd").unlink()
-                    expected_error = b"missing-codec"
+                    # The row names the codec that was missing, not merely that
+                    # one was: a reader has to know what to install.
+                    expected_error = b"service.log.1.zst\tmissing-codec:zstd"
                 (var_log / "healthy.log").write_text(
                     "healthy\n", encoding="utf-8"
                 )
@@ -1064,17 +1135,23 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             bundle = Path(result.stdout.removeprefix("bundle: ").strip())
             with tarfile.open(bundle, "r:gz") as archive:
-                expected_paths = (
-                    "merged/tree/files/app.merged",
-                    "merged/tree/dirs/app/files/service.log.merged",
-                    "merged/tree/dirs/app.merged/files/service.log.merged",
-                )
-                for relative in expected_paths:
-                    self.assertIsNotNone(
-                        archive.extractfile(
+                # Each of the three colliding names keeps its own payload: a
+                # collision that merely produced three files would still have
+                # lost evidence.
+                expected_paths = {
+                    "merged/tree/files/app.merged": b"top level",
+                    "merged/tree/dirs/app/files/service.log.merged": b"nested",
+                    "merged/tree/dirs/app.merged/files/service.log.merged": (
+                        b"suffix directory"
+                    ),
+                }
+                for relative, expected in expected_paths.items():
+                    with self.subTest(artifact=relative):
+                        collected = archive.extractfile(
                             f"./nodes/monitor01/logs/var-log/{relative}"
                         )
-                    )
+                        self.assertIsNotNone(collected)
+                        self.assertIn(expected, collected.read())
                 messages = archive.extractfile(
                     "./nodes/monitor01/logs/var-log/merged/tree/files/messages.merged"
                 )
@@ -1088,6 +1165,12 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
                 )
                 self.assertIsNotNone(raw)
                 self.assertEqual(raw.read(), mixed)
+                # A NUL past the first block still makes the file binary, so
+                # it is preserved raw and never merged as text.
+                self.assertNotIn(
+                    "./nodes/monitor01/logs/var-log/merged/tree/files/mixed.log.merged",
+                    set(archive.getnames()),
+                )
 
     def test_later_decode_failures_roll_back_and_preserve_raw(self) -> None:
         for fail_at in (2, 3):
@@ -1293,6 +1376,15 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
                 skipped = archive.extractfile("./nodes/monitor01/SKIPPED.txt")
                 self.assertIsNotNone(skipped)
                 self.assertIn(b"timed out after 3s", skipped.read())
+                # O21: a transport failure keeps its verbose re-probe in the
+                # bundle, labelled with the node it belongs to.
+                debug = archive.extractfile(
+                    "./ssh-debug/node-monitor01-ceph_10.0.0.1.log"
+                )
+                self.assertIsNotNone(debug)
+                debug_payload = debug.read()
+                self.assertIn(b"# label: node-monitor01", debug_payload)
+                self.assertIn(b"# target: ceph@10.0.0.1", debug_payload)
             self.assertIn("node collector interrupted", result.stderr)
             self.assertEqual(list((root / "remote-tmp").iterdir()), [])
 
