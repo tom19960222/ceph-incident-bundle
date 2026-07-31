@@ -21,10 +21,12 @@ STATUS_TARGET = "lab-status"
 DISCOVER_TARGET = "lab-profile-discover"
 ACTIVATE_TARGET = "lab-profile-activate"
 PREFLIGHT_TARGET = "lab-preflight"
-# The full real-lab gate does not exist yet; issue #20 owns it.  Naming it here
-# keeps every "you are done for now" message honest about that.
+# The full real-lab gate.  Every earlier step's "you are done for now" message
+# points here, so the name lives with the rest of the command vocabulary.
 QUALIFICATION_TARGET = "validate-lab"
-QUALIFICATION_OWNER = "issue #20"
+# Where a passing qualification hands off.  A report carries exactly one next
+# action, so even a pass names one ticket rather than a list of possibilities.
+CUTOVER_TICKET = "issue #21 (Python cutover qualification in the real lab)"
 
 
 def status_command(profile: Path) -> str:
@@ -57,8 +59,8 @@ def preflight_command(profile: Path) -> str:
     )
 
 
-def qualification_not_implemented() -> str:
+def qualify_command(profile: Path) -> str:
     return (
-        f"the full real-lab gate (make {QUALIFICATION_TARGET}) is owned by "
-        f"{QUALIFICATION_OWNER} and is not implemented yet"
+        f"make {QUALIFICATION_TARGET} LAB_PROFILE={profile} "
+        f"{PREFLIGHT_CONFIRMATION_VARIABLE}=1"
     )

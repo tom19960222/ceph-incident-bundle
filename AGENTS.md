@@ -20,6 +20,7 @@ This repository builds an operationally read-only evidence collector. Before cha
 
 - `docs/read-only-safety.md` for the safety contract and proof obligations.
 - `docs/lab-validation-runbook.md` for the fail-closed lab workflow.
+- `docs/lab-bundle-contract.md` for what the real-lab gate compares and what its stable-state snapshot keeps.
 
 The non-negotiable rules are:
 
@@ -31,7 +32,7 @@ The non-negotiable rules are:
 - Profiles and reports may reference credential paths, but must never contain private keys, keyrings, passwords, tokens, or other credential contents.
 - Ordinary `make validate` must remain offline. Real-lab execution always requires a separate explicit opt-in and a reviewed active Lab Profile.
 
-`make lab-status`, `make lab-profile-discover`, `make lab-profile-activate` and `make lab-preflight` are implemented (issue #19); start from `make lab-status LAB_PROFILE=/absolute/path/to/lab.toml` and follow its single `next_action`. `make validate-lab` — the dual-run full-collect gate — is still owned by issue #20 and does not exist. A passing `lab-preflight` proves lab identity only; until #20 lands, do not invent ad-hoc replacements or claim that the automated real-lab gate exists.
+`make lab-status`, `make lab-profile-discover`, `make lab-profile-activate` and `make lab-preflight` are implemented (issue #19), as is `make validate-lab` — the dual-run full-collect gate (issue #20). Start from `make lab-status LAB_PROFILE=/absolute/path/to/lab.toml` and follow its single `next_action`. A passing `lab-preflight` proves lab identity only; only a `validate-lab` report with `status: pass` is qualification evidence. The harness existing is not the same as qualification having happened: running it in a real lab and deciding cutover is issue #21, so until such a report exists, do not claim the candidate passed the real-lab gate and do not assemble an ad-hoc substitute for it.
 
 ## Equivalence claims
 
@@ -43,4 +44,6 @@ The non-negotiable rules are:
 
 The gate was declared passed on 2026-07-30 for the workstation-side contract (#18). That declaration is not qualification: it says the two implementations agree offline, nothing about a real lab.
 
-The differential gate compares the workstation side: both implementations receive the same canned Node Evidence Archive, so it says nothing about the node collector's own evidence surface. That surface is fully ported (#36), but its equivalence is *asserted* by the ledger's N-series black-box tests (`tests/test_python_collect_node.py`) — hand-written against the shell contract — not *demonstrated* by a shell-versus-Python comparison; ADR 0010 also makes the node manifest deliberately diverge. Say it that way when the distinction matters. Real-lab qualification (#20) has not run, so do not claim the candidate is qualification-ready.
+The differential gate compares the workstation side: both implementations receive the same canned Node Evidence Archive, so it says nothing about the node collector's own evidence surface. That surface is fully ported (#36), but its equivalence is *asserted* by the ledger's N-series black-box tests (`tests/test_python_collect_node.py`) — hand-written against the shell contract — not *demonstrated* by a shell-versus-Python comparison; ADR 0010 also makes the node manifest deliberately diverge. Say it that way when the distinction matters.
+
+`make validate-lab` (#20) is the real-lab counterpart, and it compares a different thing on purpose: two collects of a *live* cluster observe different moments, so it compares the bundles' member set, manifest (command argv and exit code), capture headers, whether each artifact still parses as JSON, skip classes, source/runner selection and four-path coverage — not evidence bodies or `/var/log` bytes. `docs/lab-bundle-contract.md` is the reviewed statement of that scope. The gate has not been run against a real lab, so do not claim the candidate is qualification-ready.

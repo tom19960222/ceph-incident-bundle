@@ -1,8 +1,9 @@
-"""Read-only lab probes shared by discovery and strict identity preflight.
+"""Read-only lab probes shared by discovery, identity preflight and qualification.
 
-Every probe here is a query: `ssh-keyscan`, `hostname`, `ceph fsid`, a local
-`kubectl get`, and one Prometheus readiness GET.  Nothing in this module may
-create, change or delete lab state — see `docs/read-only-safety.md`.
+Every probe here is a query: `ssh-keyscan`, `hostname`, a direct read-only `ceph`
+subcommand, a local `kubectl get`, one Prometheus readiness GET, and a listing of
+collector leftovers on a node.  Nothing in this module may create, change or
+delete lab state — see `docs/read-only-safety.md`.
 
 Two rules shape the SSH surface.  Commands are built as argv vectors, never as a
 local shell expression, so no profile value can become a shell token.  And every
@@ -43,6 +44,46 @@ EXIT_TIMEOUT = 124
 KEYSCAN_KEY_TYPE = re.compile(r"[a-z][a-z0-9@._-]*\Z")
 KEYSCAN_BLOB = re.compile(r"[A-Za-z0-9+/]+={0,2}\Z")
 KNOWN_HOSTS_NAME = "known_hosts"
+# `cephadm shell` can start a container, so it is never a runner here; only the
+# direct CLI and its sudo form are tried, exactly as the collectors do.
+CEPH_RUNNERS = ("ceph", "sudo -n ceph")
+# A ceph subcommand and a kubectl resource both become argv words.  Callers pass
+# module constants, never lab output, and these patterns keep it that way.
+SAFE_CEPH_SUBCOMMAND = re.compile(r"[a-z][a-z0-9 -]*(?: --format json)?\Z")
+SAFE_KUBECTL_RESOURCE = re.compile(r"[a-z][a-z0-9.]*\Z")
+ROOK_CLUSTER_RESOURCE = "cephclusters.ceph.rook.io"
+# The residue probe, as one POSIX sh script.
+#
+# Two details are deliberate.  The sentinel comment is what a fake `ssh` in the
+# offline tests matches on, so the probe stays one recognisable command rather
+# than a shape a fixture has to re-derive.  And the two process markers are
+# assembled from halves at run time: this script's own text appears in `ps`
+# output on the node, so spelling a marker out here would make every probe
+# report itself as leftover collector activity.
+RESIDUE_PROBE = """# ceph-incident-residue-probe
+set -u
+dir=${TMPDIR:-/tmp}
+for entry in "$dir"/ceph-incident-node.* "$dir"/ceph-incident-node-*; do
+  [ -e "$entry" ] || continue
+  printf 'workspace\\t%s\\n' "$entry"
+done
+head=collect-node
+tail=.sh
+node=ceph_incident
+script=_node.py
+snapshot=$(ps -eo args= 2>/dev/null || true)
+set -f
+old=$IFS
+IFS='
+'
+for line in $snapshot; do
+  case "$line" in
+    *"$head$tail"*|*"$node$script"*) printf 'process\\t%s\\n' "$line" ;;
+  esac
+done
+IFS=$old
+exit 0
+"""
 
 
 @dataclass(frozen=True)
@@ -181,29 +222,42 @@ class LabProber:
         return ProbeOutcome(False, None, _failure_detail("hostname", code, err))
 
     def read_ceph_fsid(self, known_hosts: Path) -> ProbeOutcome:
-        """Read the Ceph FSID from the seed host using a direct read-only CLI.
+        """Read the Ceph FSID from the seed host using a direct read-only CLI."""
 
-        `cephadm shell` can start a container, so it is not a fallback here; only
-        `ceph` and `sudo -n ceph` are tried, exactly as the collectors do.
+        outcome = self.run_ceph(known_hosts, "fsid")
+        if not outcome.ok or outcome.value is None:
+            return outcome
+        return ProbeOutcome(True, outcome.value.strip().lower(), outcome.detail)
+
+    def run_ceph(self, known_hosts: Path, subcommand: str) -> ProbeOutcome:
+        """Run one read-only `ceph` subcommand on the seed host, direct CLI only.
+
+        The subcommand comes from a module constant at every call site, never
+        from lab output, and is checked against the safe grammar anyway: it
+        becomes one remote word sequence, and a value that could carry a shell
+        token would make this probe a write surface.
         """
 
+        if SAFE_CEPH_SUBCOMMAND.fullmatch(subcommand) is None:
+            raise ValueError(f"unsafe ceph subcommand: {subcommand}")
         seed = self.profile.seed_host
         attempts: list[str] = []
-        for remote in ("ceph fsid", "sudo -n ceph fsid"):
+        for runner in CEPH_RUNNERS:
+            remote = f"{runner} {subcommand}"
             code, out, err = _run(
                 self._ssh_command(seed, known_hosts, remote),
                 timeout=self.command_timeout,
             )
-            value = out.strip()
-            if code == 0 and value:
-                return ProbeOutcome(True, value.lower(), f"`{remote}` on {seed.name}")
+            if code == 0 and out.strip():
+                return ProbeOutcome(True, out, f"`{remote}` on {seed.name}")
             attempts.append(_failure_detail(remote, code, err))
         return ProbeOutcome(False, None, "; ".join(attempts))
 
-    def read_rook_fsid(self) -> ProbeOutcome:
-        """Read the Rook CephCluster FSID with one local read-only kubectl get."""
+    def kubectl_get(self, namespace: str, resource: str) -> ProbeOutcome:
+        """Read one namespaced resource with a single local read-only kubectl get."""
 
-        namespace = self.profile.rook_namespace
+        if SAFE_KUBECTL_RESOURCE.fullmatch(resource) is None:
+            raise ValueError(f"unsafe kubectl resource: {resource}")
         code, out, err = _run(
             [
                 "kubectl",
@@ -212,16 +266,46 @@ class LabProber:
                 "-n",
                 namespace,
                 "get",
-                "cephclusters.ceph.rook.io",
+                resource,
                 "-o",
                 "json",
             ],
             timeout=self.command_timeout,
         )
         if code != 0:
-            return ProbeOutcome(False, None, _failure_detail("kubectl get", code, err))
+            return ProbeOutcome(
+                False, None, _failure_detail(f"kubectl get {resource}", code, err)
+            )
+        return ProbeOutcome(True, out, f"{resource} in namespace {namespace}")
+
+    def list_collector_residue(self, host: LabHost, known_hosts: Path) -> ProbeOutcome:
+        """List this node's collector workspaces and helper processes, changing nothing.
+
+        The probe only reads: it never removes a workspace and never signals a
+        process, because "make the check pass" is not a thing a residue check may
+        be able to do.  Ownership is decided on the workstation by comparing this
+        listing with the one taken before the first collect.
+        """
+
+        code, out, err = _run(
+            self._ssh_command(host, known_hosts, RESIDUE_PROBE),
+            timeout=self.command_timeout,
+        )
+        if code != 0:
+            return ProbeOutcome(
+                False, None, _failure_detail("residue probe", code, err)
+            )
+        return ProbeOutcome(True, out, f"residue probe on {host.name}")
+
+    def read_rook_fsid(self) -> ProbeOutcome:
+        """Read the Rook CephCluster FSID with one local read-only kubectl get."""
+
+        namespace = self.profile.rook_namespace
+        outcome = self.kubectl_get(namespace, ROOK_CLUSTER_RESOURCE)
+        if not outcome.ok:
+            return outcome
         try:
-            document = json.loads(out)
+            document = json.loads(outcome.value or "")
             items = document["items"]
         except (ValueError, KeyError, TypeError):
             return ProbeOutcome(False, None, "kubectl returned an unparseable CephCluster list")

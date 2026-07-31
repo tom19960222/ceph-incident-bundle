@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Whitelist fake ssh for the fake lab's read-only identity probes.
+"""Whitelist fake ssh for the fake lab's read-only identity and state probes.
 
-The full option vector is matched exactly, and only three remote commands are
-answered: ``hostname``, ``ceph fsid`` and ``sudo -n ceph fsid``.  Anything else
-exits 99, so a probe that reaches for ``cephadm shell``, a write verb or an extra
-option fails the suite immediately.
+The full option vector is matched exactly, and only a fixed set of remote
+commands is answered: ``hostname``, the direct ``ceph`` reads the identity
+preflight and the stable-state snapshot need, and the residue probe (recognised
+by its sentinel comment).  Anything else exits 99, so a probe that reaches for
+``cephadm shell``, a write verb or an extra option fails the suite immediately.
 
 Host key pinning is enforced, not assumed: the fake refuses to connect unless
 ``StrictHostKeyChecking=yes`` is set and the collector-owned known_hosts file
@@ -19,6 +20,10 @@ Knobs (env):
   FAKE_LAB_CEPH_DIRECT_FAIL  `ceph fsid` fails so only `sudo -n ceph` answers
   FAKE_LAB_CEPH_FAIL       both Ceph runners fail
   FAKE_LAB_SSH_UNREACHABLE space-separated addresses that refuse the connection
+  FAKE_LAB_CEPH_STATE      JSON {subcommand: document} overriding the stable state
+  FAKE_LAB_CEPH_STATE_FAIL space-separated ceph subcommands that fail
+  FAKE_LAB_RESIDUE_FILE    JSON {address: ["workspace\\t...", "process\\t..."]}
+  FAKE_LAB_RESIDUE_FAIL    space-separated addresses whose residue probe fails
 """
 
 from __future__ import annotations
@@ -53,7 +58,82 @@ EXPECTED = (
     "-o",
     KNOWN_HOSTS_FILE,
 )
-REMOTE_COMMANDS = ("hostname", "ceph fsid", "sudo -n ceph fsid")
+CEPH_SUBCOMMANDS = (
+    "fsid",
+    "mon dump --format json",
+    "osd tree --format json",
+    "osd pool ls detail --format json",
+    "config dump --format json",
+)
+REMOTE_COMMANDS = ("hostname",) + tuple(
+    f"{runner} {subcommand}"
+    for runner in ("ceph", "sudo -n ceph")
+    for subcommand in CEPH_SUBCOMMANDS
+)
+RESIDUE_SENTINEL = "# ceph-incident-residue-probe"
+# The stable state a healthy fake lab reports.  Every value here is identity or
+# desired configuration; the snapshot projection is what decides that, so the
+# fixture also serves volatile fields (epochs, counters, status) to prove they
+# are dropped rather than merely absent.
+DEFAULT_CEPH_STATE = {
+    "mon dump --format json": {
+        "epoch": 7,
+        "fsid": "3f2b1c8e-0000-4a1d-8b7e-000000000001",
+        "modified": "2026-07-31T00:00:00.000000+0000",
+        "election_epoch": 42,
+        "quorum": [0, 1],
+        "mons": [
+            {"rank": 0, "name": "monitor01", "public_addr": "10.0.0.11:6789/0"},
+            {"rank": 1, "name": "mon02", "public_addr": "10.0.0.12:6789/0"},
+        ],
+    },
+    "osd tree --format json": {
+        "nodes": [
+            {
+                "id": -1,
+                "name": "default",
+                "type": "root",
+                "children": [0, 1],
+                "crush_weight": 0,
+            },
+            {
+                "id": 0,
+                "name": "osd.0",
+                "type": "osd",
+                "device_class": "ssd",
+                "crush_weight": 0.5,
+                "children": [],
+                "status": "up",
+                "reweight": 1.0,
+            },
+        ],
+        "stray": [],
+    },
+    "osd pool ls detail --format json": [
+        {
+            "pool_id": 1,
+            "pool_name": "replicapool",
+            "type": 1,
+            "size": 3,
+            "min_size": 2,
+            "pg_num": 32,
+            "pg_num_target": 32,
+            "crush_rule": 0,
+            "erasure_code_profile": "",
+            "application_metadata": {"rbd": {}},
+            "last_change": "191",
+        }
+    ],
+    "config dump --format json": [
+        {
+            "section": "global",
+            "name": "osd_pool_default_size",
+            "value": "3",
+            "level": "advanced",
+            "can_update_at_runtime": True,
+        }
+    ],
+}
 
 arguments = sys.argv[1:]
 log_path = os.environ.get("FAKE_LAB_SSH_LOG")
@@ -82,7 +162,8 @@ if target is None:
     reject("ssh target")
 address = target.group(2)
 remote = arguments[-1]
-if remote not in REMOTE_COMMANDS:
+is_residue_probe = remote.startswith(RESIDUE_SENTINEL)
+if not is_residue_probe and remote not in REMOTE_COMMANDS:
     reject("remote command is not whitelisted")
 
 known_hosts = KNOWN_HOSTS_FILE.fullmatch(arguments[len(EXPECTED) - 1]).group(1)
@@ -99,6 +180,22 @@ if address in os.environ.get("FAKE_LAB_SSH_UNREACHABLE", "").split():
     sys.stderr.write(f"ssh: connect to host {address} port 22: Connection refused\n")
     raise SystemExit(255)
 
+if is_residue_probe:
+    if address in os.environ.get("FAKE_LAB_RESIDUE_FAIL", "").split():
+        sys.stderr.write("sh: ps: command not found\n")
+        raise SystemExit(127)
+    ledger = os.environ.get("FAKE_LAB_RESIDUE_FILE")
+    entries: list[str] = []
+    if ledger:
+        try:
+            with open(ledger, encoding="utf-8") as source:
+                entries = json.load(source).get(address, [])
+        except (OSError, ValueError):
+            entries = []
+    for entry in entries:
+        sys.stdout.write(entry + "\n")
+    raise SystemExit(0)
+
 if remote == "hostname":
     hostnames = {
         **json.loads(os.environ.get("FAKE_LAB_HOST_ALIASES", "{}")),
@@ -107,13 +204,25 @@ if remote == "hostname":
     sys.stdout.write(hostnames.get(address, address) + "\n")
     raise SystemExit(0)
 
+subcommand = remote.split("ceph ", 1)[1]
 if os.environ.get("FAKE_LAB_CEPH_FAIL"):
     sys.stderr.write("unable to get monitor info from DNS SRV with service name: ceph-mon\n")
     raise SystemExit(1)
-if remote == "ceph fsid" and os.environ.get("FAKE_LAB_CEPH_DIRECT_FAIL"):
-    sys.stderr.write("[errno 13] RADOS permission denied\n")
-    raise SystemExit(1)
-sys.stdout.write(
-    os.environ.get("FAKE_LAB_CEPH_FSID", "3f2b1c8e-0000-4a1d-8b7e-000000000001") + "\n"
-)
+if subcommand in os.environ.get("FAKE_LAB_CEPH_STATE_FAIL", "").split("|"):
+    sys.stderr.write(f"Invalid command: {subcommand}\n")
+    raise SystemExit(22)
+if subcommand == "fsid":
+    if remote == "ceph fsid" and os.environ.get("FAKE_LAB_CEPH_DIRECT_FAIL"):
+        sys.stderr.write("[errno 13] RADOS permission denied\n")
+        raise SystemExit(1)
+    sys.stdout.write(
+        os.environ.get("FAKE_LAB_CEPH_FSID", "3f2b1c8e-0000-4a1d-8b7e-000000000001") + "\n"
+    )
+    raise SystemExit(0)
+
+state = {
+    **DEFAULT_CEPH_STATE,
+    **json.loads(os.environ.get("FAKE_LAB_CEPH_STATE", "{}")),
+}
+sys.stdout.write(json.dumps(state[subcommand]) + "\n")
 raise SystemExit(0)

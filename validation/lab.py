@@ -6,11 +6,15 @@
     python3 -m validation.lab activate  --profile PATH --candidate PATH
                                         [--replace-active] [--json]
     python3 -m validation.lab preflight --profile PATH [--runs-dir PATH] [--json]
+    python3 -m validation.lab qualify   --profile PATH [--runs-dir PATH]
+                                        [--collect-timeout SECONDS] [--json]
 
 `status` is local-only.  `discover` and `preflight` reach the lab with read-only
 queries, and `preflight` additionally requires `CEPH_INCIDENT_LAB_CONFIRM=1`
 because it is part of the qualification path.  `activate` writes the trusted
-profile and requires `CEPH_INCIDENT_LAB_ACTIVATE=1`.
+profile and requires `CEPH_INCIDENT_LAB_ACTIVATE=1`.  `qualify` is the full
+dual-run gate behind `make validate-lab`; it runs two real collects and therefore
+requires the same explicit confirmation as the preflight.
 
 Exit codes: 0 when the command reached its intended state, 1 for a usage or
 configuration error, 2 when the workflow is blocked and the printed `next_action`
@@ -35,11 +39,14 @@ from validation.lab_commands import (
 from validation.lab_discovery import discover
 from validation.lab_preflight import preflight
 from validation.lab_profile import LabProfileError
+from validation.lab_qualify import DEFAULT_COLLECT_TIMEOUT_SECONDS, qualify
 from validation.lab_report import (
     ReportRejected,
     code_identity,
     report_from_preflight,
+    report_from_qualification,
     report_from_unusable_profile,
+    reserve_run_directory,
     write_report,
 )
 from validation.lab_status import lab_status
@@ -47,14 +54,16 @@ from validation.lab_status import lab_status
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUNS_DIRECTORY = REPOSITORY_ROOT / "results" / "lab-validation"
-COMMANDS = ("status", "discover", "activate", "preflight")
+COMMANDS = ("status", "discover", "activate", "preflight", "qualify")
 USAGE = """Usage:
   python3 -m validation.lab status --profile PATH [--runs-dir PATH] [--json]
   python3 -m validation.lab discover --profile PATH [--candidate-out PATH]
       [--replace-candidate] [--json]
   python3 -m validation.lab activate --profile PATH --candidate PATH
       [--replace-active] [--json]
-  python3 -m validation.lab preflight --profile PATH [--runs-dir PATH] [--json]"""
+  python3 -m validation.lab preflight --profile PATH [--runs-dir PATH] [--json]
+  python3 -m validation.lab qualify --profile PATH [--runs-dir PATH]
+      [--collect-timeout SECONDS] [--json]"""
 
 EXIT_OK = 0
 EXIT_USAGE = 1
@@ -94,7 +103,9 @@ def _dispatch(options: dict[str, object]) -> int:
         return _discover(options)
     if command == "activate":
         return _activate(options)
-    return _preflight(options)
+    if command == "preflight":
+        return _preflight(options)
+    return _qualify(options)
 
 
 def _status(options: dict[str, object]) -> int:
@@ -200,8 +211,47 @@ def _preflight(options: dict[str, object]) -> int:
     return EXIT_OK if result.ok else EXIT_BLOCKED
 
 
+def _qualify(options: dict[str, object]) -> int:
+    if os.environ.get(PREFLIGHT_CONFIRMATION_VARIABLE) != "1":
+        sys.stderr.write(
+            "error: the real-lab gate runs two full collects against the lab and "
+            f"must be confirmed explicitly\nnext action: re-run with "
+            f"{PREFLIGHT_CONFIRMATION_VARIABLE}=1\n"
+        )
+        return EXIT_USAGE
+    profile_path: Path = options["profile"]  # type: ignore[assignment]
+    runs_directory: Path = options["runs_directory"]  # type: ignore[assignment]
+    try:
+        # The run directory is reserved before anything runs: the two bundles and
+        # both command ledgers live beside the report they are evidence for.
+        run_directory = reserve_run_directory(runs_directory)
+    except OSError as error:
+        sys.stderr.write(f"error: cannot create a run directory: {error}\n")
+        return EXIT_USAGE
+    try:
+        result = qualify(
+            profile_path,
+            run_directory=run_directory,
+            collect_timeout=int(options["collect_timeout"]),  # type: ignore[arg-type]
+        )
+    except LabProfileError as error:
+        return _report_unusable_profile(
+            profile_path, error, runs_directory, directory=run_directory
+        )
+    report = report_from_qualification(result, code=code_identity(REPOSITORY_ROOT))
+    location = write_report(runs_directory, report, directory=run_directory)
+    summary = result.summary()
+    summary["report_directory"] = str(location.directory)
+    _emit(summary, result.text(), as_json=bool(options["as_json"]))
+    return EXIT_OK if result.ok else EXIT_BLOCKED
+
+
 def _report_unusable_profile(
-    profile_path: Path, error: LabProfileError, runs_directory: Path
+    profile_path: Path,
+    error: LabProfileError,
+    runs_directory: Path,
+    *,
+    directory: Path | None = None,
 ) -> int:
     next_action = (
         f"Fix {profile_path} ({error}), then re-run {preflight_command(profile_path)}"
@@ -215,6 +265,7 @@ def _report_unusable_profile(
             status=error.failure_class,
             next_action=next_action,
         ),
+        directory=directory,
     )
     sys.stderr.write(f"error: {error}\n")
     sys.stdout.write(
@@ -247,6 +298,7 @@ def _parse(argv: list[str]) -> dict[str, object]:
         "runs_directory": DEFAULT_RUNS_DIRECTORY,
         "replace_candidate": False,
         "replace_active": False,
+        "collect_timeout": DEFAULT_COLLECT_TIMEOUT_SECONDS,
         "as_json": False,
     }
     rest = argv[1:]
@@ -268,6 +320,17 @@ def _parse(argv: list[str]) -> dict[str, object]:
                 raise UsageError(f"--replace-active is not valid for {command}")
             values["replace_active"] = True
             index += 1
+            continue
+        if option == "--collect-timeout":
+            if command != "qualify":
+                raise UsageError(f"{option} is not valid for {command}")
+            if index + 1 >= len(rest):
+                raise UsageError(f"{option} requires a value")
+            value = rest[index + 1]
+            if not value.isdecimal() or int(value) <= 0:
+                raise UsageError(f"{option} must be a positive number of seconds")
+            values["collect_timeout"] = int(value)
+            index += 2
             continue
         if option in ("--profile", "--candidate", "--candidate-out", "--runs-dir"):
             if index + 1 >= len(rest):
