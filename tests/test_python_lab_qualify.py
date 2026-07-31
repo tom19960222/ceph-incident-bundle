@@ -36,7 +36,9 @@ class QualifyTestCase(unittest.TestCase):
         self.ssh_log = self.root / "ssh.log"
         self.kubectl_log = self.root / "kubectl.log"
 
-    def run_gate(self, profile: Path | None = None, **knobs: str):
+    def run_gate(
+        self, profile: Path | None = None, checkout: Path | None = None, **knobs: str
+    ):
         profile = profile or self.lab.write_profile()
         run_directory = self.runs / "run"
         run_directory.mkdir(mode=0o700, exist_ok=True)
@@ -51,6 +53,7 @@ class QualifyTestCase(unittest.TestCase):
                 run_directory=run_directory,
                 entrypoints=fake_entrypoints(),
                 collect_timeout=120,
+                repository_root=checkout or self.lab.checkout(),
             )
 
     def checks(self, result) -> dict[str, bool]:
@@ -68,6 +71,7 @@ class PassingGateTests(QualifyTestCase):
         self.assertEqual(
             [check.name for check in result.checks],
             [
+                "code-identity",
                 "read-only-opt-ins",
                 "profile-state",
                 "credential-paths",
@@ -80,8 +84,9 @@ class PassingGateTests(QualifyTestCase):
                 "stable-state-pre",
                 "residue-baseline",
                 "collect-shell",
+                "collector-coverage-shell",
                 "collect-python",
-                "collector-coverage",
+                "collector-coverage-python",
                 "bundle-comparison",
                 "stable-state-post",
                 "remote-residue",
@@ -142,6 +147,31 @@ class SharedInputTests(QualifyTestCase):
         for argument in FORBIDDEN_ARGUMENTS:
             self.assertNotIn(argument, QUALIFICATION_ARGUMENTS)
         self.assertIn("--no-trust-ssh-host-key", QUALIFICATION_ARGUMENTS)
+
+    def test_an_exported_opt_in_cannot_reach_the_collectors(self) -> None:
+        # The shell reference initialises `--allow-cephadm-shell` *from* this
+        # variable, so an operator who happens to have it exported would get a
+        # qualification run that may start a container.  The fake collect refuses
+        # the run outright if the variable survives.
+        result = self.run_gate(
+            CEPH_INCIDENT_ALLOW_CEPHADM_SHELL="1",
+            CEPH_INCIDENT_ALLOW_KUBECTL_EXEC="1",
+            CEPH_INCIDENT_TEST_BUNDLE_SAFETY_CAP_BYTES="1",
+        )
+        self.assertEqual(result.status, STATUS_PASS, result.blocked_reason)
+        for implementation in ("shell", "python"):
+            log = (result.run_directory / implementation / "collect.log").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("# exit: 0", log)
+
+    def test_a_modified_checkout_never_reaches_a_collect(self) -> None:
+        # A report says "these two implementations agreed" and names a commit; a
+        # modified tracked file means that commit does not describe what ran.
+        result = self.run_gate(checkout=self.lab.checkout(clean=False))
+        self.assertEqual(result.status, "code-identity-unclear")
+        self.assertIn("collector.py", result.blocked_reason or "")
+        self.assertFalse((result.run_directory / "shell").exists())
 
     def test_the_production_entrypoints_are_the_real_two_implementations(self) -> None:
         shell, python = default_entrypoints()
@@ -210,6 +240,14 @@ class CoverageGateTests(QualifyTestCase):
         self.assertIn("prometheus=missing", result.blocked_reason or "")
         self.assertEqual(result.comparison.result, "not-run")
 
+    def test_the_reference_missing_a_path_stops_before_the_candidate_runs(self) -> None:
+        # A second full collect would touch every node in the lab again to prove
+        # something the report can already say.
+        result = self.run_gate(FAKE_COLLECT_DROP_shell="prometheus")
+        self.assertEqual(result.status, "coverage-incomplete")
+        self.assertNotIn("collect-python", self.checks(result))
+        self.assertFalse((result.run_directory / "python").exists())
+
     def test_a_documented_skip_is_still_incomplete_coverage(self) -> None:
         result = self.run_gate(FAKE_COLLECT_SKIP_shell="rook")
         self.assertEqual(result.status, "coverage-incomplete")
@@ -218,7 +256,7 @@ class CoverageGateTests(QualifyTestCase):
     def test_a_node_without_var_log_fails_the_gate(self) -> None:
         result = self.run_gate(FAKE_COLLECT_DROP_shell="varlog")
         self.assertEqual(result.status, "coverage-incomplete")
-        self.assertIn("var_log=missing", result.blocked_reason or "")
+        self.assertIn("var_log=mon02=missing, monitor01=missing, osd01=missing", result.blocked_reason or "")
 
 
 class ComparisonGateTests(QualifyTestCase):
@@ -296,6 +334,32 @@ class ResidueGateTests(QualifyTestCase):
         leaked = [entry for entry in result.residue if entry.result == "residue"]
         self.assertEqual(len(leaked), 3)
         self.assertIn("ceph-incident-node.python0001", leaked[0].detail)
+        self.assertIn("by hand", result.next_action)
+
+    def test_a_collect_that_failed_part_way_still_owes_the_nodes_a_check(self) -> None:
+        # This run produced no usable record at all, but it reached the nodes.
+        result = self.run_gate(FAKE_COLLECT_EXIT_shell="2")
+        self.assertEqual(result.status, "collect-failed")
+        self.assertEqual(len(result.residue), 3)
+        self.assertTrue(all(entry.result == "clean" for entry in result.residue))
+
+    def test_residue_is_still_checked_after_an_earlier_stage_failed(self) -> None:
+        # The runs most likely to have leaked are the ones where something went
+        # wrong, so "the gate stopped early" must not mean the nodes go unchecked.
+        result = self.run_gate(FAKE_COLLECT_DIVERGE_python="not-json")
+        self.assertEqual(result.status, "bundle-comparison-failed")
+        self.assertEqual(len(result.residue), 3)
+        self.assertTrue(all(entry.result == "clean" for entry in result.residue))
+        self.assertTrue(self.checks(result)["remote-residue"])
+
+    def test_residue_found_after_an_earlier_failure_becomes_the_verdict(self) -> None:
+        # A lab left dirty is the finding that has to reach a person first; the
+        # stage that failed before it is still recorded in the checks.
+        result = self.run_gate(
+            FAKE_COLLECT_DIVERGE_python="not-json", FAKE_COLLECT_RESIDUE_python="1"
+        )
+        self.assertEqual(result.status, "remote-residue")
+        self.assertFalse(self.checks(result)["bundle-comparison"])
         self.assertIn("by hand", result.next_action)
 
     def test_a_leftover_that_predates_the_run_is_not_blamed_on_it(self) -> None:

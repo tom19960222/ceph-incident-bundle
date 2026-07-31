@@ -85,6 +85,14 @@ for required in ("--inventory", "--ssh-key", "--out", "--prom-url"):
     if required not in options:
         reject(f"missing {required}")
 
+# The collectors read opt-in defaults and safety-limit overrides from
+# `CEPH_INCIDENT_*`, so a qualification run must arrive with none of them: an
+# operator with one exported would otherwise get a side-effecting collect while
+# the gate reported the opt-ins disabled.
+leaked = sorted(name for name in os.environ if name.startswith("CEPH_INCIDENT_"))
+if leaked:
+    reject(f"collector variables reached the collect: {', '.join(leaked)}")
+
 home = Path(os.environ.get("HOME", ""))
 known_hosts = home / ".ssh" / "known_hosts"
 if not known_hosts.is_file() or not known_hosts.read_text(encoding="utf-8").strip():

@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -165,6 +166,33 @@ class FakeLab:
             "FAKE_LAB_RESIDUE_FILE": str(self.residue_ledger),
             **knobs,
         }
+
+    def checkout(self, *, clean: bool = True) -> Path:
+        """A throwaway git checkout for the gate's code-identity stage.
+
+        The gate refuses to produce qualification evidence from a checkout whose
+        tracked files were modified, so the tests need a checkout they control:
+        driving that stage from this repository's own working tree would make
+        every test depend on whether the developer had saved a file.
+        """
+
+        root = self.root / "checkout"
+        if not root.exists():
+            root.mkdir()
+            (root / "collector.py").write_text("# stand-in collector\n", encoding="utf-8")
+            for arguments in (
+                ("init", "-q"),
+                ("config", "user.email", "lab@example.invalid"),
+                ("config", "user.name", "Lab Fixture"),
+                ("add", "collector.py"),
+                ("-c", "commit.gpgsign=false", "commit", "-q", "-m", "fixture"),
+            ):
+                subprocess.run(
+                    ["git", "-C", str(root), *arguments], check=True, capture_output=True
+                )
+        if not clean:
+            (root / "collector.py").write_text("# edited in place\n", encoding="utf-8")
+        return root
 
     def leave_residue(self, address: str, entry: str) -> None:
         """Plant one leftover entry the fake `ssh` will report for `address`."""

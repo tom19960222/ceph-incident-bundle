@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from validation.lab_contract import describe_differences
-from validation.lab_probe import LabProber
+from validation.lab_probe import ROOK_CLUSTER_RESOURCE, LabProber
 from validation.lab_profile import LabProfile
 
 
@@ -35,7 +35,6 @@ SNAPSHOT_SCHEMA_VERSION = 1
 RESULT_UNCHANGED = "unchanged"
 RESULT_CHANGED = "changed"
 WORKLOAD_RESOURCES = ("deployments", "statefulsets", "daemonsets")
-ROOK_CLUSTER_RESOURCE = "cephclusters.ceph.rook.io"
 
 
 class SnapshotUnavailable(Exception):

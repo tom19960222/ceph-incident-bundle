@@ -20,6 +20,12 @@ arguments = sys.argv[1:]
 if len(arguments) != 3 or arguments[0] != "--implementation":
     sys.stderr.write(f"fake verify: unexpected argv: {shlex.join(arguments)}\n")
     raise SystemExit(99)
+# Verification reads its payload caps from `CEPH_INCIDENT_TEST_*`, so the gate
+# must clear those before verifying too — see the same check in `fake-collect`.
+leaked = sorted(name for name in os.environ if name.startswith("CEPH_INCIDENT_"))
+if leaked:
+    sys.stderr.write(f"fake verify: collector variables leaked: {', '.join(leaked)}\n")
+    raise SystemExit(99)
 implementation, bundle = arguments[1], Path(arguments[2])
 if not bundle.is_file():
     sys.stderr.write(f"VERIFY FAIL: missing bundle: {bundle}\n")

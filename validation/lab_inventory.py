@@ -1,13 +1,14 @@
-"""The one shared inventory both Collect implementations receive.
+"""The inputs both Collect implementations are handed: one inventory, one trust store.
 
 Qualification compares two collects of the same lab, so both have to be told
-about that lab in the same words.  The inventory is therefore *derived* from the
+about that lab in the same words.  Both inputs are therefore *derived* from the
 active Lab Profile once per run and thrown away with the run: a second,
-hand-maintained host list is exactly what drifts, and a drifted input turns "the
-two implementations disagree" into "the two runs were asked different questions".
+hand-maintained host list — or a second idea of which host keys to trust — is
+exactly what drifts, and a drifted input turns "the two implementations
+disagree" into "the two runs were asked different questions".
 
 Only values the profile loader already validated are rendered, so nothing here
-can widen what the collect entrypoints accept.  The file is local-only and
+can widen what the collect entrypoints accept.  Both files are local-only and
 owner-only like every other lab artifact.
 """
 

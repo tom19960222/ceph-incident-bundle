@@ -11,10 +11,10 @@ bypassed.  And a report is scanned for credential material before it is written:
 if a diagnostic ever carries a key, header or token, the write fails closed
 instead of persisting the leak.
 
-The identity, preflight and status fields are filled today.  Collector coverage,
-the two full-collect runs, the normalized bundle comparison, the stable-state
-diff and the per-node residue checks are declared here so the schema is fixed,
-and stay `not-run` until the dual-run harness (issue #20) fills them.
+An identity preflight fills only the identity, preflight and status fields; the
+dual-run gate (`validation/lab_qualify.py`) fills the rest.  Whatever a run did
+not reach stays `not-run`, so a report says where the gate stopped rather than
+only that it did.
 """
 
 from __future__ import annotations
@@ -69,6 +69,26 @@ def code_identity(root: Path) -> CodeIdentity:
     return CodeIdentity(commit=commit, dirty=bool(status))
 
 
+def tracked_modifications(root: Path) -> tuple[str, ...]:
+    """The tracked files that differ from HEAD, ignoring untracked ones.
+
+    The dual-run gate needs this stricter reading than `CodeIdentity.dirty`: a
+    modified tracked file means the recorded commit does not describe the code
+    that ran, while an untracked file — a local-only Lab Profile beside the
+    repository, say — changes nothing about it.
+    """
+
+    status = _git(root, "status", "--porcelain")
+    # Porcelain v1 is `XY <path>`; slicing past the two status columns and
+    # stripping keeps the path whole whether the change is staged, unstaged or
+    # both.
+    return tuple(
+        line[2:].strip()
+        for line in status.splitlines()
+        if line.strip() and not line.startswith("??")
+    )
+
+
 def _git(root: Path, *arguments: str) -> str:
     try:
         completed = subprocess.run(
@@ -101,7 +121,16 @@ class CollectorCoverage:
 
     @property
     def complete(self) -> bool:
-        return all(getattr(self, path) == "collected" for path in COLLECTOR_PATHS)
+        return not self.gaps()
+
+    def gaps(self) -> tuple[str, ...]:
+        """Name each collector path this invocation did not cover, and how."""
+
+        return tuple(
+            f"{path}={getattr(self, path)}"
+            for path in COLLECTOR_PATHS
+            if getattr(self, path) != "collected"
+        )
 
 
 @dataclass(frozen=True)
@@ -506,11 +535,7 @@ def _identity_lines(identity: dict[str, object]) -> list[str]:
 
 
 def _coverage_gaps(coverage: CollectorCoverage) -> str:
-    return ", ".join(
-        f"{path}={getattr(coverage, path)}"
-        for path in COLLECTOR_PATHS
-        if getattr(coverage, path) != "collected"
-    )
+    return ", ".join(coverage.gaps())
 
 
 def _table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[str]:

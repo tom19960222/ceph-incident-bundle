@@ -23,8 +23,16 @@ taken:
 - which of the four collector paths were covered.
 
 Evidence *bodies*, `/var/log` payloads and recompressed metric dumps are recorded
-as present-and-opaque — `_evidence_is_the_clusters_answer` below explains why
-even their JSON key paths are the cluster's doing rather than the collector's.
+as present-and-opaque, down to their JSON key paths.  Neither implementation
+*transforms* cluster evidence: each runs a command and records its output
+verbatim, and the manifest above already pins which command ran and what it
+exited with.  If both manifests agree, the two bodies came from the same question
+asked of the same cluster, and any difference between them is the cluster
+answering at two different moments — `health.checks` is `{}` on a healthy cluster
+and grows a key the moment a slow op is reported.  A gate that fails on a
+transient HEALTH_WARN is one people learn to re-run until it passes, which is
+worse than one that compares less and means it.
+
 A difference in any of the compared fields fails the gate; there is no allowance
 list here, because the only differences deliberately ignored are the ones the
 normalizer removes below — clocks, run directories, random temporary names and
@@ -86,6 +94,7 @@ SUMMARY_KEYS = (
 )
 NODE_MANIFEST = re.compile(r"nodes/([^/]+)/manifest\.jsonl\Z")
 VAR_LOG_PAYLOAD = re.compile(r"nodes/[^/]+/logs/var-log/(?:merged|raw|original)/")
+SKIP_MARKER = "SKIPPED:"
 CLUSTER_LAYERS = {"ceph": "cluster/ceph/", "rook": "cluster/rook/", "prometheus": "cluster/prometheus/"}
 
 TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?")
@@ -152,6 +161,18 @@ class BundleContents:
 
     def text(self, name: str) -> str:
         return self.payloads.get(name, b"").decode("utf-8", "replace")
+
+    def is_skip(self, name: str) -> bool:
+        """Whether this member records a skipped capture rather than evidence.
+
+        Name alone is not enough.  A collector may write `SKIPPED: <reason>` into
+        the artifact the evidence *would* have occupied — the `/var/log`
+        over-limit path does exactly that to `journal-all-since.txt` — so a
+        coverage check that only looked at filenames would count a node whose
+        whole log payload was dropped as covered.
+        """
+
+        return _is_skip_name(name) or self.text(name).startswith(SKIP_MARKER)
 
 
 def read_bundle(path: Path) -> BundleContents:
@@ -230,33 +251,41 @@ def coverage_of(contents: BundleContents, host_aliases: Sequence[str]) -> Collec
     documented reason for missing evidence is still missing evidence.
     """
 
-    names = contents.names
     verdicts = {
-        layer: _layer_verdict(names, prefix) for layer, prefix in CLUSTER_LAYERS.items()
+        layer: _layer_verdict(contents, prefix)
+        for layer, prefix in CLUSTER_LAYERS.items()
     }
-    verdicts["nodes"] = _per_node_verdict(names, host_aliases, "")
-    verdicts["var_log"] = _per_node_verdict(names, host_aliases, "logs/var-log/")
+    verdicts["nodes"] = _per_node_verdict(contents, host_aliases, "")
+    verdicts["var_log"] = _per_node_verdict(contents, host_aliases, "logs/var-log/")
     return CollectorCoverage(**{path: verdicts[path] for path in COLLECTOR_PATHS})
 
 
-def _layer_verdict(names: Sequence[str], prefix: str) -> str:
-    files = [name for name in names if name.startswith(prefix) and not name.endswith("/")]
+def _layer_verdict(contents: BundleContents, prefix: str) -> str:
+    files = [
+        member.name
+        for member in contents.members
+        if not member.is_directory and member.name.startswith(prefix)
+    ]
     if not files:
         return "missing"
-    if all(_is_skip_artifact(name) for name in files):
+    if all(contents.is_skip(name) for name in files):
         return "skipped"
     return "collected"
 
 
-def _per_node_verdict(names: Sequence[str], host_aliases: Sequence[str], suffix: str) -> str:
-    gaps = [
-        alias
-        for alias in host_aliases
-        if _layer_verdict(names, f"nodes/{alias}/{suffix}") != "collected"
-    ]
+def _per_node_verdict(
+    contents: BundleContents, host_aliases: Sequence[str], suffix: str
+) -> str:
     if not host_aliases:
         return "missing"
-    return "collected" if not gaps else "missing: " + ", ".join(sorted(gaps))
+    gaps = sorted(
+        f"{alias}={verdict}"
+        for alias in host_aliases
+        if (verdict := _layer_verdict(contents, f"nodes/{alias}/{suffix}")) != "collected"
+    )
+    # Named per node and per verdict: "the gate did not cover everything" is not
+    # actionable, "osd01 skipped its logs while mon02 produced none" is.
+    return "collected" if not gaps else ", ".join(gaps)
 
 
 def contract_of(
@@ -375,7 +404,7 @@ def _artifact_contract(
         # the collector's.  Presence and path are the contract here.
         return {"kind": "opaque"}
     text = contents.text(name)
-    if _is_skip_artifact(name):
+    if contents.is_skip(name):
         return {"kind": "skip", "reason": _classify(text, SKIP_CLASSES, rules)}
     if name == ENVIRONMENT_NAME:
         return {
@@ -388,8 +417,8 @@ def _artifact_contract(
     contract: dict[str, object] = {
         # Whether the captured body parses as JSON *is* the implementation's
         # doing — a candidate that wrapped, truncated or re-serialised evidence
-        # shows up here.  What the JSON says is the cluster's doing; see
-        # `_evidence_is_the_clusters_answer` for why it is not compared.
+        # shows up here.  What the JSON says is the cluster's doing; the module
+        # docstring explains why that is not compared.
         "kind": "json" if _parses_as_json(body) else "text"
     }
     if header:
@@ -400,27 +429,6 @@ def _artifact_contract(
             if key not in ("started", "ended")
         }
     return contract
-
-
-def _evidence_is_the_clusters_answer() -> None:
-    """Why a captured artifact's body is not compared field by field.
-
-    Neither implementation *transforms* cluster evidence: each runs a command and
-    records its output verbatim.  The manifest already pins which command ran and
-    what it exited with, so if both manifests agree, the two bodies came from the
-    same question asked of the same cluster — and any difference between them is
-    the cluster answering at two different moments.
-
-    Comparing the body, even reduced to its JSON key paths, would therefore fail
-    on things that are not the candidate's doing: `health.checks` is `{}` on a
-    healthy cluster and grows a key the moment a slow op is reported, a counter
-    that reads `0` in one run reads `0.5` in the next.  A gate that fails on a
-    transient HEALTH_WARN is a gate people learn to re-run until it passes, which
-    is worse than one that compares less and means it.
-
-    Byte-level equivalence of evidence handling is the offline gate's job
-    (`make test-differential`), where the inputs are frozen and it can be exact.
-    """
 
 
 def _fields(
@@ -479,7 +487,9 @@ def _classify(
     return normalize(" ".join(text.split()), rules)
 
 
-def _is_skip_artifact(name: str) -> bool:
+def _is_skip_name(name: str) -> bool:
+    """The artifact names that exist only to record a skip."""
+
     base = name.rsplit("/", 1)[-1]
     return (
         base.startswith("SKIPPED")

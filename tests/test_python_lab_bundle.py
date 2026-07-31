@@ -214,13 +214,37 @@ class CoverageTests(BundleTestCase):
 
     def test_a_missing_node_names_the_node(self) -> None:
         coverage = self.coverage(hosts=("monitor01",))
-        self.assertEqual(coverage.nodes, "missing: osd01")
-        self.assertEqual(coverage.var_log, "missing: osd01")
+        self.assertEqual(coverage.nodes, "osd01=missing")
+        self.assertEqual(coverage.var_log, "osd01=missing")
+
+    def test_a_skip_written_into_the_evidences_own_artifact_is_a_gap(self) -> None:
+        # The `/var/log` over-limit path deletes the payload and rewrites
+        # `journal-all-since.txt` to `SKIPPED: ...`, so a filename-only check
+        # would count a node that collected no logs at all as covered.
+        coverage = coverage_of(
+            read_bundle(
+                self.write(
+                    bundle_members(
+                        var_log=False,
+                        extra={
+                            f"nodes/{host}/logs/var-log/journal-all-since.txt": (
+                                b"SKIPPED: not collected because /var/log payload "
+                                b"exceeded the per-node cap\n"
+                            )
+                            for host in HOSTS
+                        },
+                    )
+                )
+            ),
+            HOSTS,
+        )
+        self.assertEqual(coverage.var_log, "monitor01=skipped, osd01=skipped")
+        self.assertFalse(coverage.complete)
 
     def test_nodes_without_var_log_are_a_gap(self) -> None:
         coverage = self.coverage(var_log=False)
         self.assertEqual(coverage.nodes, "collected")
-        self.assertEqual(coverage.var_log, "missing: monitor01, osd01")
+        self.assertEqual(coverage.var_log, "monitor01=missing, osd01=missing")
 
 
 class ContractTests(BundleTestCase):

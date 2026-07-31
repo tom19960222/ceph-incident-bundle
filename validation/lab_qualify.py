@@ -11,18 +11,27 @@ Three properties are structural rather than advisory:
 - **Order.** Every stage runs after the one that makes its answer meaningful.  A
   bundle collected before identity was proven is evidence about an unknown
   machine; a residue check with no pre-run baseline cannot attribute what it
-  finds.  The first failing stage stops the run.
+  finds.  The first failing stage stops the run — with one exception, below.
 - **Nothing is waivable.** There is no skip flag, no "accept current", and no
   path that reruns a stage until it passes.  Partial coverage, a failed verify, a
   contract difference, a stable-state change and remote residue are each a
   failure with one next action.
-- **Read-only stays read-only.** Both invocations' argv comes from one builder,
-  is checked for `--allow-cephadm-shell` and `--allow-kubectl-exec` before
-  anything runs, and pins host key trust to the keys the active profile already
-  records instead of delegating it to the collector's accept-new mode.
+- **Read-only stays read-only.** Both invocations' argv comes from one builder
+  and is checked for `--allow-cephadm-shell` and `--allow-kubectl-exec` before
+  anything runs; every `CEPH_INCIDENT_*` variable is stripped from the
+  environment they inherit, because the collectors read some of those as *flag
+  defaults*; and host key trust is pinned to the keys the active profile already
+  records rather than delegated to the collector's accept-new mode.
 
-The collect and verify entrypoints are injectable so the harness itself can be
-exercised offline against a fake lab; production always uses the two real ones.
+The exception to "stop at the first failure" is the residue check: once a collect
+has started, the lab has been touched, and the runs where something went wrong
+are the ones most likely to have leaked.  So it runs even after an earlier stage
+failed, and a residue finding replaces the earlier failure class — a lab left
+dirty is what has to reach a person first.
+
+The collect and verify entrypoints, and the checkout whose commit the report
+names, are injectable so the harness itself can be exercised offline against a
+fake lab; production always uses the real ones.
 """
 
 from __future__ import annotations
@@ -49,13 +58,20 @@ from validation.lab_contract import describe_differences
 from validation.lab_inventory import write_inventory, write_known_hosts_home
 from validation.lab_output import write_owner_only
 from validation.lab_preflight import PreflightCheck, preflight
-from validation.lab_probe import LabProber, bounded_diagnostic
+from validation.lab_probe import (
+    EXIT_COMMAND_MISSING,
+    EXIT_TIMEOUT,
+    LabProber,
+    bounded_diagnostic,
+)
 from validation.lab_profile import LabProfile, load_profile, safe_display_path
 from validation.lab_report import (
     ComparisonRecord,
     ResidueRecord,
     RunRecord,
     StableStateRecord,
+    code_identity,
+    tracked_modifications,
 )
 from validation.lab_residue import (
     RESULT_CLEAN,
@@ -77,6 +93,7 @@ from validation.lab_snapshot import (
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 STATUS_PASS = "pass"
+FAILURE_CODE_IDENTITY = "code-identity-unclear"
 FAILURE_OPT_IN = "side-effecting-opt-in-enabled"
 FAILURE_STABLE_STATE_UNREADABLE = "stable-state-unreadable"
 FAILURE_RESIDUE_UNREADABLE = "residue-baseline-unreadable"
@@ -105,8 +122,14 @@ QUALIFICATION_ARGUMENTS = (
     "--redact",
 )
 FORBIDDEN_ARGUMENTS = ("--allow-cephadm-shell", "--allow-kubectl-exec")
-# A full collect of a real lab reads every node's /var/log, so the ceiling is a
-# stuck run rather than a slow one.
+# Both collectors take defaults and safety-limit overrides from variables under
+# this prefix, so the whole prefix is cleared before either one runs.
+COLLECTOR_VARIABLE_PREFIX = "CEPH_INCIDENT_"
+# A full collect of a real lab reads every node's /var/log, so the ceiling is
+# there to catch a stuck run, not a slow one.  `--collect-timeout` moves it
+# because lab sizes differ by orders of magnitude; unlike the argv above it is
+# not part of what the collect is *asked to do*, so tuning it cannot change what
+# the gate proves — only how long it waits before calling a run stuck.
 DEFAULT_COLLECT_TIMEOUT_SECONDS = 4 * 60 * 60
 VERIFY_TIMEOUT_SECONDS = 30 * 60
 BUNDLE_GLOB = "ceph-incident-*.tar.gz"
@@ -236,8 +259,15 @@ def qualify(
     run_directory: Path,
     entrypoints: Sequence[CollectEntrypoint] | None = None,
     collect_timeout: int = DEFAULT_COLLECT_TIMEOUT_SECONDS,
+    repository_root: Path = REPOSITORY_ROOT,
 ) -> QualifyResult:
-    """Run the whole real-lab gate, stopping at the first stage that fails."""
+    """Run the whole real-lab gate, stopping at the first stage that fails.
+
+    `repository_root` is the checkout whose commit the report will name.  It is a
+    parameter for the same reason the entrypoints are: the harness's own tests
+    drive it against a checkout they control, and a gate that could only be
+    exercised from a pristine copy of this repository would not be exercised.
+    """
 
     profile = load_profile(profile_path)
     run = _Qualification(
@@ -246,6 +276,7 @@ def qualify(
         run_directory=run_directory,
         entrypoints=tuple(entrypoints if entrypoints is not None else default_entrypoints()),
         collect_timeout=collect_timeout,
+        repository_root=repository_root,
     )
     return run.execute()
 
@@ -269,16 +300,22 @@ class _Qualification:
         run_directory: Path,
         entrypoints: tuple[CollectEntrypoint, ...],
         collect_timeout: int,
+        repository_root: Path,
     ) -> None:
         self.profile_path = profile_path
         self.profile = profile
         self.run_directory = run_directory
         self.entrypoints = entrypoints
         self.collect_timeout = collect_timeout
+        self.repository_root = repository_root
         self.checks: list[PreflightCheck] = []
         self.identity: dict[str, object] = {}
         self.runs: list[RunRecord] = []
         self.residue: list[ResidueRecord] = []
+        # Set the moment a collect entrypoint is launched, not when it produces a
+        # usable run record: a collect that failed part-way still reached the
+        # nodes, so it still owes them a residue check.
+        self.collect_started = False
         self.comparison = ComparisonRecord()
         self.stable_state = StableStateRecord()
         self.node_invocation_ids: tuple[str, ...] = ()
@@ -330,6 +367,9 @@ class _Qualification:
     # -- the gate ----------------------------------------------------------
 
     def execute(self) -> QualifyResult:
+        code = self._check_code_identity()
+        if code is not None:
+            return code
         opt_ins = self._check_read_only_opt_ins()
         if opt_ins is not None:
             return opt_ins
@@ -350,13 +390,40 @@ class _Qualification:
         ) as workspace:
             return self._collect_and_compare(Path(workspace), identity.trusted_host_keys)
 
+    def _check_code_identity(self) -> QualifyResult | None:
+        """Require the qualification to name the code it actually ran.
+
+        A report says "these two implementations agreed" and points at a commit.
+        If tracked files were modified, that commit does not describe what ran,
+        and the claim cannot be reproduced or reviewed — so the gate stops rather
+        than producing evidence about code nobody can look up.  Untracked files
+        are not a problem: a local-only Lab Profile beside the repository is the
+        normal case.
+        """
+
+        modified = tracked_modifications(self.repository_root)
+        if modified:
+            listed = ", ".join(modified[:5]) + (
+                f" and {len(modified) - 5} more" if len(modified) > 5 else ""
+            )
+            return self._failed(
+                "code-identity",
+                f"{len(modified)} tracked file(s) differ from HEAD: {listed}",
+                FAILURE_CODE_IDENTITY,
+                "Commit or stash the modified tracked files so the report names the "
+                f"code that ran, then re-run {qualify_command(self.profile_path)}",
+            )
+        commit = code_identity(self.repository_root).commit
+        self._passed("code-identity", f"running commit {commit} with no local changes")
+        return None
+
     def _check_read_only_opt_ins(self) -> QualifyResult | None:
         """Prove this run cannot ask for a side-effecting collector path.
 
-        The check runs over the argv the collects will actually be given — the
-        fixed vector *and* the profile-derived words — rather than over the
-        constant alone, so neither a future edit to the builder nor a value
-        arriving from a profile can reintroduce an opt-in the gate forbids.
+        There are two ways in, so both are checked.  The argv the collects will
+        actually be given — the fixed vector *and* the profile-derived words, not
+        the constant alone — and the environment they will inherit, because the
+        collectors read some opt-ins as defaults from `CEPH_INCIDENT_*`.
         """
 
         words = collect_arguments(
@@ -371,9 +438,23 @@ class _Qualification:
                 "Remove the side-effecting opt-in from collect_arguments() in "
                 "validation/lab_qualify.py before running the gate again",
             )
+        inherited = sorted(
+            name
+            for name in self._environment(Path("<home>"))
+            if name.startswith(COLLECTOR_VARIABLE_PREFIX)
+        )
+        if inherited:
+            return self._failed(
+                "read-only-opt-ins",
+                f"the collect environment still carries {', '.join(inherited)}",
+                FAILURE_OPT_IN,
+                "Stop passing collector variables through _environment() in "
+                "validation/lab_qualify.py before running the gate again",
+            )
         self._passed(
             "read-only-opt-ins",
-            "cephadm shell and kubectl exec stay disabled for both invocations",
+            "cephadm shell and kubectl exec stay disabled for both invocations, in "
+            "the argv and in the inherited environment",
         )
         return None
 
@@ -397,13 +478,7 @@ class _Qualification:
         try:
             before = capture_stable_state(prober, self.profile, known_hosts)
         except SnapshotUnavailable as error:
-            return self._failed(
-                "stable-state-pre",
-                str(error),
-                FAILURE_STABLE_STATE_UNREADABLE,
-                f"Restore direct read-only Ceph CLI and local kubectl access ({error}) "
-                f"and re-run {qualify_command(self.profile_path)}",
-            )
+            return self._snapshot_unreadable("stable-state-pre", error)
         self._passed(
             "stable-state-pre",
             f"schema {before.schema_version} snapshot of {len(before.fields)} stable source(s)",
@@ -431,44 +506,57 @@ class _Qualification:
         for entrypoint in self.entrypoints:
             outcome = self._collect(entrypoint, inventory, home)
             if isinstance(outcome, QualifyResult):
-                return outcome
+                return self._finish(outcome, prober, known_hosts, baseline)
             collected.append(outcome)
             self.runs.append(outcome.record)
-
-        coverage_failure = self._check_coverage()
-        if coverage_failure is not None:
-            return coverage_failure
+            # Coverage is gated here rather than after both runs: once one
+            # invocation is known to have missed a collector path the gate has
+            # already failed, and a second full collect would touch every node in
+            # the lab again to prove something the report can already say.
+            coverage_failure = self._check_coverage(outcome.record)
+            if coverage_failure is not None:
+                return self._finish(coverage_failure, prober, known_hosts, baseline)
 
         comparison_failure = self._compare(collected)
         if comparison_failure is not None:
-            return comparison_failure
+            return self._finish(comparison_failure, prober, known_hosts, baseline)
 
         try:
             after = capture_stable_state(prober, self.profile, known_hosts)
         except SnapshotUnavailable as error:
-            return self._failed(
-                "stable-state-post",
-                str(error),
-                FAILURE_STABLE_STATE_UNREADABLE,
-                f"Restore direct read-only Ceph CLI and local kubectl access ({error}) "
-                f"and re-run {qualify_command(self.profile_path)}",
+            return self._finish(
+                self._snapshot_unreadable("stable-state-post", error),
+                prober,
+                known_hosts,
+                baseline,
             )
         result, schema, differences = compare_snapshots(before, after)
         self.stable_state = StableStateRecord(
             schema_version=before.schema_version, result=result, differences=differences
         )
         if result == RESULT_CHANGED:
-            return self._failed(
-                "stable-state-post",
-                f"{len(differences)} stable field(s) changed across the two collects",
-                FAILURE_STABLE_STATE,
-                f"Review the changed stable fields in {self.run_directory} against the "
-                "two command ledgers before any cutover — collection must not change "
-                "persistent state",
+            return self._finish(
+                self._failed(
+                    "stable-state-post",
+                    f"{len(differences)} stable field(s) changed across the two collects",
+                    FAILURE_STABLE_STATE,
+                    f"Review the changed stable fields in {self.run_directory} against "
+                    "the two command ledgers before any cutover — collection must not "
+                    "change persistent state",
+                ),
+                prober,
+                known_hosts,
+                baseline,
             )
         self._passed("stable-state-post", f"schema {schema} snapshot is {RESULT_UNCHANGED}")
 
-        return self._check_residue(prober, known_hosts, baseline)
+        residue = self._check_residue(prober, known_hosts, baseline)
+        if residue is not None:
+            return residue
+        return self._result(
+            STATUS_PASS,
+            f"Hand off {self.run_directory} to {CUTOVER_TICKET}",
+        )
 
     # -- one implementation's full collect ---------------------------------
 
@@ -478,6 +566,7 @@ class _Qualification:
         implementation = entrypoint.implementation
         output_root = self.run_directory / implementation
         output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.collect_started = True
         command = [
             *entrypoint.collect,
             *collect_arguments(
@@ -563,6 +652,16 @@ class _Qualification:
     def _environment(self, home: Path) -> dict[str, str]:
         """The environment both invocations run in — the same one, twice.
 
+        Every `CEPH_INCIDENT_*` variable is dropped from what this process
+        inherited.  The collectors read some of them as *defaults*: the shell
+        reference initialises its `--allow-cephadm-shell` flag from
+        `CEPH_INCIDENT_ALLOW_CEPHADM_SHELL`, so an operator who happens to have
+        that exported would get a qualification run that may start a container
+        while the gate still reported the opt-ins disabled.  The `..._TEST_...`
+        caps are the same hazard aimed at the safety limits.  Checking the argv
+        is therefore not enough; the environment is a second way in, and the gate
+        closes it rather than trusting the shell it was launched from.
+
         `HOME` is the collector-owned directory whose `.ssh/known_hosts` holds
         only the keys the active profile trusts, so `--no-trust-ssh-host-key`
         means "pin to the reviewed identity" rather than "hope the operator's
@@ -571,7 +670,11 @@ class _Qualification:
         """
 
         return {
-            **os.environ,
+            **{
+                name: value
+                for name, value in os.environ.items()
+                if not name.startswith(COLLECTOR_VARIABLE_PREFIX)
+            },
             "HOME": str(home),
             "KUBECONFIG": str(self.profile.rook_kubeconfig_path),
             "LC_ALL": "C",
@@ -611,30 +714,21 @@ class _Qualification:
 
     # -- gates over the two runs -------------------------------------------
 
-    def _check_coverage(self) -> QualifyResult | None:
-        incomplete = [run for run in self.runs if not run.coverage.complete]
-        if incomplete:
-            detail = "; ".join(
-                f"{run.implementation}: "
-                + ", ".join(
-                    f"{path}={getattr(run.coverage, path)}"
-                    for path in ("ceph", "rook", "prometheus", "nodes", "var_log")
-                    if getattr(run.coverage, path) != "collected"
-                )
-                for run in incomplete
-            )
+    def _check_coverage(self, run: RunRecord) -> QualifyResult | None:
+        gaps = run.coverage.gaps()
+        if gaps:
             return self._failed(
-                "collector-coverage",
-                detail,
+                f"collector-coverage-{run.implementation}",
+                f"{run.implementation}: {', '.join(gaps)}",
                 FAILURE_COVERAGE,
                 f"Investigate the uncovered collector path(s) in {self.run_directory}: "
                 "qualification requires one invocation to cover Ceph, Rook, "
                 "Prometheus, every inventory node and /var/log",
             )
         self._passed(
-            "collector-coverage",
-            "both invocations covered Ceph, Rook, Prometheus, every inventory node "
-            "and /var/log",
+            f"collector-coverage-{run.implementation}",
+            f"the {run.implementation} invocation covered Ceph, Rook, Prometheus, "
+            "every inventory node and /var/log",
         )
         return None
 
@@ -678,12 +772,52 @@ class _Qualification:
             (_path_pattern(str(self.run_directory)), "<run>"),
         ]
 
+    def _snapshot_unreadable(self, stage: str, error: Exception) -> QualifyResult:
+        return self._failed(
+            stage,
+            str(error),
+            FAILURE_STABLE_STATE_UNREADABLE,
+            f"Restore direct read-only Ceph CLI and local kubectl access ({error}) "
+            f"and re-run {qualify_command(self.profile_path)}",
+        )
+
+    def _finish(
+        self,
+        failure: QualifyResult,
+        prober: LabProber,
+        known_hosts: Path,
+        baseline: dict[str, ResidueListing],
+    ) -> QualifyResult:
+        """Check for residue even when an earlier stage already failed.
+
+        Once a collect has run, the lab has been touched, and "the gate stopped
+        early" is not a reason to leave a node's leftovers unreported — those are
+        exactly the runs most likely to have leaked, since something went wrong.
+        A residue finding also *replaces* the earlier failure class: a lab left
+        dirty is the finding that has to reach a person first, and the stage that
+        failed before it is still in the report's checks.
+        """
+
+        if not self.collect_started:
+            return failure
+        residue = self._check_residue(prober, known_hosts, baseline)
+        if residue is not None:
+            return residue
+        # `failure` was built before the residue check ran, so it still carries
+        # the empty residue list; the verdict is unchanged but the evidence is
+        # not, and the report gets the newer one.
+        return self._result(
+            failure.status, failure.next_action, blocked_reason=failure.blocked_reason
+        )
+
     def _check_residue(
         self,
         prober: LabProber,
         known_hosts: Path,
         baseline: dict[str, ResidueListing],
-    ) -> QualifyResult:
+    ) -> QualifyResult | None:
+        """Record every node's residue verdict; return a failure only if unclean."""
+
         unclean: list[str] = []
         for host in self.profile.hosts:
             try:
@@ -712,10 +846,7 @@ class _Qualification:
             "remote-residue",
             f"no collector workspace or helper process left on {len(self.residue)} node(s)",
         )
-        return self._result(
-            STATUS_PASS,
-            f"Hand off {self.run_directory} to {CUTOVER_TICKET}",
-        )
+        return None
 
 
 def _node_invocation_ids(contents: BundleContents) -> tuple[str, ...]:
@@ -765,11 +896,11 @@ def _run(
             check=False,
         )
     except FileNotFoundError:
-        return 127, "", f"{command[0]}: command not found"
+        return EXIT_COMMAND_MISSING, "", f"{command[0]}: command not found"
     except subprocess.TimeoutExpired:
-        return 124, "", f"timed out after {timeout}s"
+        return EXIT_TIMEOUT, "", f"timed out after {timeout}s"
     except OSError as error:
-        return 127, "", str(error)
+        return EXIT_COMMAND_MISSING, "", str(error)
     return (
         completed.returncode,
         completed.stdout.decode("utf-8", "replace"),

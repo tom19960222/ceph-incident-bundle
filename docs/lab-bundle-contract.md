@@ -34,6 +34,11 @@ Real lab 兩者都不是。兩次 qualification collect 相隔數分鐘打在活
 | `errors.log` 的事件分類集合 | 兩邊記錄粒度不同，但事件必須相同 |
 | 四條 collector path 的 coverage | Ceph、Rook、Prometheus、全部 inventory nodes、`/var/log` |
 
+Coverage 的 skip 判定同時看檔名與內容。Collector 有時把 `SKIPPED: <reason>` 直接寫進
+evidence 原本要佔的那個 artifact——`/var/log` 超過 per-node cap 時就是這樣改寫
+`journal-all-since.txt`——所以只看檔名的判定會把一個完全沒收到 log 的 node 算成
+covered。
+
 刻意**不**比較的：
 
 - Captured artifact 的 body 本身，**包含它的 JSON key path**。兩個實作都不「轉換」

@@ -87,14 +87,14 @@ make validate-lab LAB_PROFILE=/absolute/path/to/lab.toml CEPH_INCIDENT_LAB_CONFI
 
 這個 target 保持明確 opt-in：它需要絕對 Lab Profile 路徑與 `CEPH_INCIDENT_LAB_CONFIRM=1`，不會被一般 `make validate`、日常 CI 或無確認的 agent 自動觸發。`LAB_ARGS='--collect-timeout <seconds>'` 可調整單次 full collect 的上限（預設 4 小時），`LAB_ARGS=--json` 取得 machine-readable 輸出。
 
-Harness 依序完成下列狀態流程，第一個失敗的階段就停止；沒有 skip flag、沒有 accept-current、也沒有重跑到過為止的路徑：
+Harness 依序完成下列狀態流程，第一個失敗的階段就停止（唯一例外是 §7 的 residue check）；沒有 skip flag、沒有 accept-current、也沒有重跑到過為止的路徑：
 
 ### 1. Local preflight
 
-- 確認 explicit confirmation、active profile 與 profile hash，並記錄執行時的 Git commit 與 dirty state（report 的 `code` 欄位；dirty 會顯示成 `<commit>-dirty`，讓一份 qualification evidence 能被追溯到實際跑的程式）。
+- 確認 explicit confirmation、乾淨可辨識的 Git commit、active profile 與 profile hash。有任何 tracked file 與 HEAD 不同就 fail closed：report 會寫上一個 commit，而那個 commit 必須真的描述跑過的程式，否則這份 evidence 無法被重現或審核。Untracked 檔案不算——放在 repository 旁邊的 local-only Lab Profile 就是正常情況。
 - 驗證 profile schema 與所有 credential paths 的存在性/權限，只記錄 path 是否有效，不讀出或記錄 secret content。
 - 由 profile host map 產生一次性的 shared inventory，供 shell reference 與 Python candidate 共用；不得另外維護第二份手工 inventory。
-- 確認 qualification 沒有啟用 cephadm-shell、kubectl-exec 或其他有額外副作用的 opt-in。
+- 確認 qualification 沒有啟用 cephadm-shell、kubectl-exec 或其他有額外副作用的 opt-in。**argv 與 environment 兩條路都要檢查**：collector 會把 `CEPH_INCIDENT_ALLOW_*` 當成 flag 的預設值，把 `CEPH_INCIDENT_TEST_*` 當成 safety limit 的覆寫，所以整個 `CEPH_INCIDENT_` prefix 在兩次 invocation 前都會被清掉，不是信任啟動 gate 的那個 shell。
 
 ### 2. Strict lab identity preflight
 
@@ -115,7 +115,7 @@ Snapshot schema 以 whitelist 明確排除會自然變動的 counter、epoch、t
 - Host key 信任來自 active profile：harness 用一個只含 profile 已信任 key 的 collector-owned `HOME/.ssh/known_hosts`，搭配 `--no-trust-ssh-host-key`，所以 collector 的 accept-new 模式不會被使用，操作人員自己的 `known_hosts` 也不會被讀寫。
 - 單一 invocation 必須同時收齊 Ceph、Rook、Prometheus、全部 inventory nodes 與 `/var/log`。
 - 保存 exit status、stdout bundle path、stderr/command ledger、coverage 與 invocation identifier。
-- Bundle 必須獨立通過 verify。Partial、缺少任一路徑、使用 default-off execution path 或 verify failure 都立即使 qualification 失敗。
+- Bundle 必須獨立通過 verify。Partial、缺少任一路徑、使用 default-off execution path 或 verify failure 都立即使 qualification 失敗；coverage 就在這一次 invocation 之後立刻判定，reference 少收一條路徑時不會再去跑第二次 full collect 把整個 lab 再碰一遍。
 
 ### 5. Python candidate full collect
 
@@ -133,6 +133,7 @@ Snapshot schema 以 whitelist 明確排除會自然變動的 counter、epoch、t
 
 - 第二次 collect 完成後再次取得相同 schema 的 stable state snapshot，並與 pre-collection snapshot 比較。
 - 對每個 inventory node 執行 remote residue check：只有在兩次 collect 期間新出現的 workspace 或 helper process 才歸咎於本次 run，run 之前就存在的會如實報告為 pre-existing。Probe 只讀，不刪除任何 ownership 無法證明的資源，也不對 process 送 signal。
+- **只要有任何一次 collect 開始過，residue check 就一定會執行**，即使更早的階段已經失敗——那些正是最可能留下殘留的 run。Residue 一旦查到，它就取代先前的 failure class 成為回報結果：lab 被留髒是最需要先送到人手上的發現，而先失敗的那個階段仍然留在 report 的 checks 裡。
 - Stable-state diff 必須為空，且兩次 invocation 均不得有 remote workspace、payload、archive 或 helper process 殘留。
 
 只有 shell bundle、Python bundle、full coverage、normalized comparison、stable-state comparison 與 residue check 全部通過，qualification 才會標記 pass。

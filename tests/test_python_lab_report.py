@@ -340,6 +340,7 @@ class QualificationReportTests(unittest.TestCase):
                 run_directory=run_directory,
                 entrypoints=fake_entrypoints(),
                 collect_timeout=120,
+                repository_root=self.lab.checkout(),
             )
 
     def write(self, result):
@@ -394,7 +395,9 @@ class QualificationReportTests(unittest.TestCase):
         # implying the later stages passed.
         self.assertEqual(document["comparison"]["result"], "not-run")
         self.assertEqual(document["stable_state"]["result"], "not-run")
-        self.assertTrue(all(entry["result"] == "not-run" for entry in document["residue"]))
+        # Residue is the exception: a collect ran, so the nodes were checked and
+        # the report says what was found rather than leaving it unknown.
+        self.assertTrue(all(entry["result"] == "clean" for entry in document["residue"]))
 
     def test_a_qualification_report_carries_no_credential_content(self) -> None:
         location = self.write(self.run_gate())

@@ -21,8 +21,8 @@ STATUS_TARGET = "lab-status"
 DISCOVER_TARGET = "lab-profile-discover"
 ACTIVATE_TARGET = "lab-profile-activate"
 PREFLIGHT_TARGET = "lab-preflight"
-# The full real-lab gate does not exist yet; issue #20 owns it.  Naming it here
-# keeps every "you are done for now" message honest about that.
+# The full real-lab gate.  Every earlier step's "you are done for now" message
+# points here, so the name lives with the rest of the command vocabulary.
 QUALIFICATION_TARGET = "validate-lab"
 # Where a passing qualification hands off.  A report carries exactly one next
 # action, so even a pass names one ticket rather than a list of possibilities.
