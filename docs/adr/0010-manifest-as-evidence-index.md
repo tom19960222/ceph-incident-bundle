@@ -8,7 +8,9 @@ Python receiver 要求 Node Evidence Archive 內每一份 evidence 都有對應�
 - 複製類 evidence 的 `command` 記為 `collect-node copy <來源絕對路徑>`，不記實際讀取指令；後者隨 EUID 與 sudo 可用性改變，不是穩定契約。
 - 未執行的指令留下的 SKIPPED marker（optional 工具不存在、privileged 讀取沒有 sudo、`cephadm` 不存在、複製來源不存在）同樣要有 entry：`command` 記本來要執行的 argv，`exit_code` 記 127（指令不存在）或 2（來源不存在／複製失敗）。marker 本身寫得完整，它所代表的證據卻不完整，所以 `exit_code` 一律非 0。timesyncd config 的 marker 同時代表 `conf` 與 `conf.d` 兩個來源，`command` 因此記 `collect-node copy <conf> <conf.d>`。
 - 「來源不存在」不分層：`/var/log` 不是目錄時，`logs/var-log/SKIPPED.txt` 與複製類 marker 同樣記 `exit_code` 2，且和 reference 一樣不使 node partial。`--skip-logs`（操作者主動不收）不在本 ADR 已列舉的類別內，暫維持 `exit_code` 0，裁定請見 `docs/python-rewrite-plan.md` 的待決項。
-- `/var/lib/ceph` listing 的 `command` 記為 `collect-node list <目錄絕對路徑>`。理由同複製類（`find` 與 `sudo -n find` 兩種形狀），另加一個更硬的理由：真實 find expression 內含 `*keyring*`／`*private_key*` 這些 pattern，逐字記錄會讓 content safety 把整行 manifest 遮成 `[REDACTED]`，該 artifact 反而失去 index entry。artifact 內容本身不受影響——credential 在 `find` 走進去之前就被 prune 掉。代價是 manifest 不再顯示這條掃描是否 privileged，因此 command policy 改由 N9 的 argv ledger 斷言（`sudo -n find`）守住。
+- `/var/lib/ceph` listing 的 `command` 記為 `collect-node list <目錄絕對路徑>`，理由與複製類同源：實際掃描是 `find` 或 `sudo -n find`，隨 EUID 與 sudo 可用性改變，不是穩定契約。代價是 manifest 不再顯示這條掃描是否 privileged，因此 command policy 改由 N9 的 argv ledger 斷言（`sudo -n find`）守住。artifact 內容不受影響——credential 在 `find` 走進去之前就被 prune 掉。
+
+  （另有一個繫在暫時機制上的理由，記錄備查、但不是本條的依據：真實 find expression 內含 `*keyring*`／`*private_key*` 這些 pattern，逐字記錄會被 content safety 的行級遮蔽整行遮成 `[REDACTED]`，該 artifact 因而同時失去 manifest entry 與 `CONTENTS.md` 的列。這是行級遮蔽的誤判——manifest 只承載路徑與 argv，秘密內容從不流經那裡，而同樣的節點檔名在 tar member name 與 `INDEX.tsv` 裡本來就不遮。該誤判不另修，因為整層 content safety 本就預定移除（#44）；移除後這段註腳失效，上一段的理由不受影響。）
 - 這兩類是本 ADR 第一條的機械後果，但 #18 的比對規則是逐類列舉，所以 `docs/python-rewrite-plan.md` 的 `## Contract Adjudications` 第 7 項另行補列，並標明由 #36 提出、等 #8 確認。
 - `exit_code` 表示該筆 artifact 自身是否為完整證據（0 為完整），不表示所屬 collector 群組的整體結果。
 - 來源存在但複製失敗時寫 SKIPPED artifact 與對應 entry，使 partial bundle 能指出遺失的是哪一份證據；shell 在這條路徑靜默失敗。
