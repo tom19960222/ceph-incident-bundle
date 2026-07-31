@@ -172,14 +172,14 @@ class ActivationHistoryTests(StatusTestCase):
 
 
 class ReportHistoryTests(StatusTestCase):
-    def test_a_passing_preflight_report_hands_off_to_issue_20(self) -> None:
+    def test_a_passing_preflight_report_hands_off_to_the_full_gate(self) -> None:
         profile = self.lab.write_profile()
         self.record_preflight(profile)
         status = self.status(profile)
         self.assertEqual(status.state, "preflight-passed")
         self.assertTrue(status.ready)
-        self.assertIn("#20", status.next_action)
-        self.assertIn("not implemented", status.next_action)
+        self.assertIn("make validate-lab", status.next_action)
+        self.assertIn(str(profile), status.next_action)
 
     def test_a_failed_attempt_repeats_the_reports_next_action(self) -> None:
         profile = self.lab.write_profile()

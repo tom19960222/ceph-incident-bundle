@@ -1,5 +1,6 @@
 .PHONY: test check-python test-python test-differential shellcheck validate \
-	lab-status lab-profile-discover lab-profile-activate lab-preflight
+	lab-status lab-profile-discover lab-profile-activate lab-preflight \
+	validate-lab
 
 PYTHON ?= python3
 
@@ -23,12 +24,9 @@ shellcheck:
 
 validate: check-python test test-python test-differential shellcheck
 
-# Real-lab workflow.  `lab-status` is local-only; the other three are explicit
-# opt-ins that touch a lab or the trusted profile, and none of them is reachable
-# from `make validate`.  See docs/lab-validation-runbook.md.
-#
-# The full real-lab gate (`make validate-lab`) is owned by issue #20 and does not
-# exist yet: a passing `lab-preflight` proves lab identity, not qualification.
+# Real-lab workflow.  `lab-status` is local-only; the others are explicit opt-ins
+# that touch a lab or the trusted profile, and none of them is reachable from
+# `make validate`.  See docs/lab-validation-runbook.md.
 lab-status: check-python require-lab-profile
 	$(PYTHON) -m validation.lab status --profile "$(LAB_PROFILE)" $(LAB_ARGS)
 
@@ -43,6 +41,15 @@ lab-profile-activate: check-python require-lab-profile
 
 lab-preflight: check-python require-lab-profile
 	$(PYTHON) -m validation.lab preflight --profile "$(LAB_PROFILE)" $(LAB_ARGS)
+
+# The full real-lab gate: identity preflight, a pre-collection stable-state
+# snapshot, one shell reference full collect, one Python candidate full collect,
+# structural and content-safety verification of both bundles, the normalized
+# observable-contract comparison, the post-collection snapshot and the per-node
+# residue check.  It runs two real collects, so it needs the same explicit
+# confirmation as `lab-preflight` and is never reachable from `make validate`.
+validate-lab: check-python require-lab-profile
+	$(PYTHON) -m validation.lab qualify --profile "$(LAB_PROFILE)" $(LAB_ARGS)
 
 .PHONY: require-lab-profile
 require-lab-profile:

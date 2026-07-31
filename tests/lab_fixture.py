@@ -1,8 +1,10 @@
-"""A fake lab for the Lab Profile workflow tests.
+"""A fake lab for the Lab Profile and qualification workflow tests.
 
 Nothing here connects to a real lab.  `tests/fixtures/lab/bin` holds whitelist
 fakes for `ssh-keyscan`, `ssh`, `kubectl` and `curl`; putting that directory
 first on PATH is what makes discovery, preflight and status testable offline.
+The same directory holds the stand-in collect and verify entrypoints the
+qualification harness is exercised against — see `fake_entrypoints`.
 """
 
 from __future__ import annotations
@@ -11,8 +13,11 @@ import base64
 import hashlib
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+from validation.lab_qualify import CollectEntrypoint
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +46,25 @@ def host_fingerprint(address: str) -> str:
     return fingerprint_of_seed(f"fake-host-key-{address}")
 
 
+def fake_entrypoints() -> tuple[CollectEntrypoint, ...]:
+    """The stand-in reference and candidate the harness tests drive.
+
+    Both are the same script told which implementation it is playing, so a test
+    that makes one bundle diverge is changing exactly one thing.
+    """
+
+    collect = str(LAB_BIN / "fake-collect")
+    verify = str(LAB_BIN / "fake-verify")
+    return tuple(
+        CollectEntrypoint(
+            implementation,
+            (sys.executable, collect, "--implementation", implementation),
+            (sys.executable, verify, "--implementation", implementation),
+        )
+        for implementation in ("shell", "python")
+    )
+
+
 @dataclass
 class FakeLab:
     """One temporary lab: credential files, profiles and the fake PATH."""
@@ -57,6 +81,10 @@ class FakeLab:
         self.profiles = self.root / "profiles"
         self.profiles.mkdir(parents=True, exist_ok=True)
         self.runs = self.root / "runs"
+        # The nodes' collector leftovers, as the fake `ssh` reports them.  A run
+        # that leaks appends to this file, so residue appears *during* the run
+        # exactly as it would in a lab.
+        self.residue_ledger = self.root / "residue.json"
 
     def _write_credential(self, path: Path, text: str) -> None:
         path.write_text(text, encoding="utf-8")
@@ -77,6 +105,7 @@ class FakeLab:
         fingerprints: dict[str, tuple[str, ...]] | None = None,
         hostnames: dict[str, str] | None = None,
         seed: str = "monitor01",
+        operator_namespace: str = "rook-ceph",
     ) -> str:
         lines = [
             "schema_version = 1",
@@ -99,7 +128,7 @@ class FakeLab:
             "[rook]",
             f'kubeconfig_path = "{kubeconfig or self.kubeconfig}"',
             'namespace = "rook-ceph"',
-            'operator_namespace = "rook-ceph"',
+            f'operator_namespace = "{operator_namespace}"',
         ]
         if identity:
             lines.append(f'fsid = "{rook_fsid}"')
@@ -133,5 +162,16 @@ class FakeLab:
         return {
             "PATH": f"{LAB_BIN}{os.pathsep}{os.environ.get('PATH', '')}",
             "FAKE_LAB_HOST_ALIASES": aliases,
+            "FAKE_LAB_RESIDUE_FILE": str(self.residue_ledger),
             **knobs,
         }
+
+    def leave_residue(self, address: str, entry: str) -> None:
+        """Plant one leftover entry the fake `ssh` will report for `address`."""
+
+        try:
+            state = json.loads(self.residue_ledger.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            state = {}
+        state.setdefault(address, []).append(entry)
+        self.residue_ledger.write_text(json.dumps(state), encoding="utf-8")

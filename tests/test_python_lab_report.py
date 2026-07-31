@@ -7,8 +7,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.lab_fixture import CEPH_FSID, ROOK_FSID, FakeLab, host_fingerprint
+from tests.lab_fixture import (
+    CEPH_FSID,
+    ROOK_FSID,
+    FakeLab,
+    fake_entrypoints,
+    host_fingerprint,
+)
 from validation.lab_preflight import preflight
+from validation.lab_qualify import qualify
 from validation.lab_report import (
     COLLECTOR_PATHS,
     LATEST_NAME,
@@ -23,6 +30,7 @@ from validation.lab_report import (
     StableStateRecord,
     latest_report,
     report_from_preflight,
+    report_from_qualification,
     report_from_unusable_profile,
     write_report,
 )
@@ -266,7 +274,7 @@ class PreflightReportTests(unittest.TestCase):
         self.assertEqual([run["implementation"] for run in parsed["runs"]], ["shell", "python"])
         self.assertEqual(parsed["comparison"]["result"], "not-run")
         self.assertEqual(len(parsed["residue"]), 3)
-        self.assertIn("#20", parsed["next_action"])
+        self.assertIn("make validate-lab", parsed["next_action"])
 
     def test_a_failing_preflight_reports_its_failure_class(self) -> None:
         with mock.patch.dict(
@@ -309,6 +317,91 @@ class PreflightReportTests(unittest.TestCase):
         for path in (location.json_path, location.markdown_path):
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("-----BEGIN", text)
+            self.assertNotIn("placeholder", text)
+
+
+class QualificationReportTests(unittest.TestCase):
+    """One dual-run attempt's report, written from the harness's own result."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.lab = FakeLab(self.root)
+        self.runs = self.root / "lab-validation"
+        self.runs.mkdir()
+
+    def run_gate(self, **knobs: str):
+        run_directory = self.runs / "20260731T000000Z"
+        run_directory.mkdir(mode=0o700)
+        with mock.patch.dict(os.environ, self.lab.environment(**knobs)):
+            return qualify(
+                self.lab.write_profile(),
+                run_directory=run_directory,
+                entrypoints=fake_entrypoints(),
+                collect_timeout=120,
+            )
+
+    def write(self, result):
+        return write_report(
+            self.runs,
+            report_from_qualification(result, code=CODE),
+            directory=result.run_directory,
+        )
+
+    def test_a_pass_fills_every_section_and_points_LATEST_at_the_run(self) -> None:
+        result = self.run_gate()
+        location = self.write(result)
+        self.assertEqual(location.directory, result.run_directory)
+        document = json.loads(location.json_path.read_text(encoding="utf-8"))
+        self.assertEqual(document["status"], "pass")
+        self.assertEqual(document["schema_version"], REPORT_SCHEMA_VERSION)
+        self.assertEqual(
+            [run["implementation"] for run in document["runs"]], ["shell", "python"]
+        )
+        for run in document["runs"]:
+            self.assertEqual(run["verify_result"], "pass")
+            self.assertEqual(
+                sorted(run["coverage"]), sorted(COLLECTOR_PATHS)
+            )
+            self.assertTrue(all(value == "collected" for value in run["coverage"].values()))
+        self.assertEqual(document["comparison"]["result"], "equivalent")
+        self.assertEqual(document["stable_state"]["result"], "unchanged")
+        self.assertEqual(document["stable_state"]["snapshot_schema_version"], 1)
+        self.assertEqual(len(document["residue"]), 3)
+        self.assertEqual(
+            (self.runs / LATEST_NAME).read_text(encoding="utf-8").strip(),
+            result.run_directory.name,
+        )
+
+    def test_markdown_and_json_say_the_same_thing(self) -> None:
+        location = self.write(self.run_gate())
+        markdown = location.markdown_path.read_text(encoding="utf-8")
+        document = json.loads(location.json_path.read_text(encoding="utf-8"))
+        self.assertIn(f"- status: {document['status']}", markdown)
+        self.assertIn(f"- next action: {document['next_action']}", markdown)
+        self.assertIn("| shell |", markdown)
+        self.assertIn("| python |", markdown)
+        self.assertIn("- result: equivalent", markdown)
+        self.assertIn("| monitor01 | clean |", markdown)
+
+    def test_a_failure_records_where_the_gate_stopped(self) -> None:
+        result = self.run_gate(FAKE_COLLECT_DROP_python="prometheus")
+        document = json.loads(self.write(result).json_path.read_text(encoding="utf-8"))
+        self.assertEqual(document["status"], "coverage-incomplete")
+        self.assertEqual(document["runs"][1]["coverage"]["prometheus"], "missing")
+        # The gate stopped before comparing, and the report says so rather than
+        # implying the later stages passed.
+        self.assertEqual(document["comparison"]["result"], "not-run")
+        self.assertEqual(document["stable_state"]["result"], "not-run")
+        self.assertTrue(all(entry["result"] == "not-run" for entry in document["residue"]))
+
+    def test_a_qualification_report_carries_no_credential_content(self) -> None:
+        location = self.write(self.run_gate())
+        for path in (location.json_path, location.markdown_path):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("-----BEGIN", text)
+            self.assertNotIn("ssh-ed25519 AAAA", text)
             self.assertNotIn("placeholder", text)
 
 

@@ -18,7 +18,7 @@ from validation.lab_commands import (
     activate_command,
     discover_command,
     preflight_command,
-    qualification_not_implemented,
+    qualify_command,
     status_command,
 )
 from validation.lab_discovery import CANDIDATE_SUFFIX
@@ -289,8 +289,9 @@ def _verdict(
             return (
                 STATE_PREFLIGHT_PASSED,
                 None,
-                f"Hand off {directory}: lab identity is proven for this profile, and "
-                + qualification_not_implemented(),
+                f"Lab identity is proven for this profile ({directory}); run "
+                + qualify_command(path)
+                + " to run the full gate",
             )
         if status == STATUS_PASS:
             return (

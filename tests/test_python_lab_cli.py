@@ -226,7 +226,7 @@ class PreflightCommandTests(CliTestCase):
         latest = (self.runs / "LATEST").read_text(encoding="utf-8").strip()
         document = json.loads((self.runs / latest / "report.json").read_text("utf-8"))
         self.assertEqual(document["status"], "preflight-pass")
-        self.assertIn("#20", self.next_action(completed))
+        self.assertIn("make validate-lab", self.next_action(completed))
 
     def test_an_unusable_profile_still_leaves_a_report(self) -> None:
         broken = self.lab.profiles / "broken.toml"
@@ -263,6 +263,66 @@ class PreflightCommandTests(CliTestCase):
         document = json.loads((self.runs / latest / "report.json").read_text("utf-8"))
         self.assertEqual(document["status"], "ceph-identity-mismatch")
         self.assertIn("different Ceph cluster", self.next_action(completed))
+
+
+class QualifyCommandTests(CliTestCase):
+    """The `validate-lab` entry point.
+
+    The gate's own orchestration is covered against the fake lab in
+    `test_python_lab_qualify`; what the CLI owns is the confirmation, the run
+    directory it reserves up front, and leaving a report either way.
+    """
+
+    def test_requires_the_lab_confirmation(self) -> None:
+        profile = self.lab.write_profile()
+        completed = self.run_cli(
+            "qualify", "--profile", str(profile), "--runs-dir", str(self.runs)
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("CEPH_INCIDENT_LAB_CONFIRM=1", completed.stderr)
+        self.assertFalse(self.runs.exists())
+
+    def test_an_unusable_profile_still_leaves_a_report_in_the_run_directory(self) -> None:
+        broken = self.lab.profiles / "broken.toml"
+        broken.write_text("this is not a lab profile\n", encoding="utf-8")
+        completed = self.run_cli(
+            "qualify",
+            "--profile",
+            str(broken),
+            "--runs-dir",
+            str(self.runs),
+            CEPH_INCIDENT_LAB_CONFIRM="1",
+        )
+        self.assertEqual(completed.returncode, 2)
+        latest = (self.runs / "LATEST").read_text(encoding="utf-8").strip()
+        document = json.loads((self.runs / latest / "report.json").read_text("utf-8"))
+        self.assertEqual(document["status"], "profile-invalid")
+        # The report lands in the directory reserved before the attempt started,
+        # not in a second one created at write time.
+        self.assertEqual(
+            sorted(item.name for item in self.runs.iterdir()), sorted(["LATEST", latest])
+        )
+
+    def test_rejects_an_unusable_collect_timeout(self) -> None:
+        for value in ("0", "-5", "soon"):
+            with self.subTest(value=value):
+                completed = self.run_cli(
+                    "qualify",
+                    "--profile",
+                    "/labs/lab.toml",
+                    "--collect-timeout",
+                    value,
+                    CEPH_INCIDENT_LAB_CONFIRM="1",
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertIn("positive number of seconds", completed.stderr)
+
+    def test_the_collect_timeout_belongs_to_this_command_only(self) -> None:
+        completed = self.run_cli(
+            "preflight", "--profile", "/labs/lab.toml", "--collect-timeout", "60"
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("not valid for preflight", completed.stderr)
 
 
 class WorkflowTests(CliTestCase):
@@ -303,7 +363,7 @@ class WorkflowTests(CliTestCase):
         )
         fourth = self.run_cli("status", "--profile", str(bootstrap), *runs)
         self.assertIn("preflight-passed", fourth.stdout)
-        self.assertIn("#20", fourth.stdout)
+        self.assertIn("make validate-lab", fourth.stdout)
 
     def test_a_rebuilt_lab_cannot_reach_the_preflight_without_review(self) -> None:
         bootstrap = self.lab.write_profile(state="bootstrap", identity=False)

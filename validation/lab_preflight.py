@@ -23,7 +23,7 @@ from pathlib import Path
 from validation.lab_commands import (
     activate_command,
     discover_command,
-    qualification_not_implemented,
+    qualify_command,
 )
 from validation.lab_probe import LabProber
 from validation.lab_profile import LabProfile, load_profile, safe_display_path
@@ -38,11 +38,16 @@ FAILURE_HOST_IDENTITY = "host-identity-mismatch"
 FAILURE_CEPH_IDENTITY = "ceph-identity-mismatch"
 FAILURE_ROOK_IDENTITY = "rook-identity-mismatch"
 FAILURE_PROMETHEUS = "prometheus-not-ready"
-# The gate that consumes a passing preflight does not exist yet.  Saying so is
-# part of the contract: a passing preflight is not qualification evidence.
-PASS_NEXT_ACTION = (
-    f"Hand off this preflight report: {qualification_not_implemented()}"
-)
+
+
+def pass_next_action(profile_path: Path) -> str:
+    """A passing preflight proves identity; the gate that proves qualification
+    is the dual-run harness, so that is the one thing to do next."""
+
+    return (
+        f"Run {qualify_command(profile_path)} — this preflight proves lab "
+        "identity only, not qualification"
+    )
 
 
 @dataclass(frozen=True)
@@ -65,6 +70,11 @@ class PreflightResult:
     checks: tuple[PreflightCheck, ...] = ()
     identity: dict[str, object] = field(default_factory=dict)
     blocked_reason: str | None = None
+    # The known_hosts lines for the keys this run verified, so a later stage can
+    # pin the same trust without scanning again.  Deliberately absent from
+    # `summary()`: a host key line looks exactly like credential material to the
+    # report writer's scanner, and a report has no use for it.
+    trusted_host_keys: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -105,6 +115,7 @@ class _Preflight:
         # Written once the fingerprint stage passes; every later probe connects
         # through it, so no probe can run before host keys are verified.
         self.known_hosts = Path()
+        self.trusted_host_keys: tuple[str, ...] = ()
 
     def execute(self) -> PreflightResult:
         state = self._check_profile_state()
@@ -131,7 +142,8 @@ class _Preflight:
             status=STATUS_PASS,
             checks=tuple(self.checks),
             identity=self.identity,
-            next_action=PASS_NEXT_ACTION,
+            next_action=pass_next_action(self.profile_path),
+            trusted_host_keys=self.trusted_host_keys,
         )
 
     def _passed(self, name: str, detail: str) -> None:
@@ -226,9 +238,13 @@ class _Preflight:
             )
         # Only keys the active profile already trusts reach the pinned known_hosts,
         # so every later probe is talking to a host that proved a trusted key.
-        self.known_hosts = prober.write_known_hosts(
-            scans,
-            accepted={host.name: host.ssh_fingerprints for host in self.profile.hosts},
+        accepted = {host.name: host.ssh_fingerprints for host in self.profile.hosts}
+        self.known_hosts = prober.write_known_hosts(scans, accepted=accepted)
+        self.trusted_host_keys = tuple(
+            key.known_hosts_line
+            for scan in scans
+            for key in scan.keys
+            if key.fingerprint in accepted.get(scan.host_name, ())
         )
         self.identity["hosts"] = [
             {

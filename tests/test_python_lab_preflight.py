@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from tests.lab_fixture import CEPH_FSID, OTHER_FSID, ROOK_FSID, FakeLab, host_fingerprint
-from validation.lab_preflight import PASS_NEXT_ACTION, preflight
+from validation.lab_preflight import pass_next_action, preflight
 
 
 class PreflightTestCase(unittest.TestCase):
@@ -77,10 +77,11 @@ class PassingPreflightTests(PreflightTestCase):
         )
 
     def test_a_pass_is_not_qualification_evidence(self) -> None:
-        result = self.run_preflight(self.lab.write_profile())
-        self.assertEqual(result.next_action, PASS_NEXT_ACTION)
-        self.assertIn("#20", result.next_action)
-        self.assertIn("not implemented", result.next_action)
+        profile = self.lab.write_profile()
+        result = self.run_preflight(profile)
+        self.assertEqual(result.next_action, pass_next_action(profile))
+        self.assertIn("make validate-lab", result.next_action)
+        self.assertIn("not qualification", result.next_action)
 
     def test_pins_host_keys_and_never_accepts_new_ones(self) -> None:
         self.run_preflight(self.lab.write_profile())

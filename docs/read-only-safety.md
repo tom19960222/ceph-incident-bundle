@@ -15,7 +15,7 @@
 - 現行 `/var/log` 測試會啟用測試用的普通讀取 escape hatch，source immutability assertion 尚未涵蓋 atime、nofollow 與安全讀取失敗時 fail closed。#12 必須補齊 production read path，#18 必須把這些 invariants 納入 offline gate。
 - Shell 保留 `cephadm shell` 與 `kubectl exec` 的明確 opt-in compatibility paths。它們是 default-off，而且不得出現在 #20/#21 的 operationally read-only qualification。
 
-不得因 #23 單一邊界完成，就宣稱現有 shell 已滿足本文件的完整 proof obligations。Shell reference 只有在 #19／#20 定義的 strict identity、full coverage、stable-state 與 residue gates 全部存在且通過後，才能成為 real-lab qualification evidence；非 qualification 的受控診斷執行仍必須確認 nodes 身份可信、關閉兩個 opt-ins、限制 workstation output boundary，並在執行後檢查 remote residue。
+不得因 #23 單一邊界完成，就宣稱現有 shell 已滿足本文件的完整 proof obligations。#19／#20 定義的 strict identity、full coverage、stable-state 與 residue gates 現在都由 `make validate-lab` 實作，但 gate 存在不等於 gate 已通過：shell reference 只有在真實 lab 執行該 gate 並取得 `status: pass` 後，才能成為 real-lab qualification evidence；非 qualification 的受控診斷執行仍必須確認 nodes 身份可信、關閉兩個 opt-ins、限制 workstation output boundary，並在執行後檢查 remote residue。
 
 ## Current Python Candidate Status
 
@@ -101,7 +101,7 @@ Residue check 只能檢查本次 invocation 的 identifier 或安全的固定 co
 - Profile、report、log、bundle comparison 與 `next_action` 不得複製 private key、keyring、password、token、kubeconfig credential payload 或其他 secret content。
 - `CEPH-LAB-CONNECTION.md` 只供人閱讀；production code、test、discovery、status 與 validation harness 永遠不得解析它。
 - 執行任何 real-lab qualification collect 前，必須比對 active profile 的 SSH host fingerprints、Ceph/Rook FSID、必要 hostname/host map 與其他定義的 stable identity。缺值、連線目標不一致、fingerprint/FSID mismatch 或 candidate 尚未明確啟用時，一律 fail closed；禁止用 accept-current、skip-check 或自動改寫 active profile 繞過。一般 inventory-driven collect 仍保留既有 CLI/host-key contract，但不能被當成通過 strict lab identity gate 的證據。
-- 這條 identity gate 由 `validation/lab_preflight.py` 實作（issue #19），並由 `make lab-preflight` 執行。它只證明 identity：full coverage、bundle comparison、stable-state 與 residue gates 仍由 #20 提供，未完成前 preflight 通過不構成 qualification evidence。Discovery 與 preflight 的每一條 SSH 連線都以 collector-owned known_hosts 搭配 `StrictHostKeyChecking=yes` 進行，不讀寫操作人員的 `known_hosts`，也沒有 accept-new 路徑。
+- 這條 identity gate 由 `validation/lab_preflight.py` 實作（issue #19），並由 `make lab-preflight` 執行。它只證明 identity：full coverage、bundle comparison、stable-state 與 residue gates 由 #20 的 `make validate-lab` 提供，所以 preflight 通過本身不構成 qualification evidence。Discovery 與 preflight 的每一條 SSH 連線都以 collector-owned known_hosts 搭配 `StrictHostKeyChecking=yes` 進行，不讀寫操作人員的 `known_hosts`，也沒有 accept-new 路徑。
 
 ## Proof Obligations
 
