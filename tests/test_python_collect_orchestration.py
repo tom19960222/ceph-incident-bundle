@@ -120,6 +120,12 @@ class MultiSourceOrchestrationTests(unittest.TestCase):
 
 class CephRunnerSelectionTests(DirectCephFixture, unittest.TestCase):
     def test_quiet_suppresses_default_progress_messages(self) -> None:
+        """C16, C17, O33, O34: where progress goes, and what `--quiet` silences.
+
+        `--quiet` is the Python spelling of the shell's `CEPH_INCIDENT_QUIET=1`;
+        the collector reads no such environment variable.
+        """
+
         for extra_arguments, expect_progress in (((), True), (("--quiet",), False)):
             with self.subTest(extra_arguments=extra_arguments):
                 with tempfile.TemporaryDirectory() as temporary_directory:
@@ -136,6 +142,15 @@ class CephRunnerSelectionTests(DirectCephFixture, unittest.TestCase):
                         "packaging incident bundle" in result.stderr,
                         expect_progress,
                     )
+                    # stdout carries the bundle path and nothing else, in both
+                    # modes; progress never leaks into it and `bundle:` never
+                    # leaks the other way.
+                    self.assertRegex(result.stdout, r"^bundle: .+\.tar\.gz\n$")
+                    self.assertNotIn("bundle:", result.stderr)
+                    if not expect_progress:
+                        # Silence means silence: a successful quiet run says
+                        # nothing at all on stderr.
+                        self.assertEqual(result.stderr, "")
 
     def test_ceph_source_falls_back_from_direct_to_noninteractive_sudo(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -186,6 +201,9 @@ class CephRunnerSelectionTests(DirectCephFixture, unittest.TestCase):
             self.assertIn("node_ok: 1\n", contents["summary.txt"])
             self.assertIn("node_failed: 1\n", contents["summary.txt"])
             self.assertIn("final_status: 2\n", contents["summary.txt"])
+            # The bundle explains which node failed, not merely that one did.
+            self.assertIn("storage01", contents["errors.log"])
+            self.assertNotIn("monitor01", contents["errors.log"])
 
     def test_an_unreachable_explicit_seed_never_falls_back_to_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -229,6 +247,43 @@ class CephRunnerSelectionTests(DirectCephFixture, unittest.TestCase):
             self.assertIn("cluster/ceph/json/status.json", contents)
             self.assertIn("cluster/rook/SKIPPED.txt", contents)
             self.assertIn("cluster_status: 0\n", contents["summary.txt"])
+
+    def test_auto_mode_keeps_the_rook_reason_when_there_is_no_ceph_to_fall_back_on(
+        self,
+    ) -> None:
+        """O19: a kube-only cluster whose namespace is absent is not a green run.
+
+        Auto mode tolerates an unavailable Rook layer only when something else
+        succeeded.  With no Ceph layer at all the bundle is partial, and the
+        specific reason has to survive rather than be replaced by the generic
+        "auto mode skipped it" wording.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _ = self.make_fake_environment(root, FAKE_NODE_CAPS="kubectl")
+            (root / "bin" / "kubectl").symlink_to(ROOK_BIN / "kubectl")
+            environment["FAKE_KUBECTL_MODE"] = "missing-namespace"
+            environment["FAKE_KUBECTL_LOG"] = str(root / "kubectl-argv.jsonl")
+
+            result = self.run_collect(
+                root,
+                environment,
+                seed=None,
+                extra_arguments=("--mode", "auto", "--kube-mode", "local"),
+            )
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            contents = self.extract(self.bundle_of(result))
+            self.assertIn(
+                "rook namespace not found: rook-ceph",
+                contents["cluster/rook/SKIPPED.txt"],
+            )
+            self.assertIn("cluster/ceph/SKIPPED.txt", contents)
+            self.assertNotIn("cluster/ceph/json/status.json", contents)
+            # The node layer is unaffected by either cluster layer skipping.
+            self.assertIn("nodes/monitor01/system/hostname.txt", contents)
+            self.assertIn("final_status: 2\n", contents["summary.txt"])
 
     def test_auto_mode_without_any_capable_node_is_partial_but_still_collects_nodes(
         self,

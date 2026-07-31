@@ -306,9 +306,12 @@ def serve_bootstrap(remote_command: str) -> None:
     raise SystemExit(exit_code)
 
 
-def serve_capability_probe(words: list[str]) -> None:
+def serve_capability_probe(words: list[str], target: str) -> None:
     if words != [CAPABILITY_PROBE]:
         reject("capability probe")
+    if target in os.environ.get("FAKE_PROBE_FAIL_TARGETS", "").split():
+        sys.stderr.write("ssh: connect to host port 22: Connection refused\n")
+        raise SystemExit(255)
     emit(os.environ.get("FAKE_NODE_CAPS", "ceph kubectl"))
 
 
@@ -345,7 +348,7 @@ def serve_ceph(words: list[str]) -> None:
     fail_on = os.environ.get("FAKE_SSH_FAIL_ON")
     if fail_on and fail_on in remote:
         sys.stderr.write(f"simulated failure for {fail_on}\n")
-        raise SystemExit(17)
+        raise SystemExit(int(os.environ.get("FAKE_SSH_FAIL_EXIT", "17")))
 
     if remote == "config dump --format json-pretty" and os.environ.get(
         "FAKE_CEPH_SECRET_CONFIG"
@@ -413,7 +416,7 @@ tail = tail[1:]
 
 if len(tail) == 1:
     if tail[0] == CAPABILITY_PROBE:
-        serve_capability_probe(tail)
+        serve_capability_probe(tail, target)
     serve_bootstrap(tail[0])
 
 if tail[-3:] == ["--connect-timeout", "5", "-s"]:

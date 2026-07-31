@@ -104,6 +104,36 @@ class CollectContentSafetyTests(DirectCephFixture, unittest.TestCase):
             )
             self.assertEqual(contents["redactions.log"], "")
 
+    def test_the_defaults_trust_the_host_key_and_redact(self) -> None:
+        """O6, O7, O8: with no flag at all, accept-new is on and so is redaction.
+
+        Every other case in this file opts out of host key trust to keep the
+        fake transport simple, so only this one shows what the shell reference's
+        two independent defaults actually are.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, ledger = self.make_fake_environment(
+                root, FAKE_CEPH_SECRET_CONFIG="1"
+            )
+
+            result = self.run_collect(root, environment, host_key_arguments=())
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            contents = self.extract(self.bundle_of(result))
+            self.assertIn("[REDACTED]", contents["cluster/ceph/json/config-dump.json"])
+            self.assertNotIn(
+                "must-not-leak", contents["cluster/ceph/json/config-dump.json"]
+            )
+            invocations = [
+                json.loads(line)
+                for line in ledger.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(invocations)
+            for arguments in invocations:
+                self.assertIn("StrictHostKeyChecking=accept-new", arguments)
+
     def test_redaction_flag_precedence_is_independent_from_host_key_trust(
         self,
     ) -> None:
@@ -114,6 +144,9 @@ class CollectContentSafetyTests(DirectCephFixture, unittest.TestCase):
                 True,
             ),
             (("--no-redact", "--redact"), "[REDACTED]", False),
+            # O9: spelling both defaults out explicitly has to behave exactly
+            # like leaving them out, which is what the sibling default case runs.
+            (("--trust-ssh-host-key", "--redact"), "[REDACTED]", True),
         )
         for extra_arguments, expected_content, expected_trust in cases:
             with self.subTest(extra_arguments=extra_arguments):
@@ -172,9 +205,15 @@ class CollectContentSafetyTests(DirectCephFixture, unittest.TestCase):
 
             self.assertIn(b"[REDACTED]", redacted_payload)
             self.assertNotIn(b"must-not-leak", redacted_payload)
+            self.assertIn(b"safe evidence", redacted_payload)
             self.assertEqual(
                 hashlib.sha256(opaque_payload).digest(),
                 hashlib.sha256(expected_opaque).digest(),
+            )
+            # Untouched bytes are not enough: the opaque artifact has to still
+            # be openable as the archive it was collected as.
+            self.assertEqual(
+                gzip.decompress(opaque_payload), b"secret = intentionally opaque\n"
             )
 
     @unittest.skipUnless(shutil.which("zstd"), "zstd is required for codec parity")
@@ -316,6 +355,7 @@ class CollectContentSafetyTests(DirectCephFixture, unittest.TestCase):
                 preserved = gzip.decompress(compressed.read())
             self.assertIn(b"must-not-leak", preserved)
             self.assertIn("recompress failed", contents["redactions.log"])
+            self.assertIn("NOT redacted", contents["redactions.log"])
             self.assertIn(
                 "redaction failed; original collected artifact was preserved",
                 contents["errors.log"],
@@ -499,6 +539,122 @@ class CollectContentSafetyTests(DirectCephFixture, unittest.TestCase):
             self.assertEqual(list((root / "results").glob("*.tar.gz")), [])
 
 
+class RedactionLineSelectionTests(unittest.TestCase):
+    """Ledger C5, C6, C7, C8: which lines the redactor blanks, and which it keeps.
+
+    The end-to-end cases each carry one secret shape, so no single one of them
+    shows that every keyword of the shell contract is covered, that a blanked
+    line is replaced whole, or that a neighbouring safe line survives.  This
+    drives the same seam the collector uses with all of them at once.
+    """
+
+    SAFE_LINES = (
+        "mon_host = 10.0.0.1",
+        "osd_pool_default_size = 3",
+        "cluster_network = 10.0.0.0/24",
+    )
+
+    def redact(self, root: Path, payload: str) -> tuple[list[str], str]:
+        artifact = root / "config-dump.txt"
+        artifact.write_text(payload, encoding="utf-8")
+        log = root / "redactions.log"
+        log.touch()
+
+        bundle_entry._redact_plain_file(artifact, log)
+
+        return (
+            artifact.read_text(encoding="utf-8").splitlines(),
+            log.read_text(encoding="utf-8"),
+        )
+
+    def test_every_sensitive_keyword_blanks_its_whole_line(self) -> None:
+        secrets = (
+            "Password = hunter2-must-not-leak",
+            "admin_SECRET: must-not-leak",
+            "bearer_token=must-not-leak",
+            "keyring = /etc/ceph/ceph.client.admin.keyring",
+            "private_key: must-not-leak",
+            "private-key: must-not-leak",
+            "private key: must-not-leak",
+        )
+        for secret in secrets:
+            with self.subTest(secret=secret):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    root = Path(temporary_directory)
+                    payload = "\n".join((self.SAFE_LINES[0], secret, self.SAFE_LINES[1]))
+
+                    lines, log = self.redact(root, payload + "\n")
+
+                    # The line is replaced, not edited: no fragment survives.
+                    self.assertEqual(
+                        lines, [self.SAFE_LINES[0], "[REDACTED]", self.SAFE_LINES[1]]
+                    )
+                    self.assertIn("config-dump.txt", log)
+                    self.assertIn("1 line(s) redacted", log)
+
+    def test_a_multi_line_pem_body_is_blanked_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            payload = "\n".join(
+                (
+                    self.SAFE_LINES[0],
+                    "-----BEGIN OPENSSH PRIVATE KEY-----",
+                    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB",
+                    "-----END OPENSSH PRIVATE KEY-----",
+                    self.SAFE_LINES[1],
+                )
+            )
+
+            lines, _ = self.redact(root, payload + "\n")
+
+            self.assertEqual(
+                lines,
+                [
+                    self.SAFE_LINES[0],
+                    "[REDACTED]",
+                    "[REDACTED]",
+                    "[REDACTED]",
+                    self.SAFE_LINES[1],
+                ],
+            )
+
+    def test_ceph_key_material_is_blanked_without_over_redacting_prose(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            payload = "\n".join(
+                (
+                    self.SAFE_LINES[0],
+                    "key = AQBn0123456789012345678901234567890123456==",
+                    '"auth_key": "AQBn0123456789012345678901234567890123456=="',
+                    "the key to reproducing this is the mon store",
+                    self.SAFE_LINES[1],
+                )
+            )
+
+            lines, log = self.redact(root, payload + "\n")
+
+            self.assertEqual(
+                lines,
+                [
+                    self.SAFE_LINES[0],
+                    "[REDACTED]",
+                    "[REDACTED]",
+                    "the key to reproducing this is the mon store",
+                    self.SAFE_LINES[1],
+                ],
+            )
+            self.assertIn("2 line(s) redacted", log)
+
+    def test_a_file_without_secrets_is_left_alone_and_still_logged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+
+            lines, log = self.redact(root, "\n".join(self.SAFE_LINES) + "\n")
+
+            self.assertEqual(lines, list(self.SAFE_LINES))
+            self.assertIn("0 line(s) redacted", log)
+
+
 class RedactionFilePermissionTests(unittest.TestCase):
     """Ledger C9 and C12: redaction rewrites evidence without widening its mode.
 
@@ -546,6 +702,7 @@ class RedactionFilePermissionTests(unittest.TestCase):
             payload = gzip.decompress(artifact.read_bytes())
             self.assertIn(b"[REDACTED]", payload)
             self.assertNotIn(b"must-not-leak", payload)
+            self.assertIn(b"safe evidence", payload)
 
     def test_recompress_failure_keeps_the_original_bytes_and_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

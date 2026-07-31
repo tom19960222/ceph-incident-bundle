@@ -191,6 +191,20 @@ class LocalKubectlRunnerTests(RookFixture, unittest.TestCase):
                 contents["cluster/rook/operator.log"],
             )
 
+            # The namespace is detected before anything is collected from it.
+            commands = self.kubectl_commands(kubectl_ledger)
+            self.assertEqual(commands[0], ["get", "namespace", "rook-ceph"])
+            self.assertIn(
+                [
+                    "logs",
+                    "-n",
+                    "rook-ceph",
+                    "rook-ceph-operator-rook-ceph-abc123",
+                    "--since=24h",
+                ],
+                commands,
+            )
+
             # The local runner must not reach for ssh to talk to Kubernetes.
             for arguments in self.ledger(ssh_ledger):
                 self.assertNotIn("kubectl", arguments)
@@ -409,7 +423,58 @@ class RookNamespaceTests(RookFixture, unittest.TestCase):
                 extra_arguments=("--kube-mode", "local", "--kube-context", "bad;ctx"),
             )
 
-            self.assertIn("kube-context", result.stderr)
+            # The usage text names every option, so only the rejection wording
+            # distinguishes "refused this context" from "printed the usage".
+            self.assertIn("--kube-context may only contain", result.stderr)
+
+    def test_a_real_world_kube_context_passes_validation(self) -> None:
+        """O24: the names operators actually have must survive the filter.
+
+        `kubernetes-admin@kubernetes` and an EKS ARN carry `@`, `:` and `/`.
+        Rejecting a legal context would be as wrong as accepting a metacharacter,
+        so this asserts the run gets past validation and stops on the missing
+        inventory instead.
+        """
+
+        for context in (
+            "kubernetes-admin@kubernetes",
+            "arn:aws:eks:us-east-1:1/x@k8s",
+        ):
+            with self.subTest(kube_context=context):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    root = Path(temporary_directory)
+                    environment, kubectl_ledger, ssh_ledger = (
+                        self.make_fake_environment(root)
+                    )
+                    ssh_key = root / "id_ed25519"
+                    ssh_key.write_text("fixture key path only\n", encoding="utf-8")
+
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(ENTRYPOINT),
+                            "collect",
+                            "--inventory",
+                            str(root / "absent.env"),
+                            "--ssh-key",
+                            str(ssh_key),
+                            "--out",
+                            str(root / "results"),
+                            "--kube-mode",
+                            "local",
+                            "--kube-context",
+                            context,
+                        ],
+                        cwd=ROOT,
+                        env=environment,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertNotIn("--kube-context may only contain", result.stderr)
+                    self.assertIn("missing inventory", result.stderr)
 
     def test_remote_since_metacharacters_are_rejected_before_any_command(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
