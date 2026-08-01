@@ -192,6 +192,74 @@ EOF
   [[ "$(sed -n '4p' "$source_file")" == "just a normal sentence with words" ]] || fail "normal line over-redacted"
 }
 
+test_redact_file_keeps_unterminated_final_line_once() {
+  local source_file="$tmpdir/no-trailing-newline.txt"
+  local redaction_log="$tmpdir/no-trailing-newline.log"
+
+  printf 'first\nlast line without a newline' >"$source_file"
+
+  redact_file "$source_file" "$redaction_log"
+
+  local lines
+  lines="$(wc -l <"$source_file" | tr -d '[:space:]')"
+  [[ "$lines" == "2" ]] || fail "unterminated final line produced $lines line(s), want 2"
+  [[ "$(sed -n '2p' "$source_file")" == "last line without a newline" ]] ||
+    fail "unterminated final line was not written through verbatim"
+}
+
+# The tail-line fallback (`|| [[ -n "$line" ]]`) assumes a failing `read` clears
+# `line`. When it does not, the fallback stays true and the loop rewrites the
+# same line until the disk fills — see issue #49, where one 3.25 GB source
+# produced 11.75 GB of output with a single line repeated 75,056,647 times.
+# A stream that stops early must fail closed instead, leaving the original
+# artifact alone: silently dropping evidence is worse than refusing to redact.
+test_redact_file_fails_closed_on_short_read() {
+  local source_file="$tmpdir/short-read.txt"
+  local redaction_log="$tmpdir/short-read.log"
+  local fakebin="$tmpdir/short-read-bin"
+
+  mkdir -p "$fakebin"
+  cat >"$fakebin/cat" <<'EOF'
+#!/usr/bin/env bash
+# Stop after one line, the way a source that loses forward progress does.
+shift
+head -n 1 -- "$1"
+EOF
+  chmod +x "$fakebin/cat"
+
+  printf 'one\ntwo\nthree\n' >"$source_file"
+
+  local rc=0 saved_path=$PATH
+  PATH="$fakebin:$PATH"
+  set +e
+  redact_file "$source_file" "$redaction_log"
+  rc=$?
+  set -e
+  PATH=$saved_path
+
+  [[ "$rc" != "0" ]] || fail "redact_file accepted a short read"
+  [[ "$(cat "$source_file")" == "$(printf 'one\ntwo\nthree')" ]] ||
+    fail "short read replaced the original artifact"
+  if compgen -G "$tmpdir/.short-read.txt.*" >/dev/null; then
+    fail "short read left a redaction temp file behind"
+  fi
+  grep -q "NOT redacted" "$redaction_log" ||
+    fail "redaction log does not record the incomplete read"
+}
+
+test_redact_file_preserves_errexit_state() {
+  local source_file="$tmpdir/errexit.txt"
+  local redaction_log="$tmpdir/errexit.log"
+  printf 'token: leak\nplain\n' >"$source_file"
+
+  set +e
+  redact_file "$source_file" "$redaction_log"
+  local status="$-"
+  set -e
+
+  [[ "$status" != *e* ]] || fail "redact_file re-enabled errexit for its caller"
+}
+
 test_redact_file_preserves_mode() {
   local source_file="$tmpdir/mode.txt"
   local redaction_log="$tmpdir/mode.log"
@@ -490,6 +558,9 @@ test_redact_file
 test_redact_file_private_key_variants
 test_redact_file_multiline_pem_body
 test_redact_file_ceph_key_material
+test_redact_file_keeps_unterminated_final_line_once
+test_redact_file_fails_closed_on_short_read
+test_redact_file_preserves_errexit_state
 test_redact_file_preserves_mode
 test_redact_gz_file
 test_redact_supported_compressed_files

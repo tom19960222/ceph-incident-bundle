@@ -151,25 +151,25 @@ manifest_add() {
     "$(json_escape "$ended")" >>"$manifest"
 }
 
-redact_file() {
-  local source_file=$1 redaction_log=$2
-  require_file "$source_file"
-  ensure_dir "$(dirname -- "$redaction_log")"
-
-  local source_dir tmp_file count line nocase_was_set in_pem redact mode
-  source_dir="$(dirname -- "$source_file")"
-  tmp_file="$(mktemp "$source_dir/.${source_file##*/}.XXXXXX")"
-  count=0
-  in_pem=0
-  nocase_was_set=0
+# Redact stdin to stdout, writing "<redacted> <records>" to $1: how many lines
+# were replaced, and how many newline-terminated records were read. The second
+# number is what proves the whole stream arrived.
+#
+# Best-effort redaction (NOT a complete DLP): keyword lines, ceph key material
+# (`key = AQB..==`, base64 blobs), and whole multi-line PEM private key blocks.
+# Extensions/encodings outside this are intentionally not covered — see README
+# "安全界線"; operators must self-review before sharing.
+redact_stream() {
+  local count_file=$1
+  local count=0 records=0 line in_pem=0 redact nocase_was_set=0 tail_done=0
   shopt -q nocasematch && nocase_was_set=1
   shopt -s nocasematch
 
-  # Best-effort redaction (NOT a complete DLP): keyword lines, ceph key
-  # material (`key = AQB..==`, base64 blobs), and whole multi-line PEM private
-  # key blocks. Extensions/encodings outside this are intentionally not covered
-  # — see README "安全界線"; operators must self-review before sharing.
-  while IFS= read -r line || [[ -n "$line" ]]; do
+  # The `||` arm exists for a final line with no newline. It is latched so it
+  # can fire at most once: a `read` that fails without clearing `line` would
+  # otherwise keep the condition true forever — see issue #49.
+  while IFS= read -r line || { [[ $tail_done -eq 0 && -n "$line" ]] && tail_done=1; }; do
+    [[ $tail_done -eq 0 ]] && records=$((records + 1))
     redact=0
     if [[ "$line" =~ -----BEGIN[[:space:]].*PRIVATE[[:space:]]KEY----- ]]; then
       in_pem=1
@@ -187,14 +187,61 @@ redact_file() {
       redact=1
     fi
     if [[ $redact -eq 1 ]]; then
-      printf '[REDACTED]\n' >>"$tmp_file"
+      printf '[REDACTED]\n'
       count=$((count + 1))
     else
-      printf '%s\n' "$line" >>"$tmp_file"
+      printf '%s\n' "$line"
     fi
-  done <"$source_file"
+    [[ $tail_done -eq 1 ]] && break
+  done
 
   if [[ $nocase_was_set -eq 1 ]]; then shopt -s nocasematch; else shopt -u nocasematch; fi
+  printf '%s %s\n' "$count" "$records" >"$count_file"
+}
+
+# Redact one text artifact in place.
+#
+# The source is streamed through a pipe rather than read with `<"$source_file"`.
+# Bash keeps a file offset for a redirected regular file and can stop making
+# forward progress on a large one: past 2 GiB `read` began failing without
+# clearing `line`, and the loop rewrote the same line until the disk filled —
+# one 3.25 GB node log produced 11.75 GB of output with a single line repeated
+# 75,056,647 times (issue #49). The same content read at a lower offset, and
+# the same content read through a pipe, are both fine. A pipe carries no offset.
+#
+# Forward progress is then checked rather than assumed: the stream must deliver
+# every newline-terminated record the source holds. A stall shows up as a short
+# count, and the answer is to leave the original artifact in place and report it
+# as NOT redacted — silently dropping evidence is worse than refusing to redact.
+redact_file() {
+  local source_file=$1 redaction_log=$2
+  require_file "$source_file"
+  ensure_dir "$(dirname -- "$redaction_log")"
+
+  local source_dir tmp_file count_file mode expected count='' records='' stream_ok=1
+  source_dir="$(dirname -- "$source_file")"
+  tmp_file="$(mktemp "$source_dir/.${source_file##*/}.XXXXXX")"
+  count_file="$(mktemp "$source_dir/.${source_file##*/}.count.XXXXXX")"
+  expected="$(wc -l <"$source_file")"
+  expected=${expected//[[:space:]]/}
+
+  # `if !` rather than `set +e`: toggling errexit here would hand the caller
+  # back a different shell than it had, and this function is called from both
+  # errexit and non-errexit contexts. A `cat` that dies mid-stream needs no
+  # special case — it shows up as a short record count below.
+  if ! cat -- "$source_file" | redact_stream "$count_file" >"$tmp_file"; then
+    stream_ok=0
+  fi
+  read -r count records <"$count_file" || true
+
+  if [[ $stream_ok -eq 0 || "$records" != "$expected" ]]; then
+    rm -f -- "$tmp_file" "$count_file"
+    printf '%s: read %s of %s line(s), original left as-is (NOT redacted)\n' \
+      "$source_file" "$records" "$expected" >>"$redaction_log"
+    return 1
+  fi
+
+  rm -f -- "$count_file"
   mode="$(stat -c '%a' "$source_file" 2>/dev/null || stat -f '%Lp' "$source_file" 2>/dev/null || printf '600')"
   chmod "$mode" "$tmp_file" 2>/dev/null || true
   mv -f -- "$tmp_file" "$source_file"
@@ -225,7 +272,13 @@ redact_compressed_file() {
     return 0
   fi
 
-  redact_file "$tmp_plain" "$redaction_log"
+  # The decompressed payload is what `redact_file` reads, so a codec whose
+  # plaintext crosses the size where reading fails takes the same failure — and
+  # the same fail-closed answer: leave the original encoded artifact alone.
+  if ! redact_file "$tmp_plain" "$redaction_log"; then
+    rm -f -- "$tmp_plain" "$tmp_encoded"
+    return 1
+  fi
   case "$codec" in
     gz) gzip -c -- "$tmp_plain" >"$tmp_encoded" || encode_rc=$? ;;
     xz) xz -c -- "$tmp_plain" >"$tmp_encoded" || encode_rc=$? ;;
