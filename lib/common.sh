@@ -214,7 +214,7 @@ redact_stream() {
 # count, and the answer is to leave the original artifact in place and report it
 # as NOT redacted — silently dropping evidence is worse than refusing to redact.
 redact_file() {
-  local source_file=$1 redaction_log=$2
+  local source_file=$1 redaction_log=$2 display_file=${3-$1}
   require_file "$source_file"
   ensure_dir "$(dirname -- "$redaction_log")"
 
@@ -237,7 +237,7 @@ redact_file() {
   if [[ $stream_ok -eq 0 || "$records" != "$expected" ]]; then
     rm -f -- "$tmp_file" "$count_file"
     printf '%s: read %s of %s line(s), original left as-is (NOT redacted)\n' \
-      "$source_file" "$records" "$expected" >>"$redaction_log"
+      "$display_file" "$records" "$expected" >>"$redaction_log"
     return 1
   fi
 
@@ -245,7 +245,7 @@ redact_file() {
   mode="$(stat -c '%a' "$source_file" 2>/dev/null || stat -f '%Lp' "$source_file" 2>/dev/null || printf '600')"
   chmod "$mode" "$tmp_file" 2>/dev/null || true
   mv -f -- "$tmp_file" "$source_file"
-  printf '%s: %s line(s) redacted\n' "$source_file" "$count" >>"$redaction_log"
+  printf '%s: %s line(s) redacted\n' "$display_file" "$count" >>"$redaction_log"
 }
 
 redact_compressed_file() {
@@ -275,7 +275,7 @@ redact_compressed_file() {
   # The decompressed payload is what `redact_file` reads, so a codec whose
   # plaintext crosses the size where reading fails takes the same failure — and
   # the same fail-closed answer: leave the original encoded artifact alone.
-  if ! redact_file "$tmp_plain" "$redaction_log"; then
+  if ! redact_file "$tmp_plain" "$redaction_log" "$source_file"; then
     rm -f -- "$tmp_plain" "$tmp_encoded"
     return 1
   fi

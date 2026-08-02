@@ -247,6 +247,42 @@ EOF
     fail "redaction log does not record the incomplete read"
 }
 
+# A compressed artifact is redacted through a temp plaintext file that is then
+# removed, so naming that temp in the log would point an operator at a path that
+# no longer exists. The line has to name the bundle artifact left unredacted.
+test_compressed_short_read_names_the_original_artifact() {
+  local plain="$tmpdir/rotated-short.log"
+  local gz="$tmpdir/rotated-short.log.gz"
+  local redaction_log="$tmpdir/gz-short.log"
+  local fakebin="$tmpdir/gz-short-bin"
+
+  mkdir -p "$fakebin"
+  cat >"$fakebin/cat" <<'EOF'
+#!/usr/bin/env bash
+shift
+head -n 1 -- "$1"
+EOF
+  chmod +x "$fakebin/cat"
+
+  printf 'one\ntwo\nthree\n' >"$plain"
+  gzip -c "$plain" >"$gz"
+  rm -f -- "$plain"
+
+  local rc=0 saved_path=$PATH
+  PATH="$fakebin:$PATH"
+  set +e
+  redact_gz_file "$gz" "$redaction_log"
+  rc=$?
+  set -e
+  PATH=$saved_path
+
+  [[ "$rc" != "0" ]] || fail "redact_gz_file accepted a short read"
+  grep -q "rotated-short.log.gz: read " "$redaction_log" ||
+    fail "redaction log does not name the original artifact: $(cat "$redaction_log")"
+  [[ "$(gzip -dc "$gz")" == "$(printf 'one\ntwo\nthree')" ]] ||
+    fail "short read modified the compressed original"
+}
+
 test_redact_file_preserves_errexit_state() {
   local source_file="$tmpdir/errexit.txt"
   local redaction_log="$tmpdir/errexit.log"
@@ -561,6 +597,7 @@ test_redact_file_ceph_key_material
 test_redact_file_keeps_unterminated_final_line_once
 test_redact_file_fails_closed_on_short_read
 test_redact_file_preserves_errexit_state
+test_compressed_short_read_names_the_original_artifact
 test_redact_file_preserves_mode
 test_redact_gz_file
 test_redact_supported_compressed_files

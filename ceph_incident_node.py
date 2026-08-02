@@ -559,10 +559,11 @@ def _source_facts(source: Path) -> SourceFacts | None:
 
     try:
         info = source.lstat()
-    except PermissionError:
-        pass
     except OSError:
-        return None
+        # Any failure, not just EACCES: `var_log_stat_size` in the reference
+        # tries `sudo -n stat` after any unprivileged `stat` returns non-zero,
+        # and a scan-then-stat race should reach the same answer here.
+        pass
     else:
         return SourceFacts(info.st_size, info.st_mtime_ns)
     if _sudo_path() is None:
@@ -991,8 +992,6 @@ def _merged_destination(output: Path, family: str) -> Path:
 
 def _safe_read_command(source: Path) -> tuple[str, ...] | None:
     command = ("dd", f"if={source}", "iflag=noatime,nofollow", "status=none")
-    if os.environ.get("CEPH_INCIDENT_TEST_FORCE_SUDO") == "1":
-        return ("sudo", "-n", *command)
     try:
         source_stat = source.lstat()
     except PermissionError:
@@ -1007,6 +1006,8 @@ def _safe_read_command(source: Path) -> tuple[str, ...] | None:
         return None
     if not stat.S_ISREG(source_stat.st_mode):
         return None
+    if os.environ.get("CEPH_INCIDENT_TEST_FORCE_SUDO") == "1":
+        return ("sudo", "-n", *command)
     if os.geteuid() == 0 or source_stat.st_uid == os.geteuid():
         return command
     if _sudo_path() is None:
