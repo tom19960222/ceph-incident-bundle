@@ -21,6 +21,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+# One `sudo -n stat` on one path. Bounded because it is reached only when the
+# collector already could not stat the file itself.
+SOURCE_STAT_TIMEOUT_SECONDS = 20
+
 NODE_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("system/hostname.txt", ("hostname",)),
     ("system/uname.txt", ("uname", "-a")),
@@ -530,6 +534,57 @@ def _stat_or_none(path: Path, *, follow_symlinks: bool = True) -> os.stat_result
     try:
         return path.stat() if follow_symlinks else path.lstat()
     except OSError:
+        return None
+
+
+@dataclass(frozen=True)
+class SourceFacts:
+    """The size and mtime `/var/log` accounting needs from one source file."""
+
+    st_size: int
+    st_mtime_ns: int
+
+
+def _source_facts(source: Path) -> SourceFacts | None:
+    """Size and mtime for a log source, asking sudo when the process may not.
+
+    `/var/log/ceph/<fsid>` is 0750, so an ordinary user cannot stat what a
+    privileged scan just listed. The shell reference falls back to
+    `sudo -n stat` there; without that fallback every ceph log on every node
+    reads as `stat-failed` and the node goes partial with the evidence lost
+    (#50). Second resolution is what the reference's `%Y` gives, and both the
+    before and after reading of one file take the same path, so the immutability
+    check still compares like with like.
+    """
+
+    try:
+        info = source.lstat()
+    except PermissionError:
+        pass
+    except OSError:
+        return None
+    else:
+        return SourceFacts(info.st_size, info.st_mtime_ns)
+    if _sudo_path() is None:
+        return None
+    try:
+        result = subprocess.run(
+            ("sudo", "-n", "stat", "-c", "%s %Y", str(source)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=SOURCE_STAT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    fields = result.stdout.split()
+    if len(fields) != 2:
+        return None
+    try:
+        return SourceFacts(int(fields[0]), int(fields[1]) * 1_000_000_000)
+    except ValueError:
         return None
 
 
@@ -1308,9 +1363,8 @@ def _collect_var_logs(
     over_limit = False
     for sequence, source in enumerate(sources):
         relative = source.relative_to(root).as_posix()
-        try:
-            source_stat = source.lstat()
-        except OSError:
+        source_stat = _source_facts(source)
+        if source_stat is None:
             partial = True
             errors.append(f"{_escape_tsv(relative)}\tstat-failed\n")
             continue
@@ -1534,10 +1588,7 @@ def _collect_var_logs(
             continue
         decoded.unlink(missing_ok=True)
         payload_bytes += segment_size
-        try:
-            final_stat = candidate.source.lstat()
-        except OSError:
-            final_stat = None
+        final_stat = _source_facts(candidate.source)
         if final_stat is None or (
             final_stat.st_size != candidate.stored_bytes
             or final_stat.st_mtime_ns != candidate.mtime_ns
