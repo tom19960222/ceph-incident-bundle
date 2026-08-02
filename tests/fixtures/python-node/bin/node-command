@@ -184,6 +184,21 @@ case "$command_name" in
       *" -maxdepth 3 "*" -prune -o -exec sh -c "*" sh {} +") ;;
       *) printf 'unexpected fake find argv: %s\n' "$*" >&2; exit 64 ;;
     esac
+    # A privileged scan on a real node sees paths the collector's own process
+    # cannot stat.  The fake sudo is not privileged, so that asymmetry has to be
+    # asked for: FAKE_FIND_EXTRA_PATH appends one such path to the config scan.
+    if [ -n "${FAKE_FIND_EXTRA_PATH:-}" ]; then
+      case "$*" in
+        *" -maxdepth 4 "*)
+          # A real scan reports what it could not descend and exits non-zero;
+          # the collector reads such a scan's stdout anyway, so `set -e` must
+          # not swallow the rest of the answer here either.
+          "$FAKE_REAL_FIND" "$@" || true
+          printf '%s\0' "$FAKE_FIND_EXTRA_PATH"
+          exit 0
+          ;;
+      esac
+    fi
     exec "$FAKE_REAL_FIND" "$@"
     ;;
   sudo)

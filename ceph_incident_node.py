@@ -515,6 +515,39 @@ def _run_privileged(
     )
 
 
+def _stat_or_none(path: Path, *, follow_symlinks: bool = True) -> os.stat_result | None:
+    """Stat a node path, answering "cannot tell" instead of raising.
+
+    A daemon directory under `/var/lib/ceph` is 0750, so a collector running as
+    an ordinary user meets paths it may not stat on every real host. Before
+    Python 3.13 `pathlib`'s predicates only swallow ENOENT-shaped errors, so
+    EACCES escaped `is_symlink()` and took every artifact for the host with it
+    (#50) — on a lab node running 3.12 it still does. The shell reference has no
+    such cliff: `[[ -d ]]` on an untraversable path is simply false. Callers get
+    the same answer here, and a copy still falls through to its privileged read.
+    """
+
+    try:
+        return path.stat() if follow_symlinks else path.lstat()
+    except OSError:
+        return None
+
+
+def _is_symlink(path: Path) -> bool:
+    info = _stat_or_none(path, follow_symlinks=False)
+    return info is not None and stat.S_ISLNK(info.st_mode)
+
+
+def _is_regular_file(path: Path) -> bool:
+    info = _stat_or_none(path)
+    return info is not None and stat.S_ISREG(info.st_mode)
+
+
+def _is_directory(path: Path) -> bool:
+    info = _stat_or_none(path)
+    return info is not None and stat.S_ISDIR(info.st_mode)
+
+
 def _copy_evidence(
     source: Path, destination: Path, manifest: Path, host_alias: str
 ) -> bool:
@@ -528,7 +561,7 @@ def _copy_evidence(
     started = _utc_now()
     command = f"collect-node copy {source}"
     read_source = source
-    if source.is_symlink():
+    if _is_symlink(source):
         # `/etc/resolv.conf` is a symlink on most systemd hosts and the shell
         # reference follows it.  Resolving first keeps the read itself
         # no-follow, so only this deliberate indirection is honoured.  The
@@ -609,14 +642,14 @@ def _collect_timesyncd_config(
     destination.mkdir(mode=0o700, parents=True, exist_ok=True)
     copied = False
     complete = True
-    if conf.is_file():
+    if _is_regular_file(conf):
         if _copy_evidence(
             conf, destination / "timesyncd.conf", manifest, config.host_alias
         ):
             copied = True
         else:
             complete = False
-    if conf_directory.is_dir():
+    if _is_directory(conf_directory):
         for source in _find_files(
             conf_directory,
             ("-maxdepth", "1", "-type", "f", "-name", "*.conf"),
@@ -691,7 +724,7 @@ def _collect_var_lib_ceph(
     # away and leave the listing unindexed.  A stable collector verb keeps the
     # manifest an index, exactly as ADR 0010 does for copied evidence.
     listing_command_text = f"collect-node list {ceph_directory}"
-    if not ceph_directory.is_dir():
+    if not _is_directory(ceph_directory):
         _write_skipped_evidence(
             output / listing_artifact,
             manifest,
@@ -902,15 +935,23 @@ def _merged_destination(output: Path, family: str) -> Path:
 
 
 def _safe_read_command(source: Path) -> tuple[str, ...] | None:
+    command = ("dd", f"if={source}", "iflag=noatime,nofollow", "status=none")
+    if os.environ.get("CEPH_INCIDENT_TEST_FORCE_SUDO") == "1":
+        return ("sudo", "-n", *command)
     try:
         source_stat = source.lstat()
+    except PermissionError:
+        # Not being allowed to stat a path says nothing about whether it can be
+        # read as root, and the privileged scan that found it already proved it
+        # exists. The shell reference never stats either: `-O` is simply false
+        # on a directory it cannot traverse, so it falls through to `sudo -n dd`
+        # and comes back with the evidence (#50). `nofollow` still refuses a
+        # symlink, which is the guarantee the stat was there to make.
+        return None if _sudo_path() is None else ("sudo", "-n", *command)
     except OSError:
         return None
     if not stat.S_ISREG(source_stat.st_mode):
         return None
-    command = ("dd", f"if={source}", "iflag=noatime,nofollow", "status=none")
-    if os.environ.get("CEPH_INCIDENT_TEST_FORCE_SUDO") == "1":
-        return ("sudo", "-n", *command)
     if os.geteuid() == 0 or source_stat.st_uid == os.geteuid():
         return command
     if _sudo_path() is None:
@@ -1184,7 +1225,7 @@ def _collect_var_logs(
     config: NodeConfig,
 ) -> VarLogResult:
     output.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if not root.is_dir():
+    if not _is_directory(root):
         (output / "SKIPPED.txt").write_text(
             f"SKIPPED: {root} is not a directory\n", encoding="utf-8"
         )
