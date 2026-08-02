@@ -51,6 +51,7 @@ FAKE_NODE_COMMANDS = (
     "podman",
     "docker",
     "cephadm",
+    "stat",
 )
 # The few genuinely real binaries the fake world is built out of: the node runs
 # Python, packages its evidence with tar, and the fakes themselves are shell
@@ -64,7 +65,15 @@ class NodeCollectorFixture:
     def make_fake_environment(self, root: Path) -> tuple[dict[str, str], Path, Path]:
         real_commands = {
             command: shutil.which(command)
-            for command in ("gzip", "xz", "bzip2", "zstd", "find", *REAL_NODE_COMMANDS)
+            for command in (
+                "gzip",
+                "xz",
+                "bzip2",
+                "zstd",
+                "find",
+                "stat",
+                *REAL_NODE_COMMANDS,
+            )
         }
         self.assertTrue(all(real_commands.values()), real_commands)
         fake_bin = root / "bin"
@@ -112,6 +121,7 @@ class NodeCollectorFixture:
             "FAKE_REAL_BZIP2": str(real_commands["bzip2"]),
             "FAKE_REAL_ZSTD": str(real_commands["zstd"]),
             "FAKE_REAL_FIND": str(real_commands["find"]),
+            "FAKE_REAL_STAT": str(real_commands["stat"]),
         }
         (root / "var-log").mkdir()
         (root / "etc").mkdir()
@@ -1995,6 +2005,86 @@ class NodeEvidenceSurfaceTests(NodeCollectorFixture, unittest.TestCase):
                 self.node_manifest(bundle)["cephadm/var-lib-ceph-listing.txt"],
                 (f"collect-node list {root / 'var-lib-ceph'}", 0),
             )
+
+    def test_an_unstattable_config_costs_one_artifact_not_the_node(self) -> None:
+        """#50: a source the collector cannot stat must not abort the node.
+
+        The privileged scan finds a daemon directory this process cannot
+        traverse. `Path.is_symlink()` raises EACCES there rather than answering,
+        and that used to escape the node collector and lose every artifact for
+        the host — where the shell reference simply falls through to its
+        privileged read.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            # Depth 4 keeps it out of the `-maxdepth 3` listing scan, so only
+            # the copy scan meets it.
+            locked = root / "var-lib-ceph" / "fsid" / "mon.a" / "locked"
+            locked.mkdir()
+            config = locked / "config"
+            config.write_text("fsid = unreadable\n", encoding="utf-8")
+            environment["FAKE_FIND_EXTRA_PATH"] = str(config)
+            dd_log = root / "dd-argv.log"
+            environment["FAKE_DD_LOG"] = str(dd_log)
+            if os.geteuid() == 0:
+                self.skipTest("root can stat anything, so there is nothing to prove")
+            locked.chmod(0o000)
+            try:
+                bundle = self.collect_node_evidence(
+                    root, environment, expected_exit=2
+                )
+            finally:
+                locked.chmod(0o700)
+
+            evidence = self.node_evidence(bundle)
+            artifact = "cephadm/var-lib-ceph-configs/fsid/mon.a/locked/config"
+            self.assertIn(b"SKIPPED: copy failed: ", evidence[artifact])
+            # The rest of the node is still there: the loss is one artifact
+            # wide, not one host wide.
+            self.assertIn(b"fsid = fake\n", evidence[
+                "cephadm/var-lib-ceph-configs/fsid/mon.a/config"
+            ])
+            self.assertIn("system/hostname.txt", evidence)
+            # The read is still attempted the way the shell reference attempts
+            # it. A path the privileged scan found is reachable by a privileged
+            # read, so refusing to try is its own way of losing evidence.
+            self.assertIn(f"if={config}", dd_log.read_text(encoding="utf-8"))
+
+    def test_an_unstattable_log_is_stated_with_sudo(self) -> None:
+        """#50: `/var/log/ceph/<fsid>` is 0750, and the reference stats it anyway.
+
+        Without a privileged fallback every ceph log on every node reads as
+        `stat-failed`, which is the whole node's `/var/log` evidence gone for a
+        permission the shell reference simply asks sudo about.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            locked = root / "var-log" / "ceph" / "fsid"
+            locked.mkdir(parents=True)
+            log = locked / "ceph-volume.log"
+            log.write_text("volume line\n", encoding="utf-8")
+            (root / "var-log" / "messages").write_text("m\n", encoding="utf-8")
+            environment["FAKE_FIND_EXTRA_LOG_PATH"] = str(log)
+            stat_log = root / "stat-argv.log"
+            environment["FAKE_STAT_LOG"] = str(stat_log)
+            if os.geteuid() == 0:
+                self.skipTest("root can stat anything, so there is nothing to prove")
+            locked.chmod(0o000)
+            try:
+                bundle = self.collect_node_evidence(
+                    root, environment, expected_exit=2
+                )
+            finally:
+                locked.chmod(0o700)
+
+            self.assertIn(str(log), stat_log.read_text(encoding="utf-8"))
+            # The rest of the node is untouched by one log the collector could
+            # not size for itself.
+            self.assertIn("system/hostname.txt", self.node_evidence(bundle))
 
     def test_an_absent_var_lib_ceph_is_a_marker_not_a_failure(self) -> None:
         """A kube-only node has no `/var/lib/ceph`, and that is not an error."""

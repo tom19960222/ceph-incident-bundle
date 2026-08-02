@@ -494,7 +494,7 @@ redaction 之後（redaction 可能改變大小）對每台 node 重算 `merged/
 
 ---
 
-## 13. Redaction（lib/common.sh:154-249；lib/bundle.sh:228-253）
+## 13. Redaction（lib/common.sh:154-256；lib/bundle.sh:228-253）
 
 ### 13.1 範圍（`redact_bundle_text`）
 
@@ -509,11 +509,17 @@ redaction 之後（redaction 可能改變大小）對每台 node 重算 `merged/
 3. 行匹配 `(^|非英數)key\s*[:=]`（如 ceph `key = AQ...`）。
 4. 行含 base64 樣式 `[A-Za-z0-9+/]{38,}={1,2}`。
 
-每檔在 `redactions.log` 記 `path: N line(s) redacted`；保留原檔 permission mode（:198-201）。
+每檔在 `redactions.log` 記 `path: N line(s) redacted`；保留原檔 permission mode。
+
+**讀取方式與完整性**（#49）：來源以 `cat "$source" | redact_stream` 串進逐行迴圈，**不是** `<"$source"` 重導向——bash 對被重導向的一般檔案維持讀取 offset，超過 2 GiB 後 `read` 會失敗且不清空 `line`，「最後一行沒有換行符」的 `||` 補救因此永遠成立，迴圈會無上限地重寫同一行。該補救現在上鎖，最多只觸發一次。
+
+迴圈結束後比對「讀到的換行結尾記錄數」與來源的 `wc -l`。不相符時：**原檔原樣保留（不覆寫）**、暫存檔刪除、`redactions.log` 記 `path: read X of Y line(s), original left as-is (NOT redacted)`、return 1（→ 整體 redaction rc=2）。行為單位是「拒絕遮蔽」而不是「遮蔽一半」——安靜地少收證據比拒絕更糟。以 NUL 結尾、bash `read` 讀不出最後一段的二進位檔，兩邊都算 0 筆記錄，不算不相符。
+
+`redact_file` 的第三個參數是 log 顯示用路徑，預設等於來源路徑；壓縮檔用它記自己的原檔名而不是暫存的解壓檔。
 
 ### 13.3 壓縮檔（`redact_compressed_file`）
 
-`.gz/.xz/.bz2/.zst` 解壓 → redact → 重壓回原檔。**解壓失敗 → 檔案原樣保留、redactions.log 記 `... decompress failed, left as-is (NOT redACTED)`、return 0（不算錯誤）**；重壓失敗 → 原檔保留、記 log、return 1（→ 整體 redaction rc=2）（:221-244）。
+`.gz/.xz/.bz2/.zst` 解壓 → redact → 重壓回原檔。**解壓失敗 → 檔案原樣保留、redactions.log 記 `... decompress failed, left as-is (NOT redacted)`、return 0（不算錯誤）**；**解壓後 redact 失敗（見 13.2 的完整性檢查）→ 原檔原樣保留、暫存檔清除、return 1**；重壓失敗 → 原檔保留、記 log、return 1（→ 整體 redaction rc=2）。
 
 ---
 
