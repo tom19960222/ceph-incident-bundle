@@ -16,7 +16,11 @@ taken:
 - which members exist, at which paths;
 - the manifest — every collector, every artifact, the exact command argv and the
   exact exit code, which is where CLI semantics, runner selection and source
-  selection become observable;
+  selection become observable.  Node manifests are compared over the surface
+  both implementations claim rather than entry-for-entry, because ADR 0010
+  deliberately diverged their coverage; `_node_manifest` below is where that
+  divergence is enumerated, and it is the only place the manifest comparison
+  gives anything up;
 - each captured artifact's header (host, collector, timeout, truncation) and
   whether its body parses as JSON at all;
 - how each SKIPPED or partial outcome was classified;
@@ -33,10 +37,11 @@ and grows a key the moment a slow op is reported.  A gate that fails on a
 transient HEALTH_WARN is one people learn to re-run until it passes, which is
 worse than one that compares less and means it.
 
-A difference in any of the compared fields fails the gate; there is no allowance
-list here, because the only differences deliberately ignored are the ones the
-normalizer removes below — clocks, run directories, random temporary names and
-invocation identifiers — and each is named.
+A difference in any of the compared fields fails the gate.  Two things are
+deliberately ignored, and each is enumerated rather than described: the clocks,
+run directories, random temporary names and invocation identifiers the
+normalizer removes below, and the node manifest entries ADR 0010 already
+adjudicated as divergent.  There is no third list.
 
 Reading is untrusting.  A bundle is a tar archive, so every member is checked for
 absolute paths, traversal, links and special files before anything is read, and
@@ -95,6 +100,25 @@ SUMMARY_KEYS = (
 NODE_MANIFEST = re.compile(r"nodes/([^/]+)/manifest\.jsonl\Z")
 VAR_LOG_PAYLOAD = re.compile(r"nodes/[^/]+/logs/var-log/(?:merged|raw|original)/")
 SKIP_MARKER = "SKIPPED:"
+# The collector's own index verbs (ADR 0010).  `collect-node copy` marks evidence
+# the reference duplicates without recording, and `collect-var-log /var/log` the
+# generated `/var/log` tree.  Neither names a command that ran: they exist so an
+# archive-wide index can point at evidence nobody executed a command for.
+INDEX_VERBS = (["collect-node", "copy"], ["collect-var-log"])
+# The one artifact whose entry both implementations record but name differently.
+VAR_LIB_CEPH_LISTING = "cephadm/var-lib-ceph-listing.txt"
+CAPTURE_HEADER = "# host: "
+# ADR 0010 gives the SKIPPED markers it enumerates one of two exit codes: 127 for
+# a command that does not exist, 2 for evidence that does not.  The reference
+# writes a marker of its own outside that list — the over-limit journal, entry
+# code 75 — and that one it *does* record, so the code has to be part of the
+# recognition or the relaxation would swallow a reference entry.
+MARKER_EXIT_CODES = (2, 127)
+# A node manifest entry names its artifact by the absolute path it had inside the
+# node's workspace, which the normalizer has already collapsed to this marker.
+NODE_WORKSPACE_MARK = "<node-workspace>/"
+# All that survives of a manifest line whose command matched content safety.
+BLANKED_LINE = "[REDACTED]"
 CLUSTER_LAYERS = {"ceph": "cluster/ceph/", "rook": "cluster/rook/", "prometheus": "cluster/prometheus/"}
 
 TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?")
@@ -329,10 +353,123 @@ def _manifests(
 ) -> dict[str, object]:
     manifests: dict[str, object] = {}
     for name in sorted(contents.payloads):
-        if name != MANIFEST_NAME and NODE_MANIFEST.fullmatch(name) is None:
+        if name == MANIFEST_NAME:
+            manifests[name] = _manifest_records(contents.text(name), rules)
             continue
-        manifests[name] = _manifest_records(contents.text(name), rules)
+        node = NODE_MANIFEST.fullmatch(name)
+        if node is not None:
+            manifests[name] = _node_manifest(contents, node.group(1), name, rules)
     return manifests
+
+
+def _node_manifest(
+    contents: BundleContents,
+    alias: str,
+    name: str,
+    rules: Sequence[tuple[re.Pattern[str], str]],
+) -> dict[str, object]:
+    """One node manifest, reduced to the surface both implementations claim.
+
+    ADR 0010 deliberately diverged this document: the Python node manifest is an
+    index of *every* evidence in the archive, while the reference records only
+    the commands it ran.  Comparing entry-for-entry would make this gate overturn
+    an adjudication the project already made — and the counts say so plainly, 26
+    entries against 248 on one lab node.
+
+    What it drops is exactly what ADR 0010 enumerates: an entry that names copied
+    evidence or the generated `/var/log` tree, and an entry whose artifact is a
+    SKIPPED marker rather than evidence.  The first two announce themselves with
+    an index verb, so the bundle is asked to corroborate — an entry wearing an
+    index verb over an artifact that carries a capture header is a command that
+    really ran, and it stays in the comparison.  The third is read from the
+    bundle outright.
+
+    What it does *not* drop is the rest of `logs/var-log/`: the journal capture
+    there records the real `journalctl` argv on both sides, which is where
+    `sudo -n` and the `--since` window stay observable.
+    """
+
+    records = _manifest_records(contents.text(name), rules)
+    listing_present = _has_listing(contents, alias)
+    entries: list[dict[str, object]] = []
+    blanked = 0
+    listing = "absent"
+    for record in records:
+        if record.get("unparseable") == BLANKED_LINE:
+            blanked += 1
+            continue
+        if "unparseable" in record:
+            entries.append(record)
+            continue
+        relative = _node_relative(alias, str(record.get("artifact", "")))
+        if relative == VAR_LIB_CEPH_LISTING:
+            # Both implementations record this entry; only the command differs,
+            # and ADR 0010 moved that command's policy to the N9 argv ledger.
+            # Keyed on the artifact rather than on the candidate's verb, so the
+            # reference's `find` entry collapses the same way if content safety
+            # ever stops blanking it (#44).
+            listing = "recorded"
+            continue
+        if _is_index_only(contents, alias, relative, record):
+            continue
+        entries.append(record)
+    if listing == "absent" and listing_present and blanked:
+        # The reference records this same entry, but its real `find` expression
+        # names `*keyring*`, so content safety blanks the whole line before the
+        # bundle is packed.  One blanked line against a listing that is in the
+        # archive is that entry; ADR 0010 already moved its command policy to the
+        # N9 argv ledger.  A second blanked line is a redaction nothing here
+        # accounts for, so it stays visible below.
+        listing = "recorded"
+        blanked -= 1
+    return {
+        "entries": entries,
+        "var_lib_ceph_listing": listing,
+        "unaccounted_redacted_entries": blanked,
+    }
+
+
+def _has_listing(contents: BundleContents, alias: str) -> bool:
+    """Whether this node's `/var/lib/ceph` listing is in the bundle as evidence.
+
+    Membership, not readability: a listing over the interpretation cap is still a
+    listing, and asking `payloads` would quietly stop recognising it.
+    """
+
+    member = f"nodes/{alias}/{VAR_LIB_CEPH_LISTING}"
+    present = any(entry.name == member for entry in contents.members)
+    return present and not contents.is_skip(member)
+
+
+def _is_index_only(
+    contents: BundleContents, alias: str, relative: str | None, record: dict[str, object]
+) -> bool:
+    """Whether ADR 0010 declares this entry one the reference never records."""
+
+    if relative is None:
+        return False
+    member = f"nodes/{alias}/{relative}"
+    if contents.is_skip(member) and record.get("exit_code") in MARKER_EXIT_CODES:
+        return True
+    command = record.get("command", [])
+    if not isinstance(command, list):
+        return False
+    if not any(command[: len(verb)] == verb for verb in INDEX_VERBS):
+        return False
+    # An index verb claims nobody ran a command for this artifact.  A capture
+    # header says otherwise, and a capture is exactly what the reference records
+    # too — so the claim is refused rather than taken at its word.
+    return not contents.text(member).startswith(CAPTURE_HEADER)
+
+
+def _node_relative(alias: str, artifact: str) -> str | None:
+    """Where one node manifest entry's artifact sits inside the node's archive."""
+
+    marker = artifact.rfind(NODE_WORKSPACE_MARK)
+    if marker >= 0:
+        return artifact[marker + len(NODE_WORKSPACE_MARK) :]
+    prefix = f"nodes/{alias}/"
+    return artifact[len(prefix) :] if artifact.startswith(prefix) else None
 
 
 def _manifest_records(
