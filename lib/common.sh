@@ -83,7 +83,10 @@ write_ssh_debug_log() {
     printf '\n'
   } >"$artifact"
 
-  if "${cmd[@]}" >>"$artifact" 2>&1; then
+  # `</dev/null` for the same reason as run_capture: this probe runs on a capture
+  # failure, often from inside a caller's loop, and ssh would otherwise drain
+  # that loop's remaining input. The recorded `# command:` line is unaffected.
+  if "${cmd[@]}" >>"$artifact" 2>&1 </dev/null; then
     rc=0
   else
     rc=$?
