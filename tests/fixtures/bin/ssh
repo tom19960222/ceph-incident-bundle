@@ -9,6 +9,12 @@ if [[ -n "$log_file" ]]; then
   printf '%s\n' "$*" >>"$log_file"
 fi
 
+# Real ssh reads stdin to EOF and forwards it to the remote command. A fake that
+# leaves stdin untouched makes any caller that loops over a `while read` stream
+# look correct here and then collect one item in a real lab, which is exactly how
+# the crash-info loop shipped broken (issue #52).
+cat >/dev/null || true
+
 cmd="$*"
 
 emit_json() {

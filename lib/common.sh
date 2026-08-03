@@ -83,7 +83,10 @@ write_ssh_debug_log() {
     printf '\n'
   } >"$artifact"
 
-  if "${cmd[@]}" >>"$artifact" 2>&1; then
+  # `</dev/null` for the same reason as run_capture: this probe runs on a capture
+  # failure, often from inside a caller's loop, and ssh would otherwise drain
+  # that loop's remaining input. The recorded `# command:` line is unaffected.
+  if "${cmd[@]}" >>"$artifact" 2>&1 </dev/null; then
     rc=0
   else
     rc=$?
@@ -269,18 +272,22 @@ run_capture() {
   printf -v command_string '%q ' "${cmd[@]}"
   command_string=${command_string% }
 
+  # `</dev/null`: a captured command must never read the collector's stdin. ssh
+  # in particular drains it and forwards it to the remote command, which silently
+  # swallows whatever loop input the caller is iterating (issue #52). No capture
+  # takes input, so closing it costs nothing and leaves the argv untouched.
   local tbin
   tbin="$(timeout_cmd)"
   if [[ -n "$tbin" ]]; then
     printf '# timeout: %ss\n' "${COMMAND_TIMEOUT:-20}" >>"$artifact_tmp"
-    if "$tbin" "${COMMAND_TIMEOUT:-20}" "${cmd[@]}" >>"$artifact_tmp" 2>&1; then
+    if "$tbin" "${COMMAND_TIMEOUT:-20}" "${cmd[@]}" >>"$artifact_tmp" 2>&1 </dev/null; then
       rc=0
     else
       rc=$?
     fi
   else
     printf '# timeout: unavailable\n' >>"$artifact_tmp"
-    if "${cmd[@]}" >>"$artifact_tmp" 2>&1; then
+    if "${cmd[@]}" >>"$artifact_tmp" 2>&1 </dev/null; then
       rc=0
     else
       rc=$?
