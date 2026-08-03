@@ -664,7 +664,10 @@ class RepositoryGateTests(unittest.TestCase):
         )
         self.assertEqual(test_python_dry_run.returncode, 0, test_python_dry_run.stderr)
         self.assertIn("version_info < (3, 11)", test_python_dry_run.stdout)
-        self.assertIn("-m unittest discover", test_python_dry_run.stdout)
+        # The sharded runner spawns its own interpreters, so the gate only means
+        # something if the checked interpreter is the one it is handed.
+        self.assertIn("run-python-tests.sh", test_python_dry_run.stdout)
+        self.assertIn(f'PYTHON="{sys.executable}"', test_python_dry_run.stdout)
 
         validate_dry_run = subprocess.run(
             ["make", "-n", "-j4", "validate", f"PYTHON={sys.executable}"],
