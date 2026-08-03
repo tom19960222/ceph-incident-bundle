@@ -638,5 +638,66 @@ class NodeManifestTests(BundleTestCase):
         )
 
 
+class VarLogDriftTests(BundleTestCase):
+    """The `/var/log` payload file set belongs to the machine, not the collector.
+
+    Two honest collects hours apart package different files there — a UTC day
+    boundary births `sysstat/sa03`, journald renames its archived journals — so
+    the member comparison stops at the tree (#52).  The boundary is exactly the
+    `merged/`, `raw/` and `original/` subtrees: everything directly under
+    `logs/var-log/` is still compared, and so is every other member path.
+    """
+
+    def contract(self, extra: dict[str, bytes], name: str):
+        return contract_of(read_bundle(self.write(bundle_members(extra=extra), name)))
+
+    def test_files_the_machine_grew_between_collects_are_not_a_difference(self) -> None:
+        reference = self.contract({}, "drift-reference.tar.gz")
+        candidate = self.contract(
+            {
+                # What the real lab produced: the day boundary's sysstat file and
+                # a renamed archived journal, both candidate-only (#52).
+                "nodes/monitor01/logs/var-log/raw/sysstat/sa03": b"\x00\x01",
+                "nodes/monitor01/logs/var-log/raw/journal/3f0c/system@0006.journal": b"\x7fLPKSHHRH",
+            },
+            "drift-candidate.tar.gz",
+        )
+        self.assertEqual(describe_differences(reference, candidate), ())
+
+    def test_a_file_rotated_away_before_the_second_collect_is_not_a_difference(self) -> None:
+        reference = self.contract(
+            {"nodes/monitor01/logs/var-log/original/syslog.1": b"old line\n"},
+            "rotated-reference.tar.gz",
+        )
+        candidate = self.contract({}, "rotated-candidate.tar.gz")
+        self.assertEqual(describe_differences(reference, candidate), ())
+
+    def test_a_member_directly_under_var_log_is_still_compared(self) -> None:
+        # `INDEX.tsv` and the journal capture sit beside the payload trees, not
+        # inside them: they are the implementation's output, so losing one is a
+        # difference the drift allowance must not absorb.
+        reference = self.contract(
+            {"nodes/monitor01/logs/var-log/INDEX.tsv": b"path\tbytes\n"},
+            "index-reference.tar.gz",
+        )
+        candidate = self.contract({}, "index-candidate.tar.gz")
+        self.assertNotEqual(describe_differences(reference, candidate), ())
+
+    def test_the_drift_allowance_does_not_reach_other_node_evidence(self) -> None:
+        reference = self.contract({}, "node-reference.tar.gz")
+        candidate = self.contract(
+            {"nodes/monitor01/cephadm/extra-evidence.txt": b"data\n"},
+            "node-candidate.tar.gz",
+        )
+        self.assertNotEqual(describe_differences(reference, candidate), ())
+
+    def test_the_drift_allowance_does_not_reach_cluster_artifacts(self) -> None:
+        reference = self.contract({}, "cluster-reference.tar.gz")
+        candidate = self.contract(
+            {"cluster/ceph/json/extra.json": b"{}\n"}, "cluster-candidate.tar.gz"
+        )
+        self.assertNotEqual(describe_differences(reference, candidate), ())
+
+
 if __name__ == "__main__":
     unittest.main()

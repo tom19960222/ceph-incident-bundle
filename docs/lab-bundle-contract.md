@@ -24,7 +24,7 @@ Real lab 兩者都不是。兩次 qualification collect 相隔數分鐘打在活
 
 | 比較項目 | 為什麼它是 contract |
 | --- | --- |
-| member 路徑集合 | 兩個實作必須產出同一組 artifact，放在同一個位置 |
+| member 路徑集合 | 兩個實作必須產出同一組 artifact，放在同一個位置——唯一例外是 `/var/log` payload 樹內的檔案集合，見下方「刻意不比較」 |
 | 頂層 `manifest.jsonl` | collector、artifact、完整 command argv 與 exit code — CLI semantics、runner 選擇與 source 選擇都在這裡變成可觀測 |
 | 每個 node 的 `manifest.jsonl` | 同上，但只比對「兩邊都宣稱的那一面」，見下節 |
 | 每個 captured artifact 的 `# key: value` header | host、collector、timeout 與 truncation 標記 |
@@ -49,9 +49,19 @@ covered。
   `health.checks` 是 `{}`，一出現 slow op 就多一個 key；某個 counter 這次是 `0`
   下次是 `0.5`。會因為一次暫時性 HEALTH_WARN 就失敗的 gate，只會被學會「重跑到過為
   止」，那比一個少比但說得準的 gate 更糟。
-- `/var/log` payload 與重壓縮後的 metric dump bytes（`nodes/*/logs/var-log/{merged,raw,original}/`、
-  任何 `.gz`／`.xz`／`.bz2`／`.zst`）。這些只比對「存在與路徑」。
+- 重壓縮後的 metric dump bytes（任何 `.gz`／`.xz`／`.bz2`／`.zst`）。這些只比對
+  「存在與路徑」。
 - 超過 4 MiB 的 artifact 內容；同樣只比對存在與路徑。
+- `/var/log` payload 樹（`nodes/*/logs/var-log/{merged,raw,original}/`）**連存在與
+  路徑都不比**。這棵樹的檔案集合是活體機器的作為，不是實作的：兩次 collect 跨過
+  UTC 日界，`sysstat/sa03` 就只在第二次存在；journald 也會在兩次之間輪替、改名它
+  的 archived journal（#52 實測，3 + 4 項）。要求「存在與路徑」相同，等於要求兩個
+  時刻的 `/var/log` 長得一樣，那與比對 evidence bytes 是同一種錯。
+  放寬的界線就是這三棵子樹，一步不多：直接放在 `logs/var-log/` 下的成員——
+  `journal-all-since.txt` capture（`sudo -n` 與 `--since` 窗口在它的 argv 上）與
+  `INDEX.tsv`——照常逐筆比對；每個 node 的 `/var/log` path 仍受 per-bundle 四路
+  coverage 檢查，整棵樹沒收依然會失敗；cluster artifact 與其他 node evidence 的
+  member 路徑照常完全比對。
 
 Evidence 處理本身的 byte-level 等價是 offline gate 的職責：那裡的輸入是凍結的，所以
 它可以精確比對。

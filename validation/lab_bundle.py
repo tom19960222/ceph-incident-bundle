@@ -13,7 +13,11 @@ not be strictness — it would be a gate that can only pass by accident.
 So this module compares the part of a bundle that must not depend on when it was
 taken:
 
-- which members exist, at which paths;
+- which members exist, at which paths — except inside the `/var/log` payload
+  trees, whose file set is the live machine's doing rather than either
+  implementation's: a collect on the far side of a UTC day boundary finds a
+  `sysstat/sa03` the earlier one could not, and journald renames its archived
+  files between two runs (#52);
 - the manifest — every collector, every artifact, the exact command argv and the
   exact exit code, which is where CLI semantics, runner selection and source
   selection become observable.  Node manifests are compared over the surface
@@ -37,11 +41,13 @@ and grows a key the moment a slow op is reported.  A gate that fails on a
 transient HEALTH_WARN is one people learn to re-run until it passes, which is
 worse than one that compares less and means it.
 
-A difference in any of the compared fields fails the gate.  Two things are
+A difference in any of the compared fields fails the gate.  Three things are
 deliberately ignored, and each is enumerated rather than described: the clocks,
 run directories, random temporary names and invocation identifiers the
-normalizer removes below, and the node manifest entries ADR 0010 already
-adjudicated as divergent.  There is no third list.
+normalizer removes below; the node manifest entries ADR 0010 already
+adjudicated as divergent; and which files the `/var/log` payload trees hold,
+which belongs to the machine and the hour rather than to either implementation.
+There is no fourth list.
 
 Reading is untrusting.  A bundle is a tar archive, so every member is checked for
 absolute paths, traversal, links and special files before anything is read, and
@@ -98,6 +104,14 @@ SUMMARY_KEYS = (
     "final_status",
 )
 NODE_MANIFEST = re.compile(r"nodes/([^/]+)/manifest\.jsonl\Z")
+# The `/var/log` payload trees.  Their bytes are never interpreted, and their
+# *file set* is excluded from the member and artifact comparison outright: which
+# files `/var/log` holds is the live machine's doing — `sysstat/sa03` is born at
+# a UTC day boundary, journald renames archived journals between two collects
+# (#52) — so two honest collects hours apart legitimately package different
+# files here.  The boundary is exactly these three subtrees: members directly
+# under `logs/var-log/` (the journal capture, the INDEX) are still compared, and
+# per-bundle coverage still requires every node's `/var/log` path collected.
 VAR_LOG_PAYLOAD = re.compile(r"nodes/[^/]+/logs/var-log/(?:merged|raw|original)/")
 SKIP_MARKER = "SKIPPED:"
 # The collector's own index verbs (ADR 0010).  `collect-node copy` marks evidence
@@ -321,7 +335,10 @@ def contract_of(
     # the timestamp inside one would stop the literal from ever matching.
     rules = [*substitutions, *_default_substitutions()]
     contract: dict[str, object] = {
-        "members": list(contents.names),
+        # The `/var/log` payload trees are the one member-set exception: their
+        # file set drifts naturally between two collects, so their contents stay
+        # out of the comparison — see VAR_LOG_PAYLOAD for the boundary.
+        "members": [name for name in contents.names if not VAR_LOG_PAYLOAD.match(name)],
         "manifests": _manifests(contents, rules),
         "artifacts": _artifacts(contents, rules),
         "errors": _error_classes(contents, rules),
@@ -525,6 +542,10 @@ def _artifacts(
             continue
         name = member.name
         if name == MANIFEST_NAME or NODE_MANIFEST.fullmatch(name) is not None:
+            continue
+        if VAR_LOG_PAYLOAD.match(name):
+            # Which files the payload trees hold is the machine's doing, not the
+            # implementation's — see VAR_LOG_PAYLOAD for the boundary.
             continue
         artifacts[normalize(name, rules)] = _artifact_contract(contents, member, rules)
     return artifacts
