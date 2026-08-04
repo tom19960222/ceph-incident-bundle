@@ -117,8 +117,11 @@ SKIP_MARKER = "SKIPPED:"
 # The collector's own index verbs (ADR 0010).  `collect-node copy` marks evidence
 # the reference duplicates without recording, and `collect-var-log /var/log` the
 # generated `/var/log` tree.  Neither names a command that ran: they exist so an
-# archive-wide index can point at evidence nobody executed a command for.
-INDEX_VERBS = (["collect-node", "copy"], ["collect-var-log"])
+# archive-wide index can point at evidence nobody executed a command for.  Each
+# is matched as an argv prefix, and no wider than the contract document
+# enumerates it — the candidate writes `collect-var-log /var/log` verbatim, so
+# the `/var/log` argument is part of the verb, not an example.
+INDEX_VERBS = (["collect-node", "copy"], ["collect-var-log", "/var/log"])
 # The one artifact whose entry both implementations record but name differently.
 VAR_LIB_CEPH_LISTING = "cephadm/var-lib-ceph-listing.txt"
 CAPTURE_HEADER = "# host: "

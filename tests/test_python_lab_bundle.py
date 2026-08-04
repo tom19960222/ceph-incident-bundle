@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from validation.lab_bundle import (
+    BLANKED_LINE,
     BundleUnreadable,
     contract_of,
     coverage_of,
@@ -392,9 +393,6 @@ class ContractTests(BundleTestCase):
 
 
 WORKSPACE = "/tmp/ceph-incident-node.Ab3xY9"
-# What content safety leaves of a manifest line whose command names a credential
-# pattern; the reference's `/var/lib/ceph` listing always ends up here.
-BLANKED = "[REDACTED]"
 
 
 def node_entry(
@@ -424,7 +422,14 @@ class NodeManifestTests(BundleTestCase):
 
     HOST = "monitor01"
 
-    def bundle(self, entries: list[object], name: str):
+    def bundle(self, manifest_lines: list[object], name: str):
+        """One bundle whose node manifest holds `manifest_lines`.
+
+        A line is either an entry dict, serialised as JSON, or an already-final
+        string — the way `BLANKED_LINE` reaches a real manifest: content safety
+        rewrites the serialised line itself, leaving nothing to parse.
+        """
+
         members = bundle_members(hosts=(self.HOST,))
         members[f"nodes/{self.HOST}/cephadm/var-lib-ceph-listing.txt"] = capture(
             self.HOST, "collect-node", "2026-07-31T01:00:00Z", "d /var/lib/ceph\n"
@@ -443,7 +448,7 @@ class NodeManifestTests(BundleTestCase):
         members[f"nodes/{self.HOST}/logs/var-log/INDEX.tsv"] = b"path\tbytes\n"
         members[f"nodes/{self.HOST}/manifest.jsonl"] = "".join(
             (line if isinstance(line, str) else json.dumps(line)) + "\n"
-            for line in entries
+            for line in manifest_lines
         ).encode("utf-8")
         return contract_of(read_bundle(self.write(members, name)))
 
@@ -463,7 +468,9 @@ class NodeManifestTests(BundleTestCase):
     def reference(self, extra: list[object] | None = None):
         # The reference's own listing entry does not survive redaction: its real
         # `find` expression names `*keyring*`, so content safety blanks the line.
-        return self.bundle(self.shared() + [BLANKED] + (extra or []), "reference.tar.gz")
+        return self.bundle(
+            self.shared() + [BLANKED_LINE] + (extra or []), "reference.tar.gz"
+        )
 
     def candidate(self, extra: list[object] | None = None):
         return self.bundle(
@@ -607,11 +614,11 @@ class NodeManifestTests(BundleTestCase):
         self.assertNotEqual(describe_differences(reference, candidate), ())
 
     def test_a_redaction_the_listing_does_not_explain_is_a_difference(self) -> None:
-        reference = self.reference(extra=[BLANKED])
+        reference = self.reference(extra=[BLANKED_LINE])
         self.assertNotEqual(describe_differences(reference, self.candidate()), ())
 
     def test_the_relaxation_does_not_reach_the_cluster_manifest(self) -> None:
-        reference = self.contract_with_cluster_manifest([])
+        reference = self.contract_with_cluster_manifest([], "cluster-reference.tar.gz")
         candidate = self.contract_with_cluster_manifest(
             [
                 {
@@ -623,19 +630,19 @@ class NodeManifestTests(BundleTestCase):
                     "started": "2026-07-31T01:00:00Z",
                     "ended": "2026-07-31T01:00:01Z",
                 }
-            ]
+            ],
+            "cluster-candidate.tar.gz",
         )
         self.assertNotEqual(describe_differences(reference, candidate), ())
 
-    def contract_with_cluster_manifest(self, extra: list[dict[str, object]]):
+    def contract_with_cluster_manifest(
+        self, extra: list[dict[str, object]], name: str
+    ):
         members = bundle_members(hosts=(self.HOST,))
-        self.written = getattr(self, "written", 0) + 1
         members["manifest.jsonl"] += "".join(
             json.dumps(record) + "\n" for record in extra
         ).encode("utf-8")
-        return contract_of(
-            read_bundle(self.write(members, f"cluster-{self.written}.tar.gz"))
-        )
+        return contract_of(read_bundle(self.write(members, name)))
 
 
 class VarLogDriftTests(BundleTestCase):
