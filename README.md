@@ -69,6 +69,32 @@ HOSTS=(
 Inventory 是 declarative 格式，只接受上述 quoted scalar 與 `HOSTS` array；
 不會再當成 shell script `source`，因此不能放 command substitution 或其他命令。
 
+## 從 `/etc/hosts` 產生 inventory
+
+已經有 `/etc/hosts`（或任何同格式的檔案）時，用 `run/hosts-to-inventory.sh` 轉成 inventory，不用手抄：
+
+```bash
+bash run/hosts-to-inventory.sh --user ikaros --seed mon01 \
+  --output inventory/ceph-lab.env /etc/hosts
+```
+
+不給檔名時讀 `/etc/hosts`，給 `-` 讀 stdin；不給 `--output` 就寫 stdout。
+
+轉換規則：
+
+- 一行有多個 hostname（`1.2.3.4 aaa aaa.com`）時，取**第一個合法的**當 alias，其餘忽略；第一個不合法（例如 Linux 的 `_gateway`）就往後找下一個。
+- 整行註解、行尾註解（`#` 之後）與空行都跳過。
+- 預設跳過 loopback、wildcard、broadcast、link-local（含 IPv4 的 `169.254.0.0/16`）與 IPv6；`--keep-loopback`、`--ipv6` 可以放行（IPv6 會輸出成 `[fd00::10]`）。帶 zone id（`fe80::1%eth0`）或 v4-mapped（`::ffff:10.0.0.5`）的 IPv6 即使開了 `--ipv6` 也會跳過並回報：兩個 collect 實作的 SSH target 文法都不同時接受這兩種寫法。
+- 同一個位址出現在多行時只留第一個 alias，避免同一台 node 被收兩次。
+- 同一個 alias 指到兩個不同位址會**直接失敗**而不是猜一個，改用 `--exclude` 或 `--strip-domain` 排除。
+- 每一筆被跳過的資料都會寫到 stderr，不會安靜消失；一筆都沒留下時 exit 非 0。
+
+常用選項：`--strip-domain`（`mon01.lab.local` → `mon01`）、`--match REGEX` / `--exclude REGEX`（比對位址與該行所有 hostname）、`--rook-ns`、`--rook-operator-ns`。`--seed` 可以給 alias、該行任一個 hostname 或位址，會解析成對應位址。完整選項看 `bash run/hosts-to-inventory.sh --help`。
+
+輸出的 alias 與 SSH target 都先用 collect 端同一套規則驗過（兩個實作的規則不完全相同時取**較嚴**的那個），所以產生出來的 inventory 不會在收集時才變成 `skipped unsafe host alias` / `skipped unsafe SSH target`。
+
+這個工具只服務一般的 inventory-driven collect。real-lab 驗證（`make validate-lab`）不吃這裡產生的檔案：它每次執行都從已啟用的 Lab Profile 自己算出一份 inventory，見 `docs/lab-validation-runbook.md`。
+
 ## 自動偵測（auto，預設）
 
 預設 `--mode auto` 會逐台 node 經 ssh 偵測能力，再分層收集：

@@ -36,6 +36,12 @@
 > 因此實際列數為 138／128／10。逐項覆蓋狀態見 `docs/test-scenario-ledger.md`，
 > 該對照由 `tests/test_python_scenario_ledger.py` 機械檢查，總數不一致會失敗。
 
+> 本清單的範圍是 collect／verify 這條 observable contract 的 shell 測試。
+> `tests/run-tests.sh` 另外會跑 `tests/test-hosts-to-inventory.sh`（#47），它測的是
+> 工作機端的輔助工具 `run/hosts-to-inventory.sh`——產生 inventory 的離線轉換器，
+> 不參與 collect 的 observable contract，也不在 differential gate 的比較面內，
+> 因此刻意不列入上表、ledger 與 audit。這是範圍，不是漏記。
+
 ---
 
 ## 1. `tests/run-tests.sh`（總入口）
