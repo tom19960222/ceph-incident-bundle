@@ -527,7 +527,7 @@ redaction 之後（redaction 可能改變大小）對每台 node 重算 `merged/
 
 每個被捕捉的指令：
 
-- artifact 檔頭三～四行註解：`# host: <h>`、`# collector: <c>`、`# started: <UTC>`、`# timeout: <COMMAND_TIMEOUT>s`（無 timeout binary 時 `# timeout: unavailable`）。之後是指令 stdout+stderr 合流。
+- artifact 檔頭三～四行註解：`# host: <h>`、`# collector: <c>`、`# started: <UTC>`、`# timeout: <COMMAND_TIMEOUT>s`（無 timeout binary 時 `# timeout: unavailable`；qualification 工作機不允許此模式，見 [ADR 0011](adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md)）。之後是指令 stdout+stderr 合流。
 - **stdin 一律關成 `/dev/null`**（:334、:341）。被捕捉的指令沒有一個是互動程式，但 `ssh` 不管遠端要不要都會把 stdin 讀到 EOF，而呼叫端多半是 `while IFS= read -r … done <<<"$list"` 迴圈——繼承 stdin 等於讓第一次 capture 吃掉迴圈還沒讀的清單。`ceph crash info` 因此在真 lab 上九個 id 只取到兩個（#52）。
 - 指令被 `timeout $COMMAND_TIMEOUT`（預設 20）包住；exit 124/137 時檔尾補 `# TRUNCATED: command timed out after <s>s (exit <rc>)`（:350-352）。
 - 先寫入同目錄 mktemp 暫存檔再 `mv`（不會留半寫檔）。
