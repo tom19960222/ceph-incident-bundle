@@ -77,6 +77,9 @@ CEPH_RESPONSES = {
 SECRET_CONFIG_DUMP = (
     '[{"who":"mon.a","key":"AQBcluster0123456789012345678901234567==","value":"1"}]'
 )
+# Executable form of the length claim above, so a re-counted literal cannot
+# quietly fall back under the redaction rule's 38-character threshold.
+assert re.search(r'"key":"[A-Za-z0-9+/]{38}=="', SECRET_CONFIG_DUMP)
 
 # Twelve ids including the sanitisation collision pair, so both implementations
 # have to apply the same ten-crash limit and the same collision-safe naming.

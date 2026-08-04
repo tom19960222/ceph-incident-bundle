@@ -12,6 +12,7 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import re
 import tarfile
 
 
@@ -38,6 +39,13 @@ NODE_CONFIG_PAYLOAD = (
     b"[global]\n"
     b"mon_host = 10.0.0.1\n"
     b"key = AQBnodeconfig0123456789012345678901234==\n"
+)
+
+# Executable form of the length claim above, so a re-counted literal cannot
+# quietly fall back under the content-safety scanner's 20-character threshold.
+assert all(
+    re.search(rb"(?m)^key = [A-Za-z0-9+/]{38}==$", payload)
+    for payload in (PLAIN_SECRET_PAYLOAD, NODE_CONFIG_PAYLOAD)
 )
 
 

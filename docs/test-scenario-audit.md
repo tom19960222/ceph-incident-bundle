@@ -183,8 +183,8 @@ Python 實作缺行為。唯一觸及實作邊界的是 V7——`tls.key-2026072
 | O5 | 2026-07-31 | 209836d77795fc81 | 逐子句核對：指向的測試已斷言該列的每個子句，未更動 |
 | O6 | 2026-07-31 | 3a6bcc52cc9d65a4 | 補：新增預設值案例，斷言不帶旗標時 `StrictHostKeyChecking=accept-new` 確實在 |
 | O7 | 2026-07-31 | 98bd6d31c6709b5b | 改指：「redaction 預設仍開」那半改指向真的用預設值跑的測試 |
-| O8 | 2026-07-31 | 70e0eef1d2972289 | 補：host key trust 預設值由新的預設值案例斷言 |
-| O9 | 2026-07-31 | b6c9f15373f3964f | 改指：補上 `--trust-ssh-host-key --redact` 這一組案例，並與新的預設值案例對照出「等同預設」 |
+| O8 | 2026-08-03 | 70e0eef1d2972289 | 補：host key trust 預設值由新的預設值案例斷言。#53 後補註：differential 欄指向的 `mixed-full-collection-unredacted` 因假 key 補到真實長度而改為 fail-closed（exit 1、不產 bundle），「秘密原文保留」這個子句在該 scenario 改由保留下來的 workdir 雙跑比對見證；「保留於 bundle」本身仍由本列指向的 Python 測試與 shell 測試斷言 |
+| O9 | 2026-08-03 | b6c9f15373f3964f | 改指：補上 `--trust-ssh-host-key --redact` 這一組案例，並與新的預設值案例對照出「等同預設」。#53 後補註：differential 欄指向的 scenario 結局改為 fail-closed，見 O8 |
 | O10 | 2026-07-31 | 7b2bdf36dbb7c5d5 | 逐子句核對：指向的測試已斷言該列的每個子句，未更動 |
 | O11 | 2026-07-31 | fa1730897f3f0c3d | 補：bundle 內沒有 `cluster/rook/`、ssh ledger 沒有 `kubectl`（原本完全沒驗） |
 | O12 | 2026-07-31 | 7ad24dec847eed3f | 逐子句核對：指向的測試已斷言該列的每個子句，未更動 |
