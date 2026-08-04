@@ -493,6 +493,28 @@ if entry["exit_code"] != 0:
 PY
 }
 
+# A captured command must not be able to read the caller's stdin. Several
+# collectors drive `run_capture` from a `while IFS= read -r … done <<<"$list"`
+# loop, and the captured command is usually `ssh`, which reads stdin to EOF: it
+# would swallow the rest of the list and the loop would stop after one or two
+# items. The crash-info loop lost seven of nine ids that way (#52).
+test_run_capture_isolates_the_callers_stdin() {
+  local manifest="$tmpdir/run-manifest-stdin.jsonl"
+  local artifact="$tmpdir/run-artifact-stdin.txt"
+  local seen=''
+  local item
+
+  while IFS= read -r item; do
+    seen="${seen:+$seen,}$item"
+    run_capture "$manifest" "host-a" "collector-a" "$artifact-$item" -- cat
+  done <<<"$(printf 'one\ntwo\nthree\n')"
+
+  [[ "$seen" == "one,two,three" ]] ||
+    fail "captured command drained the loop's stdin, saw '$seen'"
+  [[ "$(sed -n '5p' "$artifact-one")" == "" ]] ||
+    fail "captured command read the loop's stdin as its own: $(sed -n '5,$p' "$artifact-one")"
+}
+
 test_run_capture_non_zero_writes_error_log_and_returns_code() {
   local manifest="$tmpdir/run-manifest-fail.jsonl"
   local artifact="$tmpdir/run-artifact-fail.txt"
@@ -608,6 +630,7 @@ test_post_redaction_cap_discards_payload
 test_progress_respects_quiet
 test_progress_goes_to_stderr
 test_run_capture_success
+test_run_capture_isolates_the_callers_stdin
 test_run_capture_non_zero_writes_error_log_and_returns_code
 test_run_capture_missing_double_dash_is_fatal
 test_run_capture_timeout_branch

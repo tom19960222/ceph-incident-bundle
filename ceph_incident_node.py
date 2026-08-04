@@ -328,6 +328,12 @@ def _write_artifact(
     try:
         result = subprocess.run(
             list(command),
+            # The reference closes stdin for every capture: a captured command
+            # that reads it would consume whatever is feeding the collector —
+            # on this node that is the collector's own source, streamed in over
+            # SSH.  Nothing captured here is interactive, but `ssh` reads stdin
+            # to EOF regardless of what the remote asked for (#52).
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,

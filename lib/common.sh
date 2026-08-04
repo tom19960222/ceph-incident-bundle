@@ -83,7 +83,10 @@ write_ssh_debug_log() {
     printf '\n'
   } >"$artifact"
 
-  if "${cmd[@]}" >>"$artifact" 2>&1; then
+  # `</dev/null` for the same reason as run_capture: this probe runs on a capture
+  # failure, often from inside a caller's loop, and ssh would otherwise drain
+  # that loop's remaining input. The recorded `# command:` line is unaffected.
+  if "${cmd[@]}" >>"$artifact" 2>&1 </dev/null; then
     rc=0
   else
     rc=$?
@@ -322,18 +325,23 @@ run_capture() {
   printf -v command_string '%q ' "${cmd[@]}"
   command_string=${command_string% }
 
+  # stdin is closed for every captured command. Nothing here is an interactive
+  # program, but `ssh` reads stdin to EOF whether or not the remote wants it,
+  # and callers drive this from `while IFS= read -r … done <<<"$list"` loops —
+  # so an inherited stdin means the first capture eats the rest of the list.
+  # `ceph crash info` lost seven of nine ids to exactly that (#52).
   local tbin
   tbin="$(timeout_cmd)"
   if [[ -n "$tbin" ]]; then
     printf '# timeout: %ss\n' "${COMMAND_TIMEOUT:-20}" >>"$artifact_tmp"
-    if "$tbin" "${COMMAND_TIMEOUT:-20}" "${cmd[@]}" >>"$artifact_tmp" 2>&1; then
+    if "$tbin" "${COMMAND_TIMEOUT:-20}" "${cmd[@]}" </dev/null >>"$artifact_tmp" 2>&1; then
       rc=0
     else
       rc=$?
     fi
   else
     printf '# timeout: unavailable\n' >>"$artifact_tmp"
-    if "${cmd[@]}" >>"$artifact_tmp" 2>&1; then
+    if "${cmd[@]}" </dev/null >>"$artifact_tmp" 2>&1; then
       rc=0
     else
       rc=$?
