@@ -114,15 +114,25 @@ collect_cephadm_recent_crashes() {
 
   [[ -n "$crash_ids" ]] || return 0
 
+  # Drain the id list into an array before capturing anything. Capturing runs
+  # ssh, ssh reads stdin to EOF, and a `while read` fed by this herestring would
+  # lose every id after the first — one crash inspected instead of ten.
+  local -a crash_id_list=()
   local crash_id safe_id crash_info_artifact
   while IFS= read -r crash_id; do
     [[ -n "$crash_id" ]] || continue
+    crash_id_list+=("$crash_id")
+  done <<<"$crash_ids"
+
+  [[ ${#crash_id_list[@]} -gt 0 ]] || return 0
+
+  for crash_id in "${crash_id_list[@]}"; do
     safe_id="$(cephadm_crash_artifact_name "$crash_id")"
     crash_info_artifact="$(cephadm_unique_crash_artifact "$crash_dir" "$safe_id")"
     if ! collect_cephadm_command "$outdir" "$manifest" "$seed" "$ssh_key" "$timeout" "$runner" "$crash_info_artifact" crash info "$crash_id"; then
       rc=2
     fi
-  done <<<"$crash_ids"
+  done
 
   return "$rc"
 }

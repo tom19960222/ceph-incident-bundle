@@ -12,7 +12,7 @@ from validation.lab_commands import (
     activate_command,
     discover_command,
     preflight_command,
-    qualification_not_implemented,
+    qualify_command,
     status_command,
 )
 
@@ -49,12 +49,34 @@ class RunnableActionTests(unittest.TestCase):
                 self.assertIn(target, defined)
                 self.assertIn(f"LAB_PROFILE={PROFILE}", command)
 
-    def test_the_unimplemented_gate_is_never_offered_as_an_action(self) -> None:
-        # `validate-lab` belongs to issue #20; naming it as a runnable step would
-        # send an agent at a target that does not exist.
-        self.assertNotIn(QUALIFICATION_TARGET, make_targets())
-        self.assertIn(QUALIFICATION_TARGET, qualification_not_implemented())
-        self.assertIn("not implemented", qualification_not_implemented())
+    def test_the_qualification_gate_is_a_real_confirmed_target(self) -> None:
+        # The gate is only useful as a next action if it exists and carries its
+        # explicit confirmation: it runs two real collects against the lab.
+        self.assertIn(QUALIFICATION_TARGET, make_targets())
+        command = qualify_command(PROFILE)
+        self.assertIn(f"make {QUALIFICATION_TARGET}", command)
+        self.assertIn(f"LAB_PROFILE={PROFILE}", command)
+        self.assertIn(f"{PREFLIGHT_CONFIRMATION_VARIABLE}=1", command)
+
+    def test_ordinary_validation_can_never_reach_a_lab(self) -> None:
+        # `make validate` must stay offline: no lab target may become one of its
+        # prerequisites, directly or through another target it depends on.
+        text = MAKEFILE.read_text(encoding="utf-8")
+        prerequisites: dict[str, set[str]] = {
+            rule.group(1): set(rule.group(2).split())
+            for rule in re.finditer(r"^([a-z][a-z0-9-]*):(.*)$", text, re.MULTILINE)
+        }
+        reachable: set[str] = set()
+        pending = list(prerequisites.get("validate", ()))
+        while pending:
+            target = pending.pop()
+            if target in reachable:
+                continue
+            reachable.add(target)
+            pending += list(prerequisites.get(target, ()))
+        for target in ("lab-status", "lab-profile-discover", "lab-profile-activate",
+                       "lab-preflight", QUALIFICATION_TARGET):
+            self.assertNotIn(target, reachable)
 
     def test_the_confirmation_variables_are_the_ones_the_makefile_documents(self) -> None:
         text = MAKEFILE.read_text(encoding="utf-8")
@@ -119,7 +141,13 @@ class VocabularyTests(unittest.TestCase):
         }
         self.assertEqual(
             builders,
-            {"status_command", "discover_command", "activate_command", "preflight_command"},
+            {
+                "status_command",
+                "discover_command",
+                "activate_command",
+                "preflight_command",
+                "qualify_command",
+            },
         )
 
 

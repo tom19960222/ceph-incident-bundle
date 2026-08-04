@@ -11,10 +11,10 @@ bypassed.  And a report is scanned for credential material before it is written:
 if a diagnostic ever carries a key, header or token, the write fails closed
 instead of persisting the leak.
 
-The identity, preflight and status fields are filled today.  Collector coverage,
-the two full-collect runs, the normalized bundle comparison, the stable-state
-diff and the per-node residue checks are declared here so the schema is fixed,
-and stay `not-run` until the dual-run harness (issue #20) fills them.
+An identity preflight fills only the identity, preflight and status fields; the
+dual-run gate (`validation/lab_qualify.py`) fills the rest.  Whatever a run did
+not reach stays `not-run`, so a report says where the gate stopped rather than
+only that it did.
 """
 
 from __future__ import annotations
@@ -24,10 +24,14 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from validation.lab_output import utc_timestamp, write_owner_only
 from validation.lab_preflight import PreflightResult
 from validation.lab_profile import CREDENTIAL_MARKERS, safe_display_path
+
+if TYPE_CHECKING:  # a report describes a qualification; it must not import one
+    from validation.lab_qualify import QualifyResult
 
 
 REPORT_SCHEMA_VERSION = 1
@@ -65,6 +69,26 @@ def code_identity(root: Path) -> CodeIdentity:
     return CodeIdentity(commit=commit, dirty=bool(status))
 
 
+def tracked_modifications(root: Path) -> tuple[str, ...]:
+    """The tracked files that differ from HEAD, ignoring untracked ones.
+
+    The dual-run gate needs this stricter reading than `CodeIdentity.dirty`: a
+    modified tracked file means the recorded commit does not describe the code
+    that ran, while an untracked file — a local-only Lab Profile beside the
+    repository, say — changes nothing about it.
+    """
+
+    status = _git(root, "status", "--porcelain")
+    # Porcelain v1 is `XY <path>`; slicing past the two status columns and
+    # stripping keeps the path whole whether the change is staged, unstaged or
+    # both.
+    return tuple(
+        line[2:].strip()
+        for line in status.splitlines()
+        if line.strip() and not line.startswith("??")
+    )
+
+
 def _git(root: Path, *arguments: str) -> str:
     try:
         completed = subprocess.run(
@@ -97,7 +121,16 @@ class CollectorCoverage:
 
     @property
     def complete(self) -> bool:
-        return all(getattr(self, path) == "collected" for path in COLLECTOR_PATHS)
+        return not self.gaps()
+
+    def gaps(self) -> tuple[str, ...]:
+        """Name each collector path this invocation did not cover, and how."""
+
+        return tuple(
+            f"{path}={getattr(self, path)}"
+            for path in COLLECTOR_PATHS
+            if getattr(self, path) != "collected"
+        )
 
 
 @dataclass(frozen=True)
@@ -297,8 +330,19 @@ class ReportLocation:
     latest_path: Path
 
 
-def write_report(runs_directory: Path, report: LabValidationReport) -> ReportLocation:
-    """Persist one report and point `LATEST` at it, or refuse to write at all."""
+def write_report(
+    runs_directory: Path,
+    report: LabValidationReport,
+    *,
+    directory: Path | None = None,
+) -> ReportLocation:
+    """Persist one report and point `LATEST` at it, or refuse to write at all.
+
+    `directory` names a run directory the caller already reserved.  The dual-run
+    gate needs one before it starts — its bundles and command ledgers live there
+    — and the report has to land in that same directory rather than a second one
+    created at write time.
+    """
 
     _reject_unusable(report)
     document = json.dumps(report.document(), indent=2, sort_keys=True) + "\n"
@@ -311,7 +355,7 @@ def write_report(runs_directory: Path, report: LabValidationReport) -> ReportLoc
             raise ReportRejected(
                 f"refusing to write a report that carries credential material ({marker})"
             )
-    directory = _reserve_run_directory(runs_directory)
+    directory = directory or reserve_run_directory(runs_directory)
     json_path = directory / REPORT_JSON_NAME
     markdown_path = directory / REPORT_MARKDOWN_NAME
     write_owner_only(json_path, document)
@@ -344,6 +388,36 @@ def report_from_preflight(
         ),
         runs=(RunRecord("shell"), RunRecord("python")),
         residue=tuple(ResidueRecord(host) for host in hosts),
+        status=result.status,
+        next_action=result.next_action,
+    )
+
+
+def report_from_qualification(result: "QualifyResult", *, code: CodeIdentity) -> LabValidationReport:
+    """Build a report for one dual-run qualification attempt, pass or fail.
+
+    Unlike the preflight report, every section is filled from what the attempt
+    actually reached: a run that stopped at the coverage gate still records the
+    bundles it produced and leaves the later sections `not-run`, so the report
+    says where the gate stopped rather than only that it did.
+    """
+
+    return LabValidationReport(
+        timestamp=utc_timestamp(),
+        code=code,
+        profile_display=safe_display_path(result.profile_path),
+        profile_hash=result.profile.profile_hash,
+        profile_state=result.profile.state,
+        profile_name=result.profile.name,
+        lab_identity=result.identity,
+        preflight=tuple(
+            {"name": check.name, "ok": check.ok, "detail": check.detail}
+            for check in result.checks
+        ),
+        runs=result.runs,
+        comparison=result.comparison,
+        stable_state=result.stable_state,
+        residue=result.residue,
         status=result.status,
         next_action=result.next_action,
     )
@@ -414,7 +488,7 @@ def _forbidden_marker(text: str) -> str | None:
     return None
 
 
-def _reserve_run_directory(runs_directory: Path) -> Path:
+def reserve_run_directory(runs_directory: Path) -> Path:
     """Create a fresh run directory, without colliding with an existing run."""
 
     runs_directory.mkdir(parents=True, exist_ok=True)
@@ -461,11 +535,7 @@ def _identity_lines(identity: dict[str, object]) -> list[str]:
 
 
 def _coverage_gaps(coverage: CollectorCoverage) -> str:
-    return ", ".join(
-        f"{path}={getattr(coverage, path)}"
-        for path in COLLECTOR_PATHS
-        if getattr(coverage, path) != "collected"
-    )
+    return ", ".join(coverage.gaps())
 
 
 def _table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[str]:

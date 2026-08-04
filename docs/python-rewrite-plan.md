@@ -55,9 +55,9 @@ Gate 的覆蓋邊界要誠實記錄：fake `ssh` 站在 SSH 邊界，因此 diff
 - #17 已完成 Content Safety 與完整 Structural Verification 的 Python candidate；Content Safety 尚未移除，任何移除仍須在 Python cutover 完成後另立變更。
 - #23 已修正 shell Node Evidence Archive 的 pre-extraction acceptance boundary；shell reference 仍須通過 #19／#20 的其餘 qualification gates。
 - #17 的 malicious final Incident Bundle 黑箱案例已收斂 Python Verify 對 link、special member、member collision、hierarchy、truncation 與 tar end markers 的接受邊界；#23 只處理 shell 收到 Node Evidence Archive 後、解壓前的窄幅安全邊界。
-- **#18 的 offline observable-contract equivalence gate 已宣告通過（2026-07-30）。** 138 個 inventory 情境全部有狀態（128 ported、10 shell 實作細節）、13 個 differential scenarios 在同一個 fake world 雙跑、normalizer 的每條忽略規則都在 `docs/differential-normalizer.md` 有據可查，`make validate` 離線可重複全綠。宣告的範圍就是它證明的範圍：**工作機端**的 observable contract；node collector 自身的 evidence surface 由 ledger 的 N 系列黑箱測試（斷言，不是雙跑比對）擔保。ledger 的機械檢查證明「指向的測試存在且通過」，逐列的斷言深度稽核另見 #42；`--skip-logs` marker 的 `exit_code` 是唯一未結裁定，不在被比較的差異面內。#36 已移植 node evidence surface，ledger 不再有 blocked 情境。#19 已建立 Lab Profile、status/discovery/activation workflow 與 strict identity preflight；#20 的 dual-run full-collect gate 尚未完成，因此 real-lab qualification 仍未通過，仍不可宣稱整體 qualification-ready。
+- **#18 的 offline observable-contract equivalence gate 已宣告通過（2026-07-30）。** 138 個 inventory 情境全部有狀態（128 ported、10 shell 實作細節）、13 個 differential scenarios 在同一個 fake world 雙跑、normalizer 的每條忽略規則都在 `docs/differential-normalizer.md` 有據可查，`make validate` 離線可重複全綠。宣告的範圍就是它證明的範圍：**工作機端**的 observable contract；node collector 自身的 evidence surface 由 ledger 的 N 系列黑箱測試（斷言，不是雙跑比對）擔保。ledger 的機械檢查證明「指向的測試存在且通過」，逐列的斷言深度稽核另見 #42；`--skip-logs` marker 的 `exit_code` 是唯一未結裁定，不在被比較的差異面內。#36 已移植 node evidence surface，ledger 不再有 blocked 情境。#19 已建立 Lab Profile、status/discovery/activation workflow 與 strict identity preflight；#20 已建立 dual-run full-collect gate（`make validate-lab`）。Harness 存在不等於 qualification 已完成——它尚未在真實 lab 執行過，因此 real-lab qualification 仍未通過，仍不可宣稱整體 qualification-ready。
 
-本階段的 Python 3.11 baseline 由 Makefile 的 offline gate 在任何測試前 fail fast；#11 已完成 node runtime negotiation 與 graceful-skip seam，#12 已完成 `/var/log` forensic evidence，#13、#14 與 #15 已分別完成 direct Ceph、Rook 與 Prometheus cluster evidence，#16 已完成多 node、source/runner selection 與 multi-source orchestration，#17 已完成 Content Safety 與完整 Structural Verification，#18 已完成 offline differential gate 與逐項 ledger，#36 已完成 node evidence surface。下一個 blocker 是 #20 的 real-lab dual-run gate；在它通過前，本 candidate 仍不可宣稱 qualification-ready。
+本階段的 Python 3.11 baseline 由 Makefile 的 offline gate 在任何測試前 fail fast；#11 已完成 node runtime negotiation 與 graceful-skip seam，#12 已完成 `/var/log` forensic evidence，#13、#14 與 #15 已分別完成 direct Ceph、Rook 與 Prometheus cluster evidence，#16 已完成多 node、source/runner selection 與 multi-source orchestration，#17 已完成 Content Safety 與完整 Structural Verification，#18 已完成 offline differential gate 與逐項 ledger，#36 已完成 node evidence surface，#20 已完成 real-lab dual-run gate 的 harness。下一個 blocker 是 #21：在真實 lab 執行 `make validate-lab` 並取得 `status: pass`；在那之前，本 candidate 仍不可宣稱 qualification-ready。
 
 ## Locked Design
 
@@ -173,7 +173,7 @@ shell 的 `node_copy_file` 複製 evidence 時不寫 manifest entry，`lib/colle
 - Agent 或操作人員檢查 candidate 後明確啟用，再執行 strict preflight 與 full validation。
 - Repository 不硬編碼 endpoints、credentials 或即時 cluster identity。
 
-> Current status: #19 已實作 `lab-status`、`lab-profile-discover`、`lab-profile-activate` 與 `lab-preflight`，並固定 Lab Validation Report schema；程式在 `validation/` package，不屬於三個 production modules。`validate-lab` 仍由 #20 負責，尚未實作，因此 `lab-preflight` 通過只證明 lab identity，不是 qualification evidence。
+> Current status: #19 已實作 `lab-status`、`lab-profile-discover`、`lab-profile-activate` 與 `lab-preflight`，並固定 Lab Validation Report schema；#20 已實作 `validate-lab` 的 dual-run harness。程式都在 `validation/` package，不屬於三個 production modules。`lab-preflight` 通過只證明 lab identity；只有 `validate-lab` 寫出 `status: pass` 的 report 才是 qualification evidence，而那尚未發生（#21）。
 
 ## Out of Scope
 

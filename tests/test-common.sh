@@ -192,6 +192,110 @@ EOF
   [[ "$(sed -n '4p' "$source_file")" == "just a normal sentence with words" ]] || fail "normal line over-redacted"
 }
 
+test_redact_file_keeps_unterminated_final_line_once() {
+  local source_file="$tmpdir/no-trailing-newline.txt"
+  local redaction_log="$tmpdir/no-trailing-newline.log"
+
+  printf 'first\nlast line without a newline' >"$source_file"
+
+  redact_file "$source_file" "$redaction_log"
+
+  local lines
+  lines="$(wc -l <"$source_file" | tr -d '[:space:]')"
+  [[ "$lines" == "2" ]] || fail "unterminated final line produced $lines line(s), want 2"
+  [[ "$(sed -n '2p' "$source_file")" == "last line without a newline" ]] ||
+    fail "unterminated final line was not written through verbatim"
+}
+
+# The tail-line fallback (`|| [[ -n "$line" ]]`) assumes a failing `read` clears
+# `line`. When it does not, the fallback stays true and the loop rewrites the
+# same line until the disk fills — see issue #49, where one 3.25 GB source
+# produced 11.75 GB of output with a single line repeated 75,056,647 times.
+# A stream that stops early must fail closed instead, leaving the original
+# artifact alone: silently dropping evidence is worse than refusing to redact.
+test_redact_file_fails_closed_on_short_read() {
+  local source_file="$tmpdir/short-read.txt"
+  local redaction_log="$tmpdir/short-read.log"
+  local fakebin="$tmpdir/short-read-bin"
+
+  mkdir -p "$fakebin"
+  cat >"$fakebin/cat" <<'EOF'
+#!/usr/bin/env bash
+# Stop after one line, the way a source that loses forward progress does.
+shift
+head -n 1 -- "$1"
+EOF
+  chmod +x "$fakebin/cat"
+
+  printf 'one\ntwo\nthree\n' >"$source_file"
+
+  local rc=0 saved_path=$PATH
+  PATH="$fakebin:$PATH"
+  set +e
+  redact_file "$source_file" "$redaction_log"
+  rc=$?
+  set -e
+  PATH=$saved_path
+
+  [[ "$rc" != "0" ]] || fail "redact_file accepted a short read"
+  [[ "$(cat "$source_file")" == "$(printf 'one\ntwo\nthree')" ]] ||
+    fail "short read replaced the original artifact"
+  if compgen -G "$tmpdir/.short-read.txt.*" >/dev/null; then
+    fail "short read left a redaction temp file behind"
+  fi
+  grep -q "NOT redacted" "$redaction_log" ||
+    fail "redaction log does not record the incomplete read"
+}
+
+# A compressed artifact is redacted through a temp plaintext file that is then
+# removed, so naming that temp in the log would point an operator at a path that
+# no longer exists. The line has to name the bundle artifact left unredacted.
+test_compressed_short_read_names_the_original_artifact() {
+  local plain="$tmpdir/rotated-short.log"
+  local gz="$tmpdir/rotated-short.log.gz"
+  local redaction_log="$tmpdir/gz-short.log"
+  local fakebin="$tmpdir/gz-short-bin"
+
+  mkdir -p "$fakebin"
+  cat >"$fakebin/cat" <<'EOF'
+#!/usr/bin/env bash
+shift
+head -n 1 -- "$1"
+EOF
+  chmod +x "$fakebin/cat"
+
+  printf 'one\ntwo\nthree\n' >"$plain"
+  gzip -c "$plain" >"$gz"
+  rm -f -- "$plain"
+
+  local rc=0 saved_path=$PATH
+  PATH="$fakebin:$PATH"
+  set +e
+  redact_gz_file "$gz" "$redaction_log"
+  rc=$?
+  set -e
+  PATH=$saved_path
+
+  [[ "$rc" != "0" ]] || fail "redact_gz_file accepted a short read"
+  grep -q "rotated-short.log.gz: read " "$redaction_log" ||
+    fail "redaction log does not name the original artifact: $(cat "$redaction_log")"
+  [[ "$(gzip -dc "$gz")" == "$(printf 'one\ntwo\nthree')" ]] ||
+    fail "short read modified the compressed original"
+}
+
+test_redact_file_preserves_errexit_state() {
+  local source_file="$tmpdir/errexit.txt"
+  local redaction_log="$tmpdir/errexit.log"
+  printf 'token: leak\nplain\n' >"$source_file"
+
+  set +e
+  redact_file "$source_file" "$redaction_log"
+  local status="$-"
+  set -e
+
+  [[ "$status" != *e* ]] || fail "redact_file re-enabled errexit for its caller"
+}
+
 test_redact_file_preserves_mode() {
   local source_file="$tmpdir/mode.txt"
   local redaction_log="$tmpdir/mode.log"
@@ -389,6 +493,28 @@ if entry["exit_code"] != 0:
 PY
 }
 
+# A captured command must not be able to read the caller's stdin. Several
+# collectors drive `run_capture` from a `while IFS= read -r … done <<<"$list"`
+# loop, and the captured command is usually `ssh`, which reads stdin to EOF: it
+# would swallow the rest of the list and the loop would stop after one or two
+# items. The crash-info loop lost seven of nine ids that way (#52).
+test_run_capture_isolates_the_callers_stdin() {
+  local manifest="$tmpdir/run-manifest-stdin.jsonl"
+  local artifact="$tmpdir/run-artifact-stdin.txt"
+  local seen=''
+  local item
+
+  while IFS= read -r item; do
+    seen="${seen:+$seen,}$item"
+    run_capture "$manifest" "host-a" "collector-a" "$artifact-$item" -- cat
+  done <<<"$(printf 'one\ntwo\nthree\n')"
+
+  [[ "$seen" == "one,two,three" ]] ||
+    fail "captured command drained the loop's stdin, saw '$seen'"
+  [[ "$(sed -n '5p' "$artifact-one")" == "" ]] ||
+    fail "captured command read the loop's stdin as its own: $(sed -n '5,$p' "$artifact-one")"
+}
+
 test_run_capture_non_zero_writes_error_log_and_returns_code() {
   local manifest="$tmpdir/run-manifest-fail.jsonl"
   local artifact="$tmpdir/run-artifact-fail.txt"
@@ -490,6 +616,10 @@ test_redact_file
 test_redact_file_private_key_variants
 test_redact_file_multiline_pem_body
 test_redact_file_ceph_key_material
+test_redact_file_keeps_unterminated_final_line_once
+test_redact_file_fails_closed_on_short_read
+test_redact_file_preserves_errexit_state
+test_compressed_short_read_names_the_original_artifact
 test_redact_file_preserves_mode
 test_redact_gz_file
 test_redact_supported_compressed_files
@@ -500,6 +630,7 @@ test_post_redaction_cap_discards_payload
 test_progress_respects_quiet
 test_progress_goes_to_stderr
 test_run_capture_success
+test_run_capture_isolates_the_callers_stdin
 test_run_capture_non_zero_writes_error_log_and_returns_code
 test_run_capture_missing_double_dash_is_fatal
 test_run_capture_timeout_branch

@@ -12,6 +12,7 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import re
 import tarfile
 
 
@@ -19,10 +20,14 @@ NODE_TMP_ROOT = "/tmp/ceph-incident-node.differential/out"
 
 # Redaction bait. Each line is a documented secret shape from the content-safety
 # contract, so a redact/no-redact pair of runs is decided by the collector's
-# policy rather than by the fixture withholding material.
+# policy rather than by the fixture withholding material.  The `key =` values
+# are real `ceph auth` key length (38 base64 characters plus `==`), which is
+# over the content-safety scanner's 20-character threshold: a redacting run must
+# neutralize them, and a `--no-redact` run must fail closed at its own verify
+# phase instead of publishing a bundle (see `mixed-full-collection-unredacted`).
 PLAIN_SECRET_PAYLOAD = (
     b"mon.a evidence line\n"
-    b"key = AQBnodemergedsecret==\n"
+    b"key = AQBnodemerged0123456789012345678901234==\n"
     b"password = merged-must-redact\n"
 )
 COMPRESSED_SECRET_PAYLOAD = (
@@ -33,7 +38,14 @@ OPAQUE_SECRET_PAYLOAD = b"secret = opaque-must-stay-byte-for-byte\n"
 NODE_CONFIG_PAYLOAD = (
     b"[global]\n"
     b"mon_host = 10.0.0.1\n"
-    b"key = AQBnodeconfigsecret==\n"
+    b"key = AQBnodeconfig0123456789012345678901234==\n"
+)
+
+# Executable form of the length claim above, so a re-counted literal cannot
+# quietly fall back under the content-safety scanner's 20-character threshold.
+assert all(
+    re.search(rb"(?m)^key = [A-Za-z0-9+/]{38}==$", payload)
+    for payload in (PLAIN_SECRET_PAYLOAD, NODE_CONFIG_PAYLOAD)
 )
 
 

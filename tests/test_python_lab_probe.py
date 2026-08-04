@@ -168,7 +168,7 @@ class RookIdentityProbeTests(ProbeTestCase):
             ("empty", "no CephCluster in namespace rook-ceph"),
             ("nostatus", "no CephCluster reports status.ceph.fsid"),
             ("two", "different CephCluster FSIDs"),
-            ("fail", "kubectl get: exit 1"),
+            ("fail", "kubectl get cephclusters.ceph.rook.io: exit 1"),
             ("badjson", "unparseable CephCluster list"),
         ):
             with self.subTest(mode=mode):

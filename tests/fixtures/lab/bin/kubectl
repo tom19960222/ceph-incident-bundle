@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Whitelist fake kubectl for the fake lab's Rook identity probe.
+"""Whitelist fake kubectl for the fake lab's Rook identity and stable-state reads.
 
-Exactly one read-only invocation is answered, matched in full:
-``--kubeconfig PATH -n NAMESPACE get cephclusters.ceph.rook.io -o json``.  A
-mutating verb, ``exec`` or an extra token exits 99 before any knob applies, so a
-probe that grows a side-effecting command surface fails the suite immediately.
+Only one argv shape is answered, matched in full:
+``--kubeconfig PATH -n NAMESPACE get RESOURCE -o json``, and only for the four
+read-only resources the workflow needs.  A mutating verb, ``exec`` or an extra
+token exits 99 before any knob applies, so a probe that grows a side-effecting
+command surface fails the suite immediately.
 
 Knobs (env):
-  FAKE_LAB_KUBECTL_LOG  append each invocation's argv here as one JSON line
-  FAKE_LAB_ROOK_FSID    the FSID the CephCluster reports
-  FAKE_LAB_ROOK_MODE    ok | empty | nostatus | two | fail | badjson
+  FAKE_LAB_KUBECTL_LOG    append each invocation's argv here as one JSON line
+  FAKE_LAB_ROOK_FSID      the FSID the CephCluster reports
+  FAKE_LAB_ROOK_MODE      ok | empty | nostatus | two | fail | badjson
+  FAKE_LAB_WORKLOAD_FAIL  space-separated resources whose get fails
+  FAKE_LAB_WORKLOADS      JSON {resource: items} overriding the workload lists
 """
 
 from __future__ import annotations
@@ -43,22 +46,77 @@ if arguments[0] != "--kubeconfig" or not arguments[1]:
     reject("kubeconfig option")
 if arguments[2] != "-n" or NAMESPACE.fullmatch(arguments[3]) is None:
     reject("namespace option")
-if arguments[4:] != ["get", "cephclusters.ceph.rook.io", "-o", "json"]:
+if arguments[4] != "get" or arguments[6:] != ["-o", "json"]:
     reject("read-only get")
+resource = arguments[5]
+if resource not in ("cephclusters.ceph.rook.io", "deployments", "statefulsets", "daemonsets"):
+    reject("resource is not whitelisted")
 if not os.path.isfile(arguments[1]):
     sys.stderr.write(f"error: stat {arguments[1]}: no such file or directory\n")
     raise SystemExit(1)
 
 fsid = os.environ.get("FAKE_LAB_ROOK_FSID", "3f2b1c8e-0000-4a1d-8b7e-000000000002")
 mode = os.environ.get("FAKE_LAB_ROOK_MODE", "ok")
+namespace = arguments[3]
+
+# Workload objects carry both desired state (`spec`) and state the cluster moves
+# on its own (`status`, `resourceVersion`, `generation`).  The fixture serves
+# both so the snapshot projection has something volatile to drop.
+DEFAULT_WORKLOADS = {
+    "deployments": [
+        {
+            "kind": "Deployment",
+            "metadata": {
+                "name": "rook-ceph-operator",
+                "namespace": namespace,
+                "resourceVersion": "180231",
+                "generation": 4,
+            },
+            "spec": {
+                "replicas": 1,
+                "template": {
+                    "spec": {"containers": [{"image": "rook/ceph:v1.14.0"}]}
+                },
+            },
+            "status": {"readyReplicas": 1, "observedGeneration": 4},
+        }
+    ],
+    "statefulsets": [],
+    "daemonsets": [
+        {
+            "kind": "DaemonSet",
+            "metadata": {"name": "csi-rbdplugin", "namespace": namespace},
+            "spec": {"template": {"spec": {"containers": [{"image": "csi:v3.11.0"}]}}},
+            "status": {"numberReady": 3},
+        }
+    ],
+}
 
 
 def cluster(name: str, cluster_fsid: str | None) -> dict[str, object]:
     status: dict[str, object] = {"phase": "Ready"}
     if cluster_fsid is not None:
         status["ceph"] = {"fsid": cluster_fsid, "health": "HEALTH_OK"}
-    return {"kind": "CephCluster", "metadata": {"name": name}, "status": status}
+    return {
+        "kind": "CephCluster",
+        "metadata": {"name": name, "namespace": namespace, "resourceVersion": "9912"},
+        "spec": {"cephVersion": {"image": "quay.io/ceph/ceph:v18"}, "mon": {"count": 3}},
+        "status": status,
+    }
 
+
+if resource != "cephclusters.ceph.rook.io":
+    if resource in os.environ.get("FAKE_LAB_WORKLOAD_FAIL", "").split():
+        sys.stderr.write("error: the server could not find the requested resource\n")
+        raise SystemExit(1)
+    workloads = {
+        **DEFAULT_WORKLOADS,
+        **json.loads(os.environ.get("FAKE_LAB_WORKLOADS", "{}")),
+    }
+    sys.stdout.write(
+        json.dumps({"apiVersion": "v1", "kind": "List", "items": workloads[resource]}) + "\n"
+    )
+    raise SystemExit(0)
 
 if mode == "fail":
     sys.stderr.write("error: the server could not find the requested resource\n")

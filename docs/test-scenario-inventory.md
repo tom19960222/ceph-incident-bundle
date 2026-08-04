@@ -48,7 +48,7 @@
 | R4 | `verify-bundle.sh` 無參數 → exit 1 且輸出含 `Usage:` | 同上 | 51–55 | 【功能等價-必移植】 |
 | R5 | `verify-bundle.sh` 指到不存在路徑 → 非 0，輸出說明失敗（`VERIFY FAIL:`/`Usage:`/`error` 擇一） | 同上 | 57–61 | 【功能等價-必移植】 |
 | R6 | `collect.sh` 帶不存在的 inventory → 非 0，輸出說明（`missing inventory` 等） | 同上 | 63–67 | 【功能等價-必移植】 |
-| R7 | 依序執行 8 個子測試檔並要求 exit 0 | 無 | 69–109 | 【實作細節-不移植】測試 harness 本身，由 unittest discovery 取代 |
+| R7 | 依序執行 8 個子測試檔並要求 exit 0 | 無 | 69–109 | 【實作細節-不移植】測試 harness 本身，由 `tests/run-python-tests.sh` 取代 |
 
 ## 2. `tests/test-common.sh`（common.sh / bundle.sh helpers）
 

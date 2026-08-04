@@ -106,6 +106,8 @@ class DirectCephFixture:
         seed: str | None = SEED,
         inventory_text: str | None = None,
         extra_arguments: tuple[str, ...] = (),
+        timeout: str | None = "5",
+        host_key_arguments: tuple[str, ...] = ("--no-trust-ssh-host-key",),
     ) -> subprocess.CompletedProcess[str]:
         inventory = root / "inventory.env"
         inventory.write_text(
@@ -126,13 +128,12 @@ class DirectCephFixture:
             str(ssh_key),
             "--out",
             str(root / "results"),
-            "--timeout",
-            "5",
+            *(("--timeout", timeout) if timeout is not None else ()),
             "--node-timeout",
             "20",
             "--mode",
             "cephadm",
-            "--no-trust-ssh-host-key",
+            *host_key_arguments,
             *extra_arguments,
         ]
         if seed is not None:
@@ -224,6 +225,38 @@ class CollectDirectCephCliTests(DirectCephFixture, unittest.TestCase):
             self.assertIn("# timeout: 5s\n", status)
             self.assertIn('"health":"HEALTH_OK"', status)
             self.assertIn("cluster is healthy", contents["cluster/ceph/text/status.txt"])
+
+            # O11: an explicit cephadm mode collects the Ceph layer only, and
+            # never reaches for Kubernetes on the way.
+            self.assertFalse([name for name in contents if name.startswith("cluster/rook/")])
+            self.assertNotIn("kubectl", ledger.read_text(encoding="utf-8"))
+
+    def test_the_default_timeout_is_the_one_recorded_in_every_artifact(self) -> None:
+        """C21: the header states the bound, and with no flag that bound is 20s."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, ledger = self.make_fake_environment(root)
+
+            result = self.run_collect(root, environment, timeout=None)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            contents = self.extract(self.bundle_of(result))
+            for artifact in EXPECTED_JSON_ARTIFACTS:
+                with self.subTest(artifact=artifact):
+                    self.assertIn(
+                        "# timeout: 20s\n", contents[f"cluster/ceph/json/{artifact}"]
+                    )
+            invocations = [
+                json.loads(line)
+                for line in ledger.read_text(encoding="utf-8").splitlines()
+            ]
+            ceph_reads = [
+                arguments for arguments in invocations if "ceph" in arguments
+            ]
+            self.assertTrue(ceph_reads)
+            for arguments in ceph_reads:
+                self.assertIn("ConnectTimeout=20", arguments)
 
     def test_direct_ceph_runs_plain_ceph_argv_over_ssh(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -384,35 +417,47 @@ class CollectDirectCephCliTests(DirectCephFixture, unittest.TestCase):
 
 class DirectCephFailureSemanticsTests(DirectCephFixture, unittest.TestCase):
     def test_failed_required_command_is_partial_and_keeps_other_evidence(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            environment, ledger = self.make_fake_environment(
-                root, FAKE_SSH_FAIL_ON="osd perf"
-            )
+        """CA2, C19: the command's own exit code is passed through verbatim.
 
-            result = self.run_collect(root, environment)
+        Both codes the shell suite uses are run — C19's 7 and the cephadm
+        fixture's 17 — so "records what the command returned" is asserted
+        rather than "records the one number the fixture happens to use".
+        """
 
-            self.assertEqual(result.returncode, 2, result.stderr)
-            bundle = self.bundle_of(result)
-            contents = self.extract(bundle)
-            self.assertIn(
-                "simulated failure for osd perf",
-                contents["cluster/ceph/json/osd-perf.json"],
-            )
-            for artifact in EXPECTED_JSON_ARTIFACTS:
-                self.assertIn(f"cluster/ceph/json/{artifact}", contents)
-            entries = {
-                Path(str(entry["artifact"])).name: entry
-                for entry in self.manifest_entries(contents)
-            }
-            self.assertEqual(entries["osd-perf.json"]["exit_code"], 17)
-            self.assertEqual(entries["status.json"]["exit_code"], 0)
-            self.assertIn("exit=17", contents["errors.log"])
-            self.assertIn("osd-perf.json", contents["errors.log"])
-            self.assertIn("cluster collection exited 2", contents["errors.log"])
-            self.assertIn("cluster_status: 2", contents["summary.txt"])
-            self.assertIn("final_status: 2", contents["summary.txt"])
-            self.assert_bundle_verifies(bundle)
+        for remote_exit_code in (7, 17):
+            with self.subTest(remote_exit_code=remote_exit_code), tempfile.TemporaryDirectory() as temporary_directory:
+                root = Path(temporary_directory)
+                environment, ledger = self.make_fake_environment(
+                    root,
+                    FAKE_SSH_FAIL_ON="osd perf",
+                    FAKE_SSH_FAIL_EXIT=str(remote_exit_code),
+                )
+
+                result = self.run_collect(root, environment)
+
+                self.assertEqual(result.returncode, 2, result.stderr)
+                bundle = self.bundle_of(result)
+                contents = self.extract(bundle)
+                self.assertIn(
+                    "simulated failure for osd perf",
+                    contents["cluster/ceph/json/osd-perf.json"],
+                )
+                for artifact in EXPECTED_JSON_ARTIFACTS:
+                    self.assertIn(f"cluster/ceph/json/{artifact}", contents)
+                entries = {
+                    Path(str(entry["artifact"])).name: entry
+                    for entry in self.manifest_entries(contents)
+                }
+                self.assertEqual(
+                    entries["osd-perf.json"]["exit_code"], remote_exit_code
+                )
+                self.assertEqual(entries["status.json"]["exit_code"], 0)
+                self.assertIn(f"exit={remote_exit_code}", contents["errors.log"])
+                self.assertIn("osd-perf.json", contents["errors.log"])
+                self.assertIn("cluster collection exited 2", contents["errors.log"])
+                self.assertIn("cluster_status: 2", contents["summary.txt"])
+                self.assertIn("final_status: 2", contents["summary.txt"])
+                self.assert_bundle_verifies(bundle)
 
     def test_timed_out_command_is_truncated_and_writes_ssh_debug(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -488,6 +533,7 @@ class DirectCephFailureSemanticsTests(DirectCephFixture, unittest.TestCase):
             )
             debug_log = contents["ssh-debug/cluster-ceph-ceph_10.0.0.1.log"]
             self.assertIn("# target: ceph@10.0.0.1", debug_log)
+            self.assertIn("# label: cluster-ceph", debug_log)
             self.assertIn("debug1:", debug_log)
             self.assertIn("# exit_code: 255", debug_log)
             self.assertIn("exit=255", contents["errors.log"])
@@ -530,6 +576,31 @@ class DirectCephSeedSelectionTests(DirectCephFixture, unittest.TestCase):
             self.assertIn("ceph_source=ceph@10.0.0.1\n", contents["environment.txt"])
             self.assertIn("cluster/ceph/json/status.json", contents)
 
+    def test_a_failed_capability_probe_names_the_target_and_keeps_its_diagnostic(
+        self,
+    ) -> None:
+        """O20: an unprobeable node is recorded by name, with its ssh debug log."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, ledger = self.make_fake_environment(
+                root, FAKE_PROBE_FAIL_TARGETS=SEED
+            )
+
+            result = self.run_collect(root, environment, seed=None)
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            contents = self.extract(self.bundle_of(result))
+            self.assertIn(
+                f"capability probe failed for {SEED}", contents["errors.log"]
+            )
+            debug_log = contents["ssh-debug/capability-probe-ceph_10.0.0.1.log"]
+            self.assertIn(f"# target: {SEED}", debug_log)
+            self.assertIn("# label: capability-probe", debug_log)
+            self.assertIn("debug1:", debug_log)
+            self.assertIn("SKIPPED", contents["cluster/ceph/SKIPPED.txt"])
+            self.assertNotIn("cluster/ceph/json/status.json", contents)
+
     def test_collect_without_a_seed_auto_selects_the_first_capable_node(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -545,6 +616,48 @@ class DirectCephSeedSelectionTests(DirectCephFixture, unittest.TestCase):
             )
             self.assertIn("ceph_runner=direct\n", contents["environment.txt"])
             self.assertTrue(self.remote_commands(ledger))
+
+    def test_two_capable_nodes_still_collect_the_cluster_layer_once(self) -> None:
+        """O13: the Ceph layer comes from the first capable node, not from both."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, ledger = self.make_fake_environment(root)
+
+            result = self.run_collect(
+                root,
+                environment,
+                seed=None,
+                inventory_text=(
+                    'SSH_USER="ceph"\n'
+                    'HOSTS=(\n  "monitor01=10.0.0.1"\n  "storage01=10.0.0.2"\n)\n'
+                ),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            contents = self.extract(self.bundle_of(result))
+            self.assertIn(f"ceph_source={SEED}\n", contents["environment.txt"])
+            # Both nodes are still collected as nodes…
+            for alias in ("monitor01", "storage01"):
+                self.assertIn(f"nodes/{alias}/system/hostname.txt", contents)
+            # …but every Ceph read went to the first capable node only, so the
+            # cluster layer was not collected twice.
+            targets = set()
+            for line in ledger.read_text(encoding="utf-8").splitlines():
+                arguments = json.loads(line)
+                if "ceph" in arguments and "status" in arguments:
+                    targets.add(arguments[arguments.index("ceph") - 1])
+            self.assertEqual(targets, {SEED})
+            self.assertEqual(
+                len(
+                    [
+                        command
+                        for command in self.remote_commands(ledger)
+                        if command[1:] == ["status", "--format", "json-pretty"]
+                    ]
+                ),
+                1,
+            )
 
 
 class DirectCephRunnerSeamTests(DirectCephFixture, unittest.TestCase):
