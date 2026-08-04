@@ -46,11 +46,22 @@ if [[ "${1-}" == "--run-one" && "${RUN_PYTHON_TESTS_SHARD:-}" == "1" ]]; then
   module="${module_file%.py}"
   cd "$ROOT"
   rc=0
+  # `-p` is an fnmatch pattern, so a filename containing `*`, `?` or `[` could
+  # match nothing — and on Python 3.11, the gate's floor, "Ran 0 tests" exits 0.
+  # The list feeding this entry point comes from `find`, so a plain filename
+  # always matches itself; refuse the metacharacters instead of risking a shard
+  # that silently tests nothing.
+  [[ "$module_file" != *[\*\?\[]* ]] ||
+    fail "test module filename contains fnmatch metacharacters: $module_file"
   "$PYTHON" -m unittest discover -s "$ROOT/tests" -p "$module_file" -v \
     >"$logdir/$module.log" 2>&1 || rc=$?
   printf '%s\n' "$rc" >"$logdir/$module.status"
   exit "$rc"
 fi
+
+# Public entry point from here on.  An inherited sentinel is dropped so only the
+# xargs line below can open the shard entry for its own children.
+unset RUN_PYTHON_TESTS_SHARD
 
 # Physical CPUs only: a cgroup CPU quota (a limited CI container) is not
 # consulted, so an over-subscribed environment should pass TEST_JOBS explicitly.
@@ -88,9 +99,12 @@ done < <(find "$ROOT/tests" -maxdepth 1 -name "$PATTERN" | sort)
 
 [[ ${#module_files[@]} -gt 0 ]] || fail "no test modules matched $PATTERN"
 
-# The serial path discovers recursively; the shard list above deliberately does
-# not.  Refuse a layout where the two would run different suites, instead of
-# letting the default path silently drop a nested module.
+# The shard list above deliberately stops at the top level, while serial
+# discovery also descends into package directories (`tests/differential/` has an
+# `__init__.py`).  A matching file anywhere deeper is refused outright: either
+# the two paths would run different suites, or the file sits in a non-package
+# directory where neither path would run it — both are layouts to reject
+# loudly, not to paper over.
 stray="$(find "$ROOT/tests" -mindepth 2 -name "$PATTERN" | head -n 1)"
 [[ -z "$stray" ]] || fail "a test module below tests/ top level would never be sharded: $stray"
 
