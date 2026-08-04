@@ -5,6 +5,15 @@ log_file=${FAKE_SSH_LOG:-}
 fail_on=${FAKE_SSH_FAIL_ON:-}
 crash_ls_broken=${FAKE_SSH_CRASH_LS_BROKEN:-0}
 
+# Real `ssh` reads stdin to EOF whether or not the remote command wants it, so a
+# fake that leaves stdin alone cannot see a caller whose loop is being eaten out
+# from under it — the crash-info loop passed here and lost seven of nine ids in a
+# real lab (#52). The TTY guard is for the fake only: an interactive test run
+# would otherwise block on the terminal.
+if [[ ! -t 0 ]]; then
+  cat >/dev/null 2>&1 || true
+fi
+
 if [[ -n "$log_file" ]]; then
   printf '%s\n' "$*" >>"$log_file"
 fi

@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from validation.lab_bundle import (
+    BLANKED_LINE,
     BundleUnreadable,
     contract_of,
     coverage_of,
@@ -389,6 +390,320 @@ class ContractTests(BundleTestCase):
         )
         candidate = contract_of(read_bundle(self.write(other, "logs.tar.gz")))
         self.assertEqual(describe_differences(reference, candidate), ())
+
+
+WORKSPACE = "/tmp/ceph-incident-node.Ab3xY9"
+
+
+def node_entry(
+    host: str, artifact: str, command: str, exit_code: int = 0
+) -> dict[str, object]:
+    """One node manifest entry, with the workspace-absolute artifact both write."""
+
+    return {
+        "host": host,
+        "collector": "collect-node",
+        "artifact": f"{WORKSPACE}/{artifact}",
+        "command": command,
+        "exit_code": exit_code,
+        "started": "2026-07-31T01:00:00Z",
+        "ended": "2026-07-31T01:00:01Z",
+    }
+
+
+class NodeManifestTests(BundleTestCase):
+    """ADR 0010 makes the node manifest's *coverage* deliberately divergent.
+
+    The Python node manifest indexes every evidence in the archive; the shell
+    reference only records the commands it ran.  A gate that compared the two
+    entry-for-entry would overturn an adjudication the project already made, so
+    it compares the surface both implementations claim — and nothing wider.
+    """
+
+    HOST = "monitor01"
+
+    def bundle(self, manifest_lines: list[object], name: str):
+        """One bundle whose node manifest holds `manifest_lines`.
+
+        A line is either an entry dict, serialised as JSON, or an already-final
+        string — the way `BLANKED_LINE` reaches a real manifest: content safety
+        rewrites the serialised line itself, leaving nothing to parse.
+        """
+
+        members = bundle_members(hosts=(self.HOST,))
+        members[f"nodes/{self.HOST}/cephadm/var-lib-ceph-listing.txt"] = capture(
+            self.HOST, "collect-node", "2026-07-31T01:00:00Z", "d /var/lib/ceph\n"
+        )
+        members[f"nodes/{self.HOST}/time/systemd-timesyncd-config/timesyncd.conf"] = (
+            b"[Time]\nNTP=10.0.0.1\n"
+        )
+        members[f"nodes/{self.HOST}/resources/iostat.txt"] = (
+            b"SKIPPED: command not found: iostat\n"
+        )
+        # Both implementations run and record this one, so it is evidence with a
+        # capture header — not part of the generated tree around it.
+        members[f"nodes/{self.HOST}/logs/var-log/journal-all-since.txt"] = capture(
+            self.HOST, "collect-node", "2026-07-31T01:00:00Z", "-- Journal begins --\n"
+        )
+        members[f"nodes/{self.HOST}/logs/var-log/INDEX.tsv"] = b"path\tbytes\n"
+        members[f"nodes/{self.HOST}/manifest.jsonl"] = "".join(
+            (line if isinstance(line, str) else json.dumps(line)) + "\n"
+            for line in manifest_lines
+        ).encode("utf-8")
+        return contract_of(read_bundle(self.write(members, name)))
+
+    def shared(self) -> list[object]:
+        """The entries the reference records, which the candidate must match."""
+
+        return [
+            node_entry(self.HOST, "system/hostname.txt", "hostname"),
+            node_entry(self.HOST, "kernel/dmesg.txt", "sudo -n dmesg -T"),
+            node_entry(
+                self.HOST,
+                "logs/var-log/journal-all-since.txt",
+                "sudo -n journalctl --since -24h --no-pager",
+            ),
+        ]
+
+    def reference(self, extra: list[object] | None = None):
+        # The reference's own listing entry does not survive redaction: its real
+        # `find` expression names `*keyring*`, so content safety blanks the line.
+        return self.bundle(
+            self.shared() + [BLANKED_LINE] + (extra or []), "reference.tar.gz"
+        )
+
+    def candidate(self, extra: list[object] | None = None):
+        return self.bundle(
+            self.shared()
+            + [
+                node_entry(
+                    self.HOST,
+                    "cephadm/var-lib-ceph-listing.txt",
+                    "collect-node list /var/lib/ceph",
+                )
+            ]
+            + (extra or []),
+            "candidate.tar.gz",
+        )
+
+    def test_the_index_only_entries_adr_0010_adds_are_not_a_difference(self) -> None:
+        reference = self.reference()
+        candidate = self.candidate(
+            [
+                node_entry(
+                    self.HOST,
+                    "time/systemd-timesyncd-config/timesyncd.conf",
+                    "collect-node copy /etc/systemd/timesyncd.conf",
+                ),
+                node_entry(
+                    self.HOST,
+                    "logs/var-log/merged/syslog.merged",
+                    "collect-var-log /var/log",
+                ),
+                node_entry(
+                    self.HOST, "logs/var-log/INDEX.tsv", "collect-var-log /var/log"
+                ),
+                node_entry(self.HOST, "resources/iostat.txt", "iostat -xz 1 3", 127),
+            ]
+        )
+        self.assertEqual(describe_differences(reference, candidate), ())
+
+    def test_the_journal_capture_under_var_log_is_still_compared(self) -> None:
+        # `logs/var-log/` is mostly the generated tree, but the journal capture
+        # in it is a command both implementations ran — losing `sudo -n` or the
+        # `--since` window there has to fail the gate.
+        reference = self.reference()
+        candidate = self.bundle(
+            [
+                node_entry(self.HOST, "system/hostname.txt", "hostname"),
+                node_entry(self.HOST, "kernel/dmesg.txt", "sudo -n dmesg -T"),
+                node_entry(
+                    self.HOST,
+                    "logs/var-log/journal-all-since.txt",
+                    "journalctl --since -24h --no-pager",
+                ),
+                node_entry(
+                    self.HOST,
+                    "cephadm/var-lib-ceph-listing.txt",
+                    "collect-node list /var/lib/ceph",
+                ),
+            ],
+            "unprivileged-journal.tar.gz",
+        )
+        self.assertNotEqual(describe_differences(reference, candidate), ())
+
+    def test_a_marker_the_reference_also_indexes_is_still_compared(self) -> None:
+        # The over-limit journal is a SKIPPED marker the reference records too,
+        # with the exit code 75 that ADR 0010 never enumerated.  Recognising
+        # markers by artifact alone would drop it and lose the degradation.
+        over_limit = [
+            node_entry(self.HOST, "system/hostname.txt", "hostname"),
+            node_entry(self.HOST, "kernel/dmesg.txt", "sudo -n dmesg -T"),
+            node_entry(
+                self.HOST,
+                "logs/var-log/journal-all-since.txt",
+                "sudo -n journalctl --since -24h --no-pager",
+                75,
+            ),
+        ]
+        members = bundle_members(hosts=(self.HOST,))
+        members[f"nodes/{self.HOST}/logs/var-log/journal-all-since.txt"] = (
+            b"SKIPPED: not collected because combined /var/log and journal text "
+            b"exceeded the per-node cap\n"
+        )
+        members[f"nodes/{self.HOST}/manifest.jsonl"] = "".join(
+            json.dumps(record) + "\n" for record in over_limit
+        ).encode("utf-8")
+        reference = contract_of(read_bundle(self.write(members, "over-limit-a.tar.gz")))
+        members[f"nodes/{self.HOST}/manifest.jsonl"] = "".join(
+            json.dumps(record) + "\n" for record in over_limit[:2]
+        ).encode("utf-8")
+        candidate = contract_of(read_bundle(self.write(members, "over-limit-b.tar.gz")))
+        self.assertNotEqual(describe_differences(reference, candidate), ())
+
+    def test_an_index_verb_over_a_real_capture_is_still_compared(self) -> None:
+        # The index verbs say "nobody ran a command for this".  The artifact's
+        # capture header says otherwise, and the bundle is believed over the
+        # manifest — otherwise any entry could vanish by wearing the verb.
+        reference = self.reference()
+        candidate = self.bundle(
+            [
+                node_entry(self.HOST, "system/hostname.txt", "hostname"),
+                node_entry(self.HOST, "kernel/dmesg.txt", "sudo -n dmesg -T"),
+                node_entry(
+                    self.HOST,
+                    "logs/var-log/journal-all-since.txt",
+                    "collect-var-log /var/log",
+                ),
+                node_entry(
+                    self.HOST,
+                    "cephadm/var-lib-ceph-listing.txt",
+                    "collect-node list /var/lib/ceph",
+                ),
+            ],
+            "verb-over-capture.tar.gz",
+        )
+        self.assertNotEqual(describe_differences(reference, candidate), ())
+
+    def test_the_var_lib_ceph_listing_verb_is_not_a_difference(self) -> None:
+        # ADR 0010 moved this entry's command policy to the N9 argv ledger, so
+        # the gate compares that the listing was recorded, not how.
+        self.assertEqual(describe_differences(self.reference(), self.candidate()), ())
+
+    def test_an_entry_the_reference_claims_is_still_compared(self) -> None:
+        reference = self.reference()
+        candidate = self.bundle(
+            [
+                node_entry(self.HOST, "system/hostname.txt", "hostname"),
+                node_entry(self.HOST, "kernel/dmesg.txt", "dmesg -T"),
+                node_entry(
+                    self.HOST,
+                    "cephadm/var-lib-ceph-listing.txt",
+                    "collect-node list /var/lib/ceph",
+                ),
+            ],
+            "unprivileged.tar.gz",
+        )
+        self.assertNotEqual(describe_differences(reference, candidate), ())
+
+    def test_a_candidate_entry_outside_the_enumerated_classes_is_a_difference(self) -> None:
+        reference = self.reference()
+        candidate = self.candidate(
+            [node_entry(self.HOST, "system/uptime.txt", "uptime")]
+        )
+        self.assertNotEqual(describe_differences(reference, candidate), ())
+
+    def test_a_redaction_the_listing_does_not_explain_is_a_difference(self) -> None:
+        reference = self.reference(extra=[BLANKED_LINE])
+        self.assertNotEqual(describe_differences(reference, self.candidate()), ())
+
+    def test_the_relaxation_does_not_reach_the_cluster_manifest(self) -> None:
+        reference = self.contract_with_cluster_manifest([], "cluster-reference.tar.gz")
+        candidate = self.contract_with_cluster_manifest(
+            [
+                {
+                    "host": "monitor01",
+                    "collector": "cluster-ceph",
+                    "artifact": "cluster/ceph/json/crash-info/crash-02.json",
+                    "command": "ssh -i /key monitor01 ceph crash info crash-02",
+                    "exit_code": 0,
+                    "started": "2026-07-31T01:00:00Z",
+                    "ended": "2026-07-31T01:00:01Z",
+                }
+            ],
+            "cluster-candidate.tar.gz",
+        )
+        self.assertNotEqual(describe_differences(reference, candidate), ())
+
+    def contract_with_cluster_manifest(
+        self, extra: list[dict[str, object]], name: str
+    ):
+        members = bundle_members(hosts=(self.HOST,))
+        members["manifest.jsonl"] += "".join(
+            json.dumps(record) + "\n" for record in extra
+        ).encode("utf-8")
+        return contract_of(read_bundle(self.write(members, name)))
+
+
+class VarLogDriftTests(BundleTestCase):
+    """The `/var/log` payload file set belongs to the machine, not the collector.
+
+    Two honest collects hours apart package different files there — a UTC day
+    boundary births `sysstat/sa03`, journald renames its archived journals — so
+    the member comparison stops at the tree (#52).  The boundary is exactly the
+    `merged/`, `raw/` and `original/` subtrees: everything directly under
+    `logs/var-log/` is still compared, and so is every other member path.
+    """
+
+    def contract(self, extra: dict[str, bytes], name: str):
+        return contract_of(read_bundle(self.write(bundle_members(extra=extra), name)))
+
+    def test_files_the_machine_grew_between_collects_are_not_a_difference(self) -> None:
+        reference = self.contract({}, "drift-reference.tar.gz")
+        candidate = self.contract(
+            {
+                # What the real lab produced: the day boundary's sysstat file and
+                # a renamed archived journal, both candidate-only (#52).
+                "nodes/monitor01/logs/var-log/raw/sysstat/sa03": b"\x00\x01",
+                "nodes/monitor01/logs/var-log/raw/journal/3f0c/system@0006.journal": b"\x7fLPKSHHRH",
+            },
+            "drift-candidate.tar.gz",
+        )
+        self.assertEqual(describe_differences(reference, candidate), ())
+
+    def test_a_file_rotated_away_before_the_second_collect_is_not_a_difference(self) -> None:
+        reference = self.contract(
+            {"nodes/monitor01/logs/var-log/original/syslog.1": b"old line\n"},
+            "rotated-reference.tar.gz",
+        )
+        candidate = self.contract({}, "rotated-candidate.tar.gz")
+        self.assertEqual(describe_differences(reference, candidate), ())
+
+    def test_a_member_directly_under_var_log_is_still_compared(self) -> None:
+        # `INDEX.tsv` and the journal capture sit beside the payload trees, not
+        # inside them: they are the implementation's output, so losing one is a
+        # difference the drift allowance must not absorb.
+        reference = self.contract(
+            {"nodes/monitor01/logs/var-log/INDEX.tsv": b"path\tbytes\n"},
+            "index-reference.tar.gz",
+        )
+        candidate = self.contract({}, "index-candidate.tar.gz")
+        self.assertNotEqual(describe_differences(reference, candidate), ())
+
+    def test_the_drift_allowance_does_not_reach_other_node_evidence(self) -> None:
+        reference = self.contract({}, "node-reference.tar.gz")
+        candidate = self.contract(
+            {"nodes/monitor01/cephadm/extra-evidence.txt": b"data\n"},
+            "node-candidate.tar.gz",
+        )
+        self.assertNotEqual(describe_differences(reference, candidate), ())
+
+    def test_the_drift_allowance_does_not_reach_cluster_artifacts(self) -> None:
+        reference = self.contract({}, "cluster-reference.tar.gz")
+        candidate = self.contract(
+            {"cluster/ceph/json/extra.json": b"{}\n"}, "cluster-candidate.tar.gz"
+        )
+        self.assertNotEqual(describe_differences(reference, candidate), ())
 
 
 if __name__ == "__main__":

@@ -172,7 +172,14 @@ SCENARIOS: tuple[Scenario, ...] = (
     ),
     Scenario(
         name="mixed-full-collection-unredacted",
-        summary="the same full collection with --no-redact: raw evidence is preserved",
+        summary=(
+            "the same full collection with --no-redact: raw evidence is "
+            "preserved, and because it contains real-length ceph key material "
+            "(`key = ` plus 38 base64 characters) the unconditional verify "
+            "phase refuses to publish a bundle — --no-redact skips rewriting, "
+            "never the content-safety scan, so both implementations keep the "
+            "raw workdir and exit 1"
+        ),
         arguments=(
             "--mode",
             "auto",
@@ -193,18 +200,21 @@ SCENARIOS: tuple[Scenario, ...] = (
             "FAKE_CEPH_SECRET_CONFIG": "1",
             "FAKE_KUBE_TOOLS_POD": "1",
         },
-        coverage=("O8", "O9"),
-        expected_exit=0,
+        coverage=("O8", "O9", "B9"),
+        expected_exit=1,
+        expect_archive=False,
     ),
     Scenario(
         name="verify-failure-keeps-workdir",
         summary=(
-            "a node smuggles a private key: verification fails, no bundle is "
-            "published and the workdir is kept for investigation"
+            "a node smuggles a private key in a `.pem` path: the forbidden-path "
+            "rule fails verification, no bundle is published and the workdir is "
+            "kept for investigation (the content scan itself is exercised by "
+            "mixed-full-collection-unredacted)"
         ),
         arguments=("--mode", "cephadm", "--seed", CEPH_SEED),
         knobs={"FAKE_CAPS": BOTH_CAPABLE, "FAKE_NODE_CASES": "kubenode=pem-leak"},
-        coverage=("O18", "B8", "B9"),
+        coverage=("O18", "B8"),
         expected_exit=1,
         expect_archive=False,
     ),

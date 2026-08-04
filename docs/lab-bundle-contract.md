@@ -24,8 +24,9 @@ Real lab 兩者都不是。兩次 qualification collect 相隔數分鐘打在活
 
 | 比較項目 | 為什麼它是 contract |
 | --- | --- |
-| member 路徑集合 | 兩個實作必須產出同一組 artifact，放在同一個位置 |
-| `manifest.jsonl`（含每個 node 的 manifest） | collector、artifact、完整 command argv 與 exit code — CLI semantics、runner 選擇與 source 選擇都在這裡變成可觀測 |
+| member 路徑集合 | 兩個實作必須產出同一組 artifact，放在同一個位置——唯一例外是 `/var/log` payload 樹內的檔案集合，見下方「刻意不比較」 |
+| 頂層 `manifest.jsonl` | collector、artifact、完整 command argv 與 exit code — CLI semantics、runner 選擇與 source 選擇都在這裡變成可觀測 |
+| 每個 node 的 `manifest.jsonl` | 同上，但只比對「兩邊都宣稱的那一面」，見下節 |
 | 每個 captured artifact 的 `# key: value` header | host、collector、timeout 與 truncation 標記 |
 | artifact body 是否解析得出 JSON | 「是不是 JSON」是實作決定的：把 evidence 包裝、截斷或重新序列化的 candidate 會在這裡現形 |
 | `environment.txt` 的選擇欄位 | `mode`、`seed`、`since`、`timeout`、`git_commit`、`ceph_source`、`ceph_runner`、`rook_source`、`prom_url`、`prom_jobs` |
@@ -48,12 +49,71 @@ covered。
   `health.checks` 是 `{}`，一出現 slow op 就多一個 key；某個 counter 這次是 `0`
   下次是 `0.5`。會因為一次暫時性 HEALTH_WARN 就失敗的 gate，只會被學會「重跑到過為
   止」，那比一個少比但說得準的 gate 更糟。
-- `/var/log` payload 與重壓縮後的 metric dump bytes（`nodes/*/logs/var-log/{merged,raw,original}/`、
-  任何 `.gz`／`.xz`／`.bz2`／`.zst`）。這些只比對「存在與路徑」。
+- 重壓縮後的 metric dump bytes（任何 `.gz`／`.xz`／`.bz2`／`.zst`）。這些只比對
+  「存在與路徑」。
 - 超過 4 MiB 的 artifact 內容；同樣只比對存在與路徑。
+- `/var/log` payload 樹（`nodes/*/logs/var-log/{merged,raw,original}/`）**連存在與
+  路徑都不比**。這棵樹的檔案集合是活體機器的作為，不是實作的：兩次 collect 跨過
+  UTC 日界，`sysstat/sa03` 就只在第二次存在；journald 也會在兩次之間輪替、改名它
+  的 archived journal（#52 實測，3 + 4 項）。要求「存在與路徑」相同，等於要求兩個
+  時刻的 `/var/log` 長得一樣，那與比對 evidence bytes 是同一種錯。
+  放寬的界線就是這三棵子樹，一步不多：直接放在 `logs/var-log/` 下的成員——
+  `journal-all-since.txt` capture（`sudo -n` 與 `--since` 窗口在它的 argv 上）與
+  `INDEX.tsv`——照常逐筆比對；每個 node 的 `/var/log` path 仍受 per-bundle 四路
+  coverage 檢查，整棵樹沒收依然會失敗；cluster artifact 與其他 node evidence 的
+  member 路徑照常完全比對。
 
 Evidence 處理本身的 byte-level 等價是 offline gate 的職責：那裡的輸入是凍結的，所以
 它可以精確比對。
+
+## Node manifest：只比對兩邊都宣稱的那一面（ADR 0010）
+
+[ADR 0010](adr/0010-manifest-as-evidence-index.md) 已經裁定 node manifest **刻意
+diverge**：Python 的 node manifest 是「archive 內全部 evidence 的索引」，shell
+reference 只記錄它實際執行過的指令。逐筆比對等於用 gate 推翻已經裁定的 ADR，數字也
+說得很清楚——真 lab 上同一台 node 是 26 筆對 248 筆（#52）。
+
+所以 node manifest 比對前先移除 ADR 0010 列舉的那幾類 entry。這幾類只有 Python 會
+產生，但判定規則兩邊照跑——`contract_of` 逐份 bundle 化約，不知道自己拿到的是哪一
+邊，這樣才不會出現「reference 專用的寬鬆路徑」：
+
+| 移除的 entry | 怎麼認出來 |
+| --- | --- |
+| 複製類 evidence | `command` 是 index verb `collect-node copy …`，**且** artifact 在 bundle 裡沒有 capture 檔頭 |
+| `/var/log` 產出樹 | `command` 是 index verb `collect-var-log /var/log`，**且** artifact 沒有 capture 檔頭 |
+| SKIPPED／「證據不在」marker | artifact 在 bundle 裡的內容或檔名是 skip marker，**且** `exit_code` 是 ADR 0010 列的 127（指令不存在）或 2（證據不存在／複製失敗） |
+
+`exit_code` 是那一列的一部分而不是修飾：reference 自己也會寫一種 marker——
+`/var/log` 加 journal 超過 per-node cap 時的 `journal-all-since.txt`——而且**有**記
+manifest entry，exit code 75。只認 artifact 就會把它一起吃掉，degradation 就從比對
+裡消失了。ADR 0010 沒有列 75，所以它留在比對裡。同理 `--skip-logs` 的 marker（exit
+0）也不在列舉內，仍逐筆比對；那一項的裁定還掛在 `docs/python-rewrite-plan.md`。
+
+Index verb 的意思是「這份 evidence 沒有任何指令為它執行過」。這句話 manifest 自己
+說了不算：artifact 只要帶著 `# host: ` capture 檔頭，就代表真的跑過指令，該筆 entry
+留在比對裡。否則任何一筆 entry 只要換上 verb 就能從 gate 消失。
+
+**`logs/var-log/` 不是整包排除。** 那棵樹裡的 `journal-all-since.txt` 是兩邊都執行
+並記錄的 capture，`sudo -n` 與 `--since` 時間窗都在它的 argv 上，所以它照常逐筆比
+對；被移除的是那棵樹其餘由 `collect-var-log` 索引起來的產出。
+
+`/var/lib/ceph` listing 是另一種情況：兩邊都有這筆 entry，但記法不同。Python 記
+ADR 0010 的穩定 verb `collect-node list <dir>`；shell 記真正的 `find` argv，而那串
+expression 裡有 `*keyring*`，會被 content safety 整行遮成 `[REDACTED]`。同一件事的
+兩種記法，因此各自收斂成「這台有沒有記到 listing」一個事實——ADR 0010 早已把這筆的
+command policy 交給 N9 的 argv ledger 斷言。收斂是**認 artifact 而不是認 verb**，所
+以 #44 把 content safety 移掉、shell 的 `find` entry 不再被遮之後，這條規則不會反過
+來讓 gate 誤判。
+
+界線寫死在兩處：**只有**該 node 的 `cephadm/var-lib-ceph-listing.txt` 真的在 bundle
+裡（且不是 skip）時才會去吃被遮蔽的行，而且**只吃掉一行**。第二行 `[REDACTED]` 是
+這裡沒有解釋的遮蔽，會原樣留在比對裡讓 gate 失敗。已知代價：一行 `[REDACTED]` 本身
+不帶任何資訊，所以在 listing artifact 存在的前提下，「被遮蔽的 listing entry」與
+「少索引了 listing 又剛好有一行別的被遮蔽」這兩種情況分不出來。
+
+沒有落入上表任何一類的 entry 一律留在比對裡。放寬只到 node manifest 為止：頂層
+`manifest.jsonl` 仍然逐筆比對，cluster artifact 的 exit code、skip 分類與
+source／runner 選擇也都不受影響。
 
 ## Normalizer 允許忽略的差異（完整清單）
 

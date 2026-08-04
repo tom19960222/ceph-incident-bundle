@@ -700,6 +700,12 @@ def run_capture(
             try:
                 completed = subprocess.run(
                     list(command),
+                    # The reference closes stdin for every capture, because the
+                    # captured command is usually `ssh` and `ssh` reads stdin to
+                    # EOF whether the remote wants it or not — inheriting the
+                    # caller's stdin let one capture swallow the list the caller
+                    # was still iterating (#52).
+                    stdin=subprocess.DEVNULL,
                     stdout=stream,
                     stderr=subprocess.STDOUT,
                     timeout=timeout,

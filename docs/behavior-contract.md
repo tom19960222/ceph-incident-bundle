@@ -123,8 +123,8 @@
 | `CEPH_INCIDENT_VAR_LOG_FREE_RESERVE_BYTES` | `1073741824`（1 GiB） | 遠端輸出目錄需保留的最小剩餘空間（lib/collect-var-log.sh:317） |
 | `CEPH_INCIDENT_TEST_ALLOW_ATIME_READ` | `0` | 測試 escape hatch：允許用 `cat` 讀（略過 dd noatime；lib/collect-var-log.sh:41-44、lib/collect-node.sh:155-158、lib/collect-var-log.sh:60） |
 | `COLLECT_TEST_ABORT_AFTER_NODES` | 未設 | 測試 hook：node 收完後強制 die（run/collect.sh:622-625） |
-| `COMMAND_TIMEOUT` | `20` | `run_capture` 的單指令 timeout（呼叫端逐次設定；lib/common.sh:276） |
-| `ERROR_LOG` | 無 | `run_capture`/probe 失敗時追加的 errors.log 路徑（lib/common.sh:300-304） |
+| `COMMAND_TIMEOUT` | `20` | `run_capture` 的單指令 timeout（呼叫端逐次設定；lib/common.sh:334） |
+| `ERROR_LOG` | 無 | `run_capture`/probe 失敗時追加的 errors.log 路徑（lib/common.sh:358-362） |
 
 注意：node 端相關變數（`CEPH_INCIDENT_VAR_LOG_*`、`TIMESYNCD` 等）是在**遠端 node 的環境**讀取，工作機不會把它們轉送過去。
 
@@ -494,7 +494,7 @@ redaction 之後（redaction 可能改變大小）對每台 node 重算 `merged/
 
 ---
 
-## 13. Redaction（lib/common.sh:154-256；lib/bundle.sh:228-253）
+## 13. Redaction（lib/common.sh:154-302；lib/bundle.sh:228-253）
 
 ### 13.1 範圍（`redact_bundle_text`）
 
@@ -523,15 +523,16 @@ redaction 之後（redaction 可能改變大小）對每台 node 重算 `merged/
 
 ---
 
-## 14. `run_capture` 與 artifact/manifest 格式（lib/common.sh:140-152、251-307）
+## 14. `run_capture` 與 artifact/manifest 格式（lib/common.sh:140-152、304-365）
 
 每個被捕捉的指令：
 
 - artifact 檔頭三～四行註解：`# host: <h>`、`# collector: <c>`、`# started: <UTC>`、`# timeout: <COMMAND_TIMEOUT>s`（無 timeout binary 時 `# timeout: unavailable`）。之後是指令 stdout+stderr 合流。
-- 指令被 `timeout $COMMAND_TIMEOUT`（預設 20）包住；exit 124/137 時檔尾補 `# TRUNCATED: command timed out after <s>s (exit <rc>)`（:292-294）。
+- **stdin 一律關成 `/dev/null`**（:334、:341）。被捕捉的指令沒有一個是互動程式，但 `ssh` 不管遠端要不要都會把 stdin 讀到 EOF，而呼叫端多半是 `while IFS= read -r … done <<<"$list"` 迴圈——繼承 stdin 等於讓第一次 capture 吃掉迴圈還沒讀的清單。`ceph crash info` 因此在真 lab 上九個 id 只取到兩個（#52）。
+- 指令被 `timeout $COMMAND_TIMEOUT`（預設 20）包住；exit 124/137 時檔尾補 `# TRUNCATED: command timed out after <s>s (exit <rc>)`（:350-352）。
 - 先寫入同目錄 mktemp 暫存檔再 `mv`（不會留半寫檔）。
 - `manifest.jsonl` 追加一行 JSON：`{"host":…,"collector":…,"artifact":<絕對路徑>,"command":<%q quoted 字串>,"exit_code":N,"started":…,"ended":…}`（自製 escape：`\ " \n \r \t`；:130-152）。exit_code 必須是數字，否則 die。
-- 非 0 且設了 `ERROR_LOG` → 追加 `<ended> host=<h> collector=<c> artifact=<a> exit=<rc> command=<cmd>`（:300-304）。
+- 非 0 且設了 `ERROR_LOG` → 追加 `<ended> host=<h> collector=<c> artifact=<a> exit=<rc> command=<cmd>`（:358-362）。
 - cluster 層寫 workdir 根的 `manifest.jsonl`/`errors.log`；node 層寫 node 自己 out 目錄下的（打包後成為 `nodes/<alias>/manifest.jsonl`、`nodes/<alias>/errors.log`）。
 
 `CONTENTS.md`（lib/bundle.sh:169-201）由 manifest 生成：頂層檔案說明 + cluster 表格 + 每個 node 一段表格（`| exit | file | command |`）；node 的 artifact 路徑把遠端 `/tmp/…/out/` 前綴轉成 `nodes/<alias>/`（:152-158）；缺 node manifest 時寫 `Not collected — see nodes/<alias>/SKIPPED.txt`；有 var-log INDEX 時補一行指引。
@@ -573,7 +574,7 @@ URL 中 `user:pass@` 在寫入任何 artifact/錯誤訊息前遮蔽為 `user:***
 檢查（目錄樹，:96-103）：
 
 1. **成員檢查**（`find -print0` 防換行走私）：不可有 symlink；路徑不可含 `keyring`、`.ssh`、`id_ed25519`、`private_key`，或以 `.pem/.key/.crt/.pfx/.p12` 結尾（:20-37）。
-2. **內容檢查**：任何檔案殘留 `-----BEGIN ... PRIVATE KEY-----` 或 `^\s*key\s*=\s*[A-Za-z0-9+/]{20,}={0,2}` → fail（:57-66）。
+2. **內容檢查**：任何檔案殘留 `-----BEGIN ... PRIVATE KEY-----` 或 `^\s*key\s*=\s*[A-Za-z0-9+/]{20,}={0,2}` → fail（:57-66）。此掃描**不受 `--redact/--no-redact` 影響**——`--no-redact` 只略過改寫（§1 流程第 16 步），verify 照跑（§1 第 20/22 步）。因此收集到真實長度 ceph key（`key = ` 後接 38–40 個 base64 字元，超過 20 字元門檻）的證據時，`--no-redact` 會在 verify 階段 fail-closed：exit 1、不產 bundle、保留 workdir（#53 裁定；differential scenario `mixed-full-collection-unredacted` 對此雙跑比對）。
 3. **必要頂層檔**：`manifest.jsonl`、`summary.txt`、`README-FIRST.txt`（:68-78）。
 4. **必要 artifacts**：`cluster/` 與 `nodes/` 下各至少一個檔案（SKIPPED.txt 也算；:80-94）。
 
