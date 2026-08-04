@@ -573,7 +573,7 @@ URL 中 `user:pass@` 在寫入任何 artifact/錯誤訊息前遮蔽為 `user:***
 檢查（目錄樹，:96-103）：
 
 1. **成員檢查**（`find -print0` 防換行走私）：不可有 symlink；路徑不可含 `keyring`、`.ssh`、`id_ed25519`、`private_key`，或以 `.pem/.key/.crt/.pfx/.p12` 結尾（:20-37）。
-2. **內容檢查**：任何檔案殘留 `-----BEGIN ... PRIVATE KEY-----` 或 `^\s*key\s*=\s*[A-Za-z0-9+/]{20,}={0,2}` → fail（:57-66）。
+2. **內容檢查**：任何檔案殘留 `-----BEGIN ... PRIVATE KEY-----` 或 `^\s*key\s*=\s*[A-Za-z0-9+/]{20,}={0,2}` → fail（:57-66）。此掃描**不受 `--redact/--no-redact` 影響**——`--no-redact` 只略過改寫（§16 流程第 16 步），verify 照跑（第 20/22 步）。因此收集到真實長度 ceph key（`key = ` 後接 38–40 個 base64 字元，超過 20 字元門檻）的證據時，`--no-redact` 會在 verify 階段 fail-closed：exit 1、不產 bundle、保留 workdir（#53 裁定；differential scenario `mixed-full-collection-unredacted` 對此雙跑比對）。
 3. **必要頂層檔**：`manifest.jsonl`、`summary.txt`、`README-FIRST.txt`（:68-78）。
 4. **必要 artifacts**：`cluster/` 與 `nodes/` 下各至少一個檔案（SKIPPED.txt 也算；:80-94）。
 

@@ -170,7 +170,7 @@
 | B6 | 檔名 `id_ed25519`（dir/archive）→ 失敗且點名 | ported | `test_python_verify.VerifyCliTests.test_secret_paths_are_rejected_for_directory_and_archive` | — |
 | B7 | 檔名 `private_key`（dir/archive）→ 失敗且點名 | ported | `test_python_verify.VerifyCliTests.test_secret_paths_are_rejected_for_directory_and_archive` | — |
 | B8 | 檔名 `*.pem`（dir/archive）→ 失敗且點名 | ported | `test_python_verify.VerifyCliTests.test_secret_paths_are_rejected_for_directory_and_archive` | verify-failure-keeps-workdir |
-| B9 | 允許副檔名內夾帶未遮蔽 PEM 本體（`-----BEGIN OPENSSH PRIVAT… | ported | `test_python_verify.VerifyCliTests.test_private_key_and_ceph_key_content_are_rejected` | verify-failure-keeps-workdir |
+| B9 | 允許副檔名內夾帶未遮蔽 PEM 本體（`-----BEGIN OPENSSH PRIVAT… | ported | `test_python_verify.VerifyCliTests.test_private_key_and_ceph_key_content_are_rejected` | mixed-full-collection-unredacted |
 | B10 | 非法 tar.gz → 失敗且說 invalid archive | ported | `test_python_verify.VerifyCliTests.test_corrupt_and_truncated_archives_are_rejected`<br>`test_python_verify.VerifyCliTests.test_archive_with_invalid_deflate_body_is_rejected_without_traceback` | — |
 | B11 | 多餘參數 → 非 0＋Usage | ported | `test_python_verify.VerifyCliTests.test_extra_argument_prints_usage_to_stderr` | — |
 

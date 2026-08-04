@@ -68,7 +68,15 @@ CEPH_RESPONSES = {
     "orch device ls --wide --format json-pretty": '[{"path":"/dev/sdb"}]',
     "config dump --format json-pretty": '[{"who":"mon.a","value":"1"}]',
 }
-SECRET_CONFIG_DUMP = '[{"who":"mon.a","key":"AQBclustersecret==","value":"1"}]'
+# Real `ceph auth` key length (38 base64 characters plus `==`), with no English
+# keyword in the value: on a real cluster the base64 blob itself is all a
+# redacting run gets to react to, so the fake must not hand the keyword rule a
+# hit the real material would never produce.  The JSON `"key":"…"` spelling is
+# deliberately not the `key = …` line the verify scanner rejects: a `--no-redact`
+# bundle keeps this line raw and both implementations must tolerate it there.
+SECRET_CONFIG_DUMP = (
+    '[{"who":"mon.a","key":"AQBcluster0123456789012345678901234567==","value":"1"}]'
+)
 
 # Twelve ids including the sanitisation collision pair, so both implementations
 # have to apply the same ten-crash limit and the same collision-safe naming.
