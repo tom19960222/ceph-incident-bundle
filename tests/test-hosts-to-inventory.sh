@@ -157,8 +157,39 @@ HOSTS=(
 assert_status "ipv6 stays out by default" 1 \
   "$(run_and_capture "$CONVERT" --user ikaros "$v6_file")"
 
+# A zone id and a v4-mapped address pass the shell reference's target check but
+# not the Python candidate's, so neither may reach the output: the whole point
+# is an inventory both implementations accept entry for entry.
+v6_odd_file="$tmpdir/v6-odd-hosts"
+cat >"$v6_odd_file" <<'EOF'
+fd00::20%eth0 zoned
+::ffff:10.0.0.5 mapped
+fd00::10 mon01
+EOF
+v6_odd="$(run_and_capture "$CONVERT" --user ikaros --ipv6 --keep-loopback "$v6_odd_file")"
+assert_status "odd ipv6 forms do not fail the run" 0 "$v6_odd"
+assert_contains "zone id reported as unusable" \
+  'unusable SSH target, skipped: [fd00::20%eth0]' "$v6_odd"
+assert_contains "v4-mapped reported as unusable" \
+  'unusable SSH target, skipped: [::ffff:10.0.0.5]' "$v6_odd"
+v6_odd_out="$(convert_stdout --user ikaros --ipv6 --keep-loopback "$v6_odd_file")"
+[[ "$v6_odd_out" != *zoned* && "$v6_odd_out" != *mapped* ]] ||
+  fail "odd ipv6 forms should not reach the output: $v6_odd_out"
+assert_contains "the usable ipv6 entry survives" '"mon01=[fd00::10]"' "$v6_odd_out"
+
 assert_contains "keep-loopback opts loopback back in" '"localhost=127.0.0.1"' \
   "$(convert_stdout --user ikaros --keep-loopback "$hosts_file")"
+
+# IPv4 link-local is autoconfiguration debris, not a node, and --keep-loopback
+# is the documented way back in.
+apipa_file="$tmpdir/apipa-hosts"
+printf '169.254.7.7 apipa\n10.0.0.5 mon01\n' >"$apipa_file"
+apipa_out="$(convert_stdout --user ikaros "$apipa_file")"
+[[ "$apipa_out" != *169.254.7.7* ]] ||
+  fail "ipv4 link-local should stay out: $apipa_out"
+assert_contains "the routable entry survives" '"mon01=10.0.0.5"' "$apipa_out"
+assert_contains "keep-loopback opts ipv4 link-local back in" '"apipa=169.254.7.7"' \
+  "$(convert_stdout --user ikaros --keep-loopback "$apipa_file")"
 
 # ---------------------------------------------------------------------------
 # stdin.
@@ -187,6 +218,15 @@ dup_entries="$(convert_stdout --user ikaros "$dup_file" | grep -c '^  "' || true
 [[ "${dup_entries// /}" == "1" ]] ||
   fail "repeated address should yield exactly one HOSTS entry, got $dup_entries"
 
+# The provenance comment carries the input path, and the inventory grammar is
+# line-based: a newline in that path must not become an inventory statement.
+newline_file="$tmpdir/$(printf 'weird\nSEED_HOST="10.9.9.9"')"
+printf '10.0.0.1 mon01\n' >"$newline_file"
+newline_out="$(convert_stdout --user ikaros "$newline_file")"
+[[ "$newline_out" != *'
+SEED_HOST='* ]] || fail "a newline in the input path leaked a statement: $newline_out"
+assert_contains "the entry still converts" '"mon01=10.0.0.1"' "$newline_out"
+
 empty_file="$tmpdir/empty-hosts"
 printf '# only comments\n127.0.0.1 localhost\n' >"$empty_file"
 assert_status "no usable entry fails" 1 \
@@ -194,6 +234,12 @@ assert_status "no usable entry fails" 1 \
 
 assert_status "invalid user fails" 1 \
   "$(run_and_capture "$CONVERT" --user 'bad user' "$hosts_file")"
+# Both entrypoints reject a leading "-" separately from the character class,
+# because SSH_USER and SEED_HOST become ssh argv words.
+assert_status "option-shaped user fails" 1 \
+  "$(run_and_capture "$CONVERT" --user -oProxyCommand "$hosts_file")"
+assert_status "option-shaped seed fails" 1 \
+  "$(run_and_capture "$CONVERT" --user ikaros --seed -F.ssh "$hosts_file")"
 assert_status "invalid namespace fails" 1 \
   "$(run_and_capture "$CONVERT" --user ikaros --rook-ns 'bad ns' "$hosts_file")"
 assert_status "invalid regex fails" 1 \
@@ -219,9 +265,34 @@ assert_contains "forced output has hosts" '"ceph-lab-mon-01=192.168.18.166"' \
   "$(cat "$out_file")"
 
 # ---------------------------------------------------------------------------
-# The point of the whole script: the reference inventory parser accepts the
-# output, and accepts every entry (no "skipped unsafe ..." rejects).
+# The point of the whole script: both inventory parsers accept the output, and
+# accept every entry (no "skipped unsafe ..." rejects). The two do not accept
+# exactly the same target grammar, so asking only the shell reference would
+# leave the promise half-proven.
 # ---------------------------------------------------------------------------
+PYTHON="${PYTHON:-python3}"
+
+# Prints the number of accepted nodes, or fails if the candidate rejected the
+# file or any single entry in it.
+assert_candidate_accepts() {
+  local label=$1 inventory=$2 expected=$3 result
+  result="$(
+    "$PYTHON" -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from ceph_incident_bundle import _read_inventory
+
+inventory = _read_inventory(Path(sys.argv[2]))
+if inventory.rejected_entries:
+    print("rejected: " + "; ".join(inventory.rejected_entries))
+    raise SystemExit(1)
+print(len(inventory.nodes))
+' "$ROOT" "$inventory" 2>&1
+  )" || fail "$label: candidate parser refused the generated inventory: $result"
+  assert_equals "$label" "$expected" "$result"
+}
+
 generated="$tmpdir/generated.env"
 "$CONVERT" --user ikaros --seed mon01 --rook-ns rook-ceph "$hosts_file" \
   >"$generated" 2>/dev/null
@@ -256,6 +327,9 @@ assert_equals "reference parser reads the generated inventory" \
   "user=ikaros seed=192.168.18.166 ns=rook-ceph count=5" \
   "$parsed"
 
+assert_candidate_accepts "candidate parser reads the generated inventory" \
+  "$generated" 5
+
 # IPv6 output has to survive the same gate.
 v6_generated="$tmpdir/generated-v6.env"
 "$CONVERT" --user ikaros --ipv6 "$v6_file" >"$v6_generated" 2>/dev/null
@@ -270,5 +344,8 @@ bash -c '
   is_safe_ssh_target "$(ssh_target_for_host "${entry#*=}" "$SSH_USER")"
 ' _ "$ROOT" "$v6_generated" ||
   fail "generated IPv6 inventory rejected by the reference parser"
+
+assert_candidate_accepts "candidate parser accepts the IPv6 inventory" \
+  "$v6_generated" 1
 
 printf 'ok: hosts-to-inventory\n'
