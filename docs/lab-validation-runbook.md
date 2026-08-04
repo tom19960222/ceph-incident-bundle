@@ -87,7 +87,7 @@ make validate-lab LAB_PROFILE=/absolute/path/to/lab.toml CEPH_INCIDENT_LAB_CONFI
 
 這個 target 保持明確 opt-in：它需要絕對 Lab Profile 路徑與 `CEPH_INCIDENT_LAB_CONFIRM=1`，不會被一般 `make validate`、日常 CI 或無確認的 agent 自動觸發。`LAB_ARGS='--collect-timeout <seconds>'` 可調整單次 full collect 的上限（預設 4 小時），`LAB_ARGS=--json` 取得 machine-readable 輸出。
 
-工作站前置條件：執行前必須讓 GNU `timeout`（或 macOS coreutils 的 `gtimeout`）可被 shell reference 的 `timeout_cmd()` 找到；macOS 上 `brew install coreutils` 即可。缺少時 reference 會在沒有單指令 timeout 保護的模式下收集，cluster capture 的 `# timeout` 標頭寫成 `unavailable`，gate 會在 bundle comparison 階段以標頭差異 fail closed（#52 實測為 29 項）。裁定與理由見 [ADR 0011](adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md)。
+工作機前置條件：執行前必須讓 `timeout`（或 macOS coreutils 的 `gtimeout`）可被 shell reference 的 `timeout_cmd()` 找到；macOS 上 `brew install coreutils` 即可。缺少時 reference 會在沒有外層單指令 timeout 的模式下收集，cluster capture 的 `# timeout` 標頭寫成 `unavailable`，gate 會在 bundle comparison 階段以標頭差異 fail closed（#52 那一輪實測 29 項；PR #55 修復 crash-info 後同一情境為 36 項）。collect-shell 階段的輸出開頭會有 reference 自己印的 `WARNING: no 'timeout'/'gtimeout' found`，不必等到 comparison 才發現。裁定與理由見 [ADR 0011](adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md)。
 
 Harness 依序完成下列狀態流程，第一個失敗的階段就停止（唯一例外是 §7 的 residue check）；沒有 skip flag、沒有 accept-current、也沒有重跑到過為止的路徑：
 

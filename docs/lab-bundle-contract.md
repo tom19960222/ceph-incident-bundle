@@ -27,7 +27,7 @@ Real lab 兩者都不是。兩次 qualification collect 相隔數分鐘打在活
 | member 路徑集合 | 兩個實作必須產出同一組 artifact，放在同一個位置——唯一例外是 `/var/log` payload 樹內的檔案集合，見下方「刻意不比較」 |
 | 頂層 `manifest.jsonl` | collector、artifact、完整 command argv 與 exit code — CLI semantics、runner 選擇與 source 選擇都在這裡變成可觀測 |
 | 每個 node 的 `manifest.jsonl` | 同上，但只比對「兩邊都宣稱的那一面」，見下節 |
-| 每個 captured artifact 的 `# key: value` header | host、collector、timeout 與 truncation 標記——`# timeout` 逐字比對，qualification 工作站因此必須提供 timeout binary（[ADR 0011](adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md)） |
+| 每個 captured artifact 的 `# key: value` header | host、collector、timeout 與 truncation 標記——`# timeout` 逐字比對，qualification 工作機因此必須提供 timeout binary（[ADR 0011](adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md)） |
 | artifact body 是否解析得出 JSON | 「是不是 JSON」是實作決定的：把 evidence 包裝、截斷或重新序列化的 candidate 會在這裡現形 |
 | `environment.txt` 的選擇欄位 | `mode`、`seed`、`since`、`timeout`、`git_commit`、`ceph_source`、`ceph_runner`、`rook_source`、`prom_url`、`prom_jobs` |
 | `summary.txt` | `cluster_status`、`node_ok`、`node_failed`、`final_status` — partial collection 在這裡變成可觀測 |

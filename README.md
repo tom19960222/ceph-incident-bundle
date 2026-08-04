@@ -159,7 +159,7 @@ bash run/collect.sh \
 - 預設每台 log payload 上限 10 GiB。用 `--var-log-max-bytes BYTES|unlimited` 調整；payload 包含 merged/raw/original 與 `journal-all-since.txt`，redaction 後會再驗一次。預估或實際超限、遠端暫存空間不足時只留下 index/原因並回傳 exit 2，不產生看似完整的半套 log。另以 64 MiB scan-path staging 與 100,000 entries 上限約束 metadata/記憶體；超過時留下 `SCAN-LIMIT.txt`。
 - 成功合併後預設不重複保存文字來源；`--keep-original-logs` 才會在 `original/` 保留來源格式。`--skip-logs` 可完全跳過 `/var/log` file collection。
 - 被逾時砍掉（exit 124/137）的指令輸出會在 artifact 末尾標 `# TRUNCATED`，讓判讀者知道內容被截斷。
-- **工作機若沒有 `timeout` / `gtimeout`**（如預設 macOS），會在開頭印警告；此時外層逾時停用，只靠 SSH `ConnectTimeout` / `ServerAlive` 把關。要完整把關可 `brew install coreutils`（提供 `gtimeout`），或在 Linux ops 機執行。
+- **工作機若沒有 `timeout` / `gtimeout`**（如預設 macOS），會在開頭印警告；此時外層逾時停用，只靠 SSH `ConnectTimeout` / `ServerAlive` 把關。要完整把關可 `brew install coreutils`（提供 `gtimeout`），或在 Linux ops 機執行。Qualification 工作機必須先補齊，否則 real-lab gate 會在 bundle comparison 以 `# timeout` 標頭差異失敗（見 `docs/adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md`）。
 
 ## 進度顯示
 
