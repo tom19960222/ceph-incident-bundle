@@ -13,36 +13,47 @@ set -euo pipefail
 # that path working: an isolation bug that only appears under sharding is not
 # debuggable without a serial run to compare against.
 #
-# A shard's exit status is the authority on whether it passed.  The `Ran N
-# tests` line is scraped for reporting only, and a shard that never printed one
-# counts as failed -- an interpreter that dies before unittest summarises
-# (crash, OOM, external kill) must not be able to look like a pass.
+# A shard's recorded exit status is the authority on whether it passed: each
+# shard writes its interpreter's exit code to a per-module status file as its
+# last act, and only a recorded 0 counts as a pass.  A shard that dies before
+# recording (crash, OOM, external kill, a disk too full to write one byte)
+# leaves no status and is reported as DIED -- it cannot look like a pass,
+# whatever its log says.  The `Ran N tests` line is scraped for reporting only.
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"
 ROOT="$(cd "$HERE/.." && pwd)"
 PYTHON="${PYTHON:-python3}"
+# The shards re-read PYTHON; exported so the interpreter that passed the 3.11
+# gate reaches them by the script's own doing, not the caller's spelling.
+export PYTHON
 PATTERN='test_python_*.py'
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
-# Internal shard entry point: re-invoked by xargs, one call per module.  A
-# failure is recorded as a marker file rather than appended to a shared log, so
-# concurrent shards never contend for the same file.  `tests.<module>` only
-# resolves from the repository root, which is why this re-anchors rather than
-# inheriting the caller's directory.
-if [[ "${1-}" == "--run-one" ]]; then
-  [[ $# -eq 3 ]] || fail "--run-one needs a module and a log directory"
-  module=$2
+# Internal shard entry point: re-invoked by xargs, one call per module file.
+# The sentinel is exported only by the xargs line below, so a stray TEST_JOBS
+# value of `--run-one` cannot steer the public entry point in here.  Each shard
+# runs the same `unittest discover` the serial path runs, narrowed to one
+# module's filename, so a module keeps the same import identity under sharding
+# as under `TEST_JOBS=1` -- an isolation bug can be compared across the two
+# runs without the module changing its name.  Writing the status file last
+# means a shard that dies mid-run leaves no record and is judged fail-closed.
+if [[ "${1-}" == "--run-one" && "${RUN_PYTHON_TESTS_SHARD:-}" == "1" ]]; then
+  [[ $# -eq 3 ]] || fail "--run-one needs a module filename and a log directory"
+  module_file=$2
   logdir=$3
+  module="${module_file%.py}"
   cd "$ROOT"
-  if "$PYTHON" -m unittest "$module" -v >"$logdir/$module.log" 2>&1; then
-    exit 0
-  fi
-  : >"$logdir/$module.failed"
-  exit 1
+  rc=0
+  "$PYTHON" -m unittest discover -s "$ROOT/tests" -p "$module_file" -v \
+    >"$logdir/$module.log" 2>&1 || rc=$?
+  printf '%s\n' "$rc" >"$logdir/$module.status"
+  exit "$rc"
 fi
 
+# Physical CPUs only: a cgroup CPU quota (a limited CI container) is not
+# consulted, so an over-subscribed environment should pass TEST_JOBS explicitly.
 detect_jobs() {
   local detected
   if detected="$(sysctl -n hw.ncpu 2>/dev/null)" && [[ "$detected" =~ ^[0-9]+$ ]]; then
@@ -70,43 +81,54 @@ if [[ "$jobs" -eq 1 ]]; then
   exec "$PYTHON" -m unittest discover -s "$ROOT/tests" -p "$PATTERN" -v
 fi
 
-modules=()
+module_files=()
 while IFS= read -r path; do
-  modules+=("tests.$(basename "$path" .py)")
+  module_files+=("$(basename "$path")")
 done < <(find "$ROOT/tests" -maxdepth 1 -name "$PATTERN" | sort)
 
-[[ ${#modules[@]} -gt 0 ]] || fail "no test modules matched $PATTERN"
+[[ ${#module_files[@]} -gt 0 ]] || fail "no test modules matched $PATTERN"
+
+# The serial path discovers recursively; the shard list above deliberately does
+# not.  Refuse a layout where the two would run different suites, instead of
+# letting the default path silently drop a nested module.
+stray="$(find "$ROOT/tests" -mindepth 2 -name "$PATTERN" | head -n 1)"
+[[ -z "$stray" ]] || fail "a test module below tests/ top level would never be sharded: $stray"
 
 logdir="$(mktemp -d "${TMPDIR:-/tmp}/ceph-incident-python-tests.XXXXXX")"
 trap 'rm -rf "$logdir"' EXIT
 
 started="$SECONDS"
-printf 'running %s test modules across %s jobs\n' "${#modules[@]}" "$jobs"
+printf 'running %s test modules across %s jobs\n' "${#module_files[@]}" "$jobs"
 
-# xargs exits nonzero when any shard does; the per-module verdicts below are
-# what actually decide the outcome, so don't let `set -e` cut reporting short.
-printf '%s\n' "${modules[@]}" |
-  xargs -P "$jobs" -I {} bash "$SELF" --run-one {} "$logdir" || true
+# xargs exits nonzero when any shard does; the recorded statuses below are what
+# actually decide the outcome, so don't let `set -e` cut reporting short.
+printf '%s\n' "${module_files[@]}" |
+  RUN_PYTHON_TESTS_SHARD=1 xargs -P "$jobs" -I {} bash "$SELF" --run-one {} "$logdir" || true
 
 # Collect every verdict before reporting anything: the EXIT trap removes the
 # logs, so bailing out mid-loop would destroy the evidence for the failure being
 # reported *and* for every module after it.
 total=0
 failed=()
-for module in "${modules[@]}"; do
+for module_file in "${module_files[@]}"; do
+  module="${module_file%.py}"
   log="$logdir/$module.log"
   ran=""
   [[ -f "$log" ]] && ran="$(sed -n 's/^Ran \([0-9]*\) test.*/\1/p' "$log" | tail -1)"
+  summary="${ran:+$ran tests}"
+  summary="${summary:-no unittest summary}"
+  status=""
+  [[ -f "$logdir/$module.status" ]] && status="$(<"$logdir/$module.status")"
 
-  if [[ -f "$logdir/$module.failed" ]]; then
+  if [[ "$status" == "0" ]]; then
+    total=$((total + ${ran:-0}))
+    printf '  ok   %-44s %s\n' "$module" "$summary"
+  elif [[ -z "$status" ]]; then
     failed+=("$module")
-    printf '  FAIL %-44s %s\n' "$module" "${ran:+$ran tests}${ran:-no unittest summary}"
-  elif [[ -z "$ran" ]]; then
-    failed+=("$module")
-    printf '  DIED %-44s shard exited without a unittest summary\n' "$module"
+    printf '  DIED %-44s shard exited without recording a status\n' "$module"
   else
-    total=$((total + ran))
-    printf '  ok   %-44s %s tests\n' "$module" "$ran"
+    failed+=("$module")
+    printf '  FAIL %-44s exit %s, %s\n' "$module" "$status" "$summary"
   fi
 done
 
@@ -120,8 +142,8 @@ if [[ ${#failed[@]} -gt 0 ]]; then
     fi
   done
   printf '\n%s of %s modules failed: %s\n' \
-    "${#failed[@]}" "${#modules[@]}" "${failed[*]}" >&2
+    "${#failed[@]}" "${#module_files[@]}" "${failed[*]}" >&2
   exit 1
 fi
 
-printf 'OK — %s tests in %s modules, %ss\n' "$total" "${#modules[@]}" "$((SECONDS - started))"
+printf 'OK — %s tests in %s modules, %ss\n' "$total" "${#module_files[@]}" "$((SECONDS - started))"

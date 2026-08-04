@@ -80,7 +80,7 @@ Python 實作缺行為。唯一觸及實作邊界的是 V7——`tls.key-2026072
 | R4 | 2026-07-31 | 18d164b3bace2714 | 逐子句核對：指向的測試已斷言該列的每個子句，未更動 |
 | R5 | 2026-07-31 | 296bd1c3bd82933a | 逐子句核對：指向的測試已斷言該列的每個子句，未更動 |
 | R6 | 2026-07-31 | 2c8c99ead0e6e4b2 | 逐子句核對：指向的測試已斷言該列的每個子句，未更動 |
-| R7 | 2026-08-03 | c39a065066fad5db | 不移植；ledger 的理由與 inventory 分類一致。理由句從「由 unittest discovery 取代」改為指向 `tests/run-python-tests.sh`：預設路徑已是分片 runner，`TEST_JOBS=1` 才是 discovery。分類與結論不變 |
+| R7 | 2026-08-03 | c39a065066fad5db | 改寫：理由句從「由 unittest discovery 取代」改為指向 `tests/run-python-tests.sh`——預設路徑已是分片 runner，`TEST_JOBS=1` 才是 discovery。仍不移植，ledger 的理由與 inventory 分類一致，結論不變 |
 | C1 | 2026-07-31 | 2314d5b3a9748b88 | 不移植；ledger 的理由與 inventory 分類一致 |
 | C2 | 2026-07-31 | 4ab8492ee600d816 | 不移植；ledger 的理由與 inventory 分類一致 |
 | C3 | 2026-07-31 | 81000bacf2112a74 | 逐子句核對：指向的測試已斷言該列的每個子句，未更動 |
