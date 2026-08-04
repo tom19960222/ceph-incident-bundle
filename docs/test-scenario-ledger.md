@@ -42,7 +42,7 @@
 | R4 | `verify-bundle.sh` 無參數 → exit 1 且輸出含 `Usage:` | ported | `test_python_verify.VerifyCliTests.test_wrong_invocation_prints_usage_to_stderr` | — |
 | R5 | `verify-bundle.sh` 指到不存在路徑 → 非 0，輸出說明失敗（`VERI… | ported | `test_python_verify.VerifyCliTests.test_invalid_command_and_targets_fail_closed` | — |
 | R6 | `collect.sh` 帶不存在的 inventory → 非 0，輸出說明（`miss… | ported | `test_python_collect_cli.CollectCliContractTests.test_a_missing_inventory_names_the_file_and_writes_nothing` | — |
-| R7 | 依序執行 8 個子測試檔並要求 exit 0 | not-ported | 測試 harness 本身，由 unittest discovery 取代 | — |
+| R7 | 依序執行 8 個子測試檔並要求 exit 0 | not-ported | 測試 harness 本身，由 `tests/run-python-tests.sh` 取代 | — |
 
 ## 2. `tests/test-common.sh`（common.sh / bundle.sh helpers）
 

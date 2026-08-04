@@ -4,6 +4,9 @@
 
 PYTHON ?= python3
 
+# Job count for the sharded Python test runner; see tests/run-python-tests.sh.
+TEST_JOBS ?= auto
+
 test: check-python
 	bash tests/run-tests.sh
 
@@ -11,7 +14,7 @@ check-python:
 	@$(PYTHON) -c 'import sys; sys.exit("Python 3.11 or newer is required") if sys.version_info < (3, 11) else None'
 
 test-python: check-python
-	$(PYTHON) -m unittest discover -s tests -p 'test_python_*.py' -v
+	PYTHON="$(PYTHON)" bash tests/run-python-tests.sh $(TEST_JOBS)
 
 # Offline observable-contract equivalence gate: the shell reference and the
 # Python candidate run the same scenarios in the same fake world and their
