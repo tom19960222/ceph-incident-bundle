@@ -186,6 +186,7 @@ bash run/collect.sh \
 - 成功合併後預設不重複保存文字來源；`--keep-original-logs` 才會在 `original/` 保留來源格式。`--skip-logs` 可完全跳過 `/var/log` file collection。
 - 被逾時砍掉（exit 124/137）的指令輸出會在 artifact 末尾標 `# TRUNCATED`，讓判讀者知道內容被截斷。
 - **工作機若沒有 `timeout` / `gtimeout`**（如預設 macOS），會在開頭印警告；此時外層逾時停用，只靠 SSH `ConnectTimeout` / `ServerAlive` 把關。要完整把關可 `brew install coreutils`（提供 `gtimeout`），或在 Linux ops 機執行。Qualification 工作機必須先補齊，否則 real-lab gate 會在 bundle comparison 以 `# timeout` 標頭差異失敗（見 `docs/adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md`）。
+- **遮蔽需要工作機上的 `awk`**，而且沒有慢速 fallback：它在此之前是逐行 bash 迴圈，實測 10 MiB/min，一次真 lab collect 的資料量要跑 12.8 小時。缺 `awk`、或 `awk` 不支援 `{38,}` 這類 interval expression（mawk 1.3.3 會把它當字面字串，Ceph 金鑰材料就會漏遮）時，collect 明確失敗並指出缺什麼。掃描固定跑在 `LC_ALL=C`，所以規則裡的「非英數」以位元組判定，含非法 UTF-8 的行也照樣走規則——偏向多遮。
 
 ## 進度顯示
 
