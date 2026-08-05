@@ -120,6 +120,33 @@ progress() {
   printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" >&2
 }
 
+# Parse an Evidence Window duration into seconds: N (seconds) or N{s,m,h,d,w}.
+# Rejects 0 and anything non-matching.
+#
+# The grammar stays this strict on purpose. Absolute file selection needs an
+# epoch to compare mtimes against, and turning a free-form `journalctl` range
+# such as `yesterday` into one would need GNU `date -d` or a shared date parser
+# — the second of which would let one parsing bug pick the wrong files on both
+# sides at once, where the differential gate cannot see it (ADR 0012).
+evidence_window_seconds() {
+  local value=$1 n unit
+  local re='^([0-9]+)([smhdw]?)$'
+  [[ $value =~ $re ]] || return 1
+  n="${BASH_REMATCH[1]}"
+  unit="${BASH_REMATCH[2]}"
+  # Normalize to base-10 immediately to avoid octal interpretation
+  n=$((10#$n))
+  [[ "$n" -gt 0 ]] || return 1
+  case "$unit" in
+    ''|s) : ;;
+    m) n=$((n * 60)) ;;
+    h) n=$((n * 3600)) ;;
+    d) n=$((n * 86400)) ;;
+    w) n=$((n * 604800)) ;;
+  esac
+  printf '%s' "$n"
+}
+
 # Resolve a timeout binary: GNU coreutils `timeout`, or `gtimeout` on macOS.
 # Prints the binary name, or nothing if neither is installed.
 timeout_cmd() {

@@ -19,23 +19,13 @@ EOF
 
 # Parse a --since style duration into seconds: N (seconds) or N{s,m,h,d,w}.
 # Rejects 0 and anything non-matching.
+#
+# One grammar serves both users of `--since`: the metrics window here and the
+# Evidence Window that bounds `/var/log` (ADR 0012). The parser lives in
+# `common.sh` because the node collector needs it too and never sources this
+# file; the name is kept so the Prometheus path still reads as its own.
 prom_duration_seconds() {
-  local value=$1 n unit
-  local re='^([0-9]+)([smhdw]?)$'
-  [[ $value =~ $re ]] || return 1
-  n="${BASH_REMATCH[1]}"
-  unit="${BASH_REMATCH[2]}"
-  # Normalize to base-10 immediately to avoid octal interpretation
-  n=$((10#$n))
-  [[ "$n" -gt 0 ]] || return 1
-  case "$unit" in
-    ''|s) : ;;
-    m) n=$((n * 60)) ;;
-    h) n=$((n * 3600)) ;;
-    d) n=$((n * 86400)) ;;
-    w) n=$((n * 604800)) ;;
-  esac
-  printf '%s' "$n"
+  evidence_window_seconds "$1"
 }
 
 # Auto query_range step: smallest step >= 15s that keeps points per series

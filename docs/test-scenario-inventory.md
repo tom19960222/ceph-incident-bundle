@@ -25,15 +25,16 @@
 | `tests/test-common.sh` | 23 | 18 | 5 |
 | `tests/test-cephadm-collector.sh` | 5 | 5 | 0 |
 | `tests/test-node-collector.sh` | 13 | 13 | 0 |
-| `tests/test-var-log-collector.sh` | 14 | 14 | 0 |
+| `tests/test-var-log-collector.sh` | 20 | 19 | 1 |
 | `tests/test-rook-collector.sh` | 10 | 10 | 0 |
 | `tests/test-prom-collector.sh` | 19 | 17 | 2 |
 | `tests/test-verify-bundle.sh` | 11 | 11 | 0 |
-| `tests/test-collect.sh` | 36 | 36 | 0 |
-| **合計** | **138** | **128** | **10** |
+| `tests/test-collect.sh` | 37 | 37 | 0 |
+| **合計** | **145** | **134** | **11** |
 
 > 原始盤點（issue #7）為 137／127／10；#15 之後補入 `P6a`（Prometheus 憑證邊界），
-> 因此實際列數為 138／128／10。逐項覆蓋狀態見 `docs/test-scenario-ledger.md`，
+> #60 再補入 Evidence Window 的 `V15`–`V20` 與 `O37`，因此實際列數為 145／134／11。
+> 逐項覆蓋狀態見 `docs/test-scenario-ledger.md`，
 > 該對照由 `tests/test_python_scenario_ledger.py` 機械檢查，總數不一致會失敗。
 
 > 本清單的範圍是 collect／verify 這條 observable contract 的 shell 測試。
@@ -124,8 +125,11 @@
 
 ## 5. `tests/test-var-log-collector.sh`（collect-var-log.sh）
 
-以 `collect_var_logs <var_log> <out> <max_bytes> <keep_originals>` 直呼函式；
-全程 `CEPH_INCIDENT_TEST_ALLOW_ATIME_READ=1`。輔助斷言 `assert_before`（檔內行序）。
+以 `collect_var_logs <var_log> <out> <max_bytes> <keep_originals> <window_start_epoch>`
+直呼函式；全程 `CEPH_INCIDENT_TEST_ALLOW_ATIME_READ=1`。輔助斷言 `assert_before`
+（檔內行序）與 `assert_index_field`（INDEX.tsv 指定欄位）。V1–V14 一律傳窗口起點
+`0`（不設限），斷言與加入窗口前完全相同；V15 起用 `set_source_mtime` 釘住固定 mtime
+的 fixture 驗證窗口本身。
 
 | # | 情境描述 | fixture 手法 | 行號 | 分類 |
 |---|---|---|---|---|
@@ -143,6 +147,12 @@
 | V12 | 檔案後段才出現 NUL → 視為 binary，raw 保留、不合併為文字 | 1MiB 文字＋NUL 尾 | 240–252 | 【功能等價-必移植】 |
 | V13 | 第二階段解壓失敗（第一次探測成功、正式解壓失敗）→ 回 2、壓縮原檔保留在 raw、部分解碼位元組**不得**洩入 merged | 假 gzip＋呼叫計數器（第 3 次起 exit 7），`REAL_GZIP`/`GZIP_COUNTER` env | 254–289 | 【功能等價-必移植】 |
 | V14 | 掃描 metadata 本身有上限：超過 → 回 2、`SCAN-LIMIT.txt`、不留 payload | `CEPH_INCIDENT_VAR_LOG_SCAN_MAX_BYTES=5` | 291–305 | 【功能等價-必移植】 |
+| V15 | Evidence Window 邊界：mtime 在窗口內、正好等於窗口起點、以及窗口前最新的那一個都收進 merged；更舊的不收也不進 `raw/`；INDEX 列出被排除者的 mtime 與 `outside-window`，跨界者 detail 標 `window-crossing` | 固定 mtime fixture（`set_source_mtime`） | 322-356 | 【功能等價-必移植】ADR 0012 |
+| V16 | 跨界規則逐 family 獨立：剛輪替過的 family 現行檔與最新輪替檔都收；輪替慢、窗口內無檔的 family 仍保留自己最新的一個，更舊的標 `outside-window`；不留空的 merged 檔或殘留 staging | 兩個不同輪替節奏的 family | 358-401 | 【功能等價-必移植】 |
+| V17 | binary systemd journal 依 machine-id 目錄與 stream（`@` 前綴）分組後套用同一條規則：同一 stream 只跨界一個，其他 stream 與其他 machine-id 各自保留自己的 | `.journal` 檔名＋NUL 內容 | 403-441 | 【功能等價-必移植】 |
+| V18 | mtime 讀不到的來源**照收**並在 INDEX 標 `unknown` 與 `mtime-unknown`，不因窗口被丟掉 | 假 `stat`（`%Y`/`%m` 失敗、size 照常） | 443-470 | 【功能等價-必移植】少收證據比多收更糟 |
+| V19 | 窗口先於位元組上限估算：上限遠低於窗口外的量、遠高於窗口內的量時，收集成功且不產生 `OVER-LIMIT.txt` | 300 KB 的窗口外檔＋`max_bytes=65536` | 472-494 | 【功能等價-必移植】順序契約 |
+| V20 | 窗口起點非數字（如 `24h`）→ 回 1，且不開始收集（不產生 `INDEX.tsv`） | 直接傳 `24h` | 496-508 | 【實作細節-不移植】shell 參數皆為字串故自驗型別；Python seam 的參數是 `int` |
 
 ## 6. `tests/test-rook-collector.sh`（collect-cluster-rook.sh）
 
@@ -257,6 +267,7 @@ cluster/ceph＋nodes/<host>/system）與 `make_bundle_archive`（tar.gz 化）�
 | O34 | `--quiet`：stdout 仍印 `bundle:`，stderr 進度全部靜默 | 同上 | 504-511 | 【功能等價-必移植】 |
 | O35 | 中斷處理（Ctrl-C 契約）：`on_interrupt` → exit 130、announce interrupted、移除 workdir | source lib 後直呼 handler（`CLEANUP_WORKDIR`/`CLEANUP_KEEP`） | 513-535 | 【功能等價-必移植】行為契約；移植時改為對 Python 版 SIGINT handler / cleanup 函式做單元測試 |
 | O36 | `--keep-workdir` 時中斷處理保留 workdir（`CLEANUP_KEEP=1`） | 同上 | 536-550 | 【功能等價-必移植】 |
+| O37 | 收 `/var/log` 時不可解析的 `--since` → 前置檢查 exit 1，訊息指出 `/var/log` 需要的文法；同一個值配 `--skip-logs` 不被擋 | 直接呼叫 | 456-470 | 【功能等價-必移植】fail-closed（ADR 0012） |
 
 ---
 

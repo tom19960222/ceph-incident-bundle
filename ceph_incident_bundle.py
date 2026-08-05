@@ -262,6 +262,17 @@ def _parse_collect_arguments(arguments: Sequence[str]) -> dict[str, object]:
         else:
             values[key] = _positive_integer(raw_value, argument)
         index += 2
+    # `--since` bounds the Evidence Window, and `/var/log` selection needs an
+    # epoch to compare mtimes against, so the strict duration grammar applies
+    # whenever logs are collected. Failing closed here rather than skipping the
+    # window keeps the old defect — a bounded request answered with months of
+    # `/var/log` — from coming back as a silent fallback (ADR 0012).
+    if not values["skip_logs"]:
+        since = str(values["since"])
+        if prometheus_duration_seconds(since) is None:
+            raise CollectUsageError(
+                f"--since must be N/Ns/Nm/Nh/Nd/Nw when collecting /var/log: {since}"
+            )
     if (
         values.get("mode") in ("auto", "rook")
         and values.get("kube_mode") == "remote"

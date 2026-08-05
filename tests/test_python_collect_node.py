@@ -184,6 +184,24 @@ class NodeCollectorFixture:
             *extra_arguments,
         ]
 
+    def var_log_index(self, archive: tarfile.TarFile) -> dict[str, list[str]]:
+        """The /var/log evidence index, keyed by source path.
+
+        Fields: 0 source, 1 family, 2 codec, 3 stored_bytes, 4 decoded_bytes,
+        5 mtime_epoch, 6 disposition, 7 detail.
+        """
+
+        index = archive.extractfile("./nodes/monitor01/logs/var-log/INDEX.tsv")
+        self.assertIsNotNone(index)
+        lines = index.read().decode("utf-8").splitlines()
+        rows = [line.split("\t") for line in lines[1:]]
+        return {row[0]: row for row in rows}
+
+    def stamp(self, path: Path, epoch: int) -> None:
+        """Pin one source's mtime, which is what the Evidence Window reads."""
+
+        os.utime(path, (epoch, epoch))
+
     def var_log_manifest_exit_codes(self, archive: tarfile.TarFile) -> dict[str, int]:
         """Manifest exit codes for the generated /var/log tree, keyed by artifact."""
 
@@ -339,6 +357,216 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
                 )
                 self.assertFalse(
                     any("/logs/var-log/original/" in name for name in archive.getnames())
+                )
+
+    def test_the_evidence_window_bounds_var_log_and_indexes_what_it_left(self) -> None:
+        """`--since` bounds `/var/log`, not just the journal query (ADR 0012).
+
+        The fixture stamps distances from the window start rather than absolute
+        dates, because the window start is `--since` before this node's clock.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            var_log = root / "var-log"
+            now = int(time.time())
+            (var_log / "syslog").write_text("inside the window\n", encoding="utf-8")
+            (var_log / "syslog.1").write_text("just before\n", encoding="utf-8")
+            with gzip.open(var_log / "syslog.2.gz", "wb") as output:
+                output.write(b"a month before\n")
+            self.stamp(var_log / "syslog", now - 3600)
+            self.stamp(var_log / "syslog.1", now - 25 * 3600)
+            self.stamp(var_log / "syslog.2.gz", now - 30 * 86400)
+
+            result = self.run_collect(root, environment)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            bundle = Path(result.stdout.removeprefix("bundle: ").strip())
+            with tarfile.open(bundle, "r:gz") as archive:
+                merged = archive.extractfile(
+                    "./nodes/monitor01/logs/var-log/merged/tree/files/syslog.merged"
+                )
+                self.assertIsNotNone(merged)
+                payload = merged.read()
+                self.assertIn(b"inside the window", payload)
+                # The rotation that crosses the window start comes too: its
+                # mtime is when the rotation happened, not what it spans.
+                self.assertIn(b"just before", payload)
+                self.assertNotIn(b"a month before", payload)
+                self.assertNotIn(
+                    "./nodes/monitor01/logs/var-log/raw/syslog.2.gz",
+                    archive.getnames(),
+                )
+                index = self.var_log_index(archive)
+                self.assertEqual(index["syslog.2.gz"][6], "outside-window")
+                self.assertEqual(
+                    index["syslog.2.gz"][5], str(now - 30 * 86400)
+                )
+                self.assertEqual(
+                    index["syslog.2.gz"][7],
+                    "older than the evidence window start",
+                )
+                self.assertEqual(index["syslog.1"][6], "merge-candidate")
+                self.assertEqual(
+                    index["syslog.1"][7], "oldest-to-newest window-crossing"
+                )
+                self.assertEqual(index["syslog"][5], str(now - 3600))
+                self.assertEqual(index["syslog"][7], "oldest-to-newest")
+
+    def test_the_evidence_window_crosses_its_start_per_family_and_journal_stream(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            var_log = root / "var-log"
+            slow = var_log / "slow"
+            slow.mkdir()
+            machine_a = var_log / "journal" / "1111111111111111111111111111aaaa"
+            machine_b = var_log / "journal" / "2222222222222222222222222222bbbb"
+            machine_a.mkdir(parents=True)
+            machine_b.mkdir(parents=True)
+            now = int(time.time())
+            # A family that rotated moments before the collect: the active file
+            # is nearly empty and the incident is in the newest rotation.
+            (var_log / "fast.log").write_text("post-rotation\n", encoding="utf-8")
+            (var_log / "fast.log.1").write_text(
+                "the incident is in here\n", encoding="utf-8"
+            )
+            self.stamp(var_log / "fast.log", now - 600)
+            self.stamp(var_log / "fast.log.1", now - 25 * 3600)
+            # A family that rotates far more slowly: nothing it has is inside.
+            (slow / "slow.log").write_text("slow current\n", encoding="utf-8")
+            (slow / "slow.log.1").write_text("slow rotation\n", encoding="utf-8")
+            self.stamp(slow / "slow.log", now - 26 * 3600)
+            self.stamp(slow / "slow.log.1", now - 40 * 86400)
+            for name, directory, age in (
+                ("system.journal", machine_a, 3600),
+                ("system@0001.journal", machine_a, 25 * 3600),
+                ("system@0002.journal", machine_a, 30 * 86400),
+                ("user-1000@0001.journal", machine_a, 30 * 86400),
+                ("system@0003.journal", machine_b, 30 * 86400),
+            ):
+                (directory / name).write_bytes(f"{name}\0\n".encode())
+                self.stamp(directory / name, now - age)
+
+            result = self.run_collect(root, environment)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            bundle = Path(result.stdout.removeprefix("bundle: ").strip())
+            with tarfile.open(bundle, "r:gz") as archive:
+                fast = archive.extractfile(
+                    "./nodes/monitor01/logs/var-log/merged/tree/files/fast.log.merged"
+                )
+                self.assertIsNotNone(fast)
+                self.assertIn(b"the incident is in here", fast.read())
+                slow_merged = archive.extractfile(
+                    "./nodes/monitor01/logs/var-log/merged/tree/dirs/slow/"
+                    "files/slow.log.merged"
+                )
+                self.assertIsNotNone(slow_merged)
+                slow_payload = slow_merged.read()
+                # One family's rotation rhythm must not decide another's.
+                self.assertIn(b"slow current", slow_payload)
+                self.assertNotIn(b"slow rotation", slow_payload)
+                names = set(archive.getnames())
+                raw = "./nodes/monitor01/logs/var-log/raw/journal"
+                self.assertIn(
+                    f"{raw}/1111111111111111111111111111aaaa/system.journal", names
+                )
+                self.assertIn(
+                    f"{raw}/1111111111111111111111111111aaaa/system@0001.journal",
+                    names,
+                )
+                self.assertNotIn(
+                    f"{raw}/1111111111111111111111111111aaaa/system@0002.journal",
+                    names,
+                )
+                # A different stream on the same machine, and the same stream on
+                # another machine, each get their own window-crossing file.
+                self.assertIn(
+                    f"{raw}/1111111111111111111111111111aaaa/user-1000@0001.journal",
+                    names,
+                )
+                self.assertIn(
+                    f"{raw}/2222222222222222222222222222bbbb/system@0003.journal",
+                    names,
+                )
+                index = self.var_log_index(archive)
+                self.assertEqual(index["slow/slow.log.1"][6], "outside-window")
+                self.assertEqual(
+                    index["journal/1111111111111111111111111111aaaa/"
+                          "system@0002.journal"][6],
+                    "outside-window",
+                )
+                self.assertEqual(
+                    index["journal/2222222222222222222222222222bbbb/"
+                          "system@0003.journal"][7],
+                    "binary or unknown window-crossing",
+                )
+
+    def test_the_evidence_window_is_applied_before_the_byte_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            var_log = root / "var-log"
+            now = int(time.time())
+            (var_log / "big.log").write_text("current\n", encoding="utf-8")
+            (var_log / "big.log.1").write_text("crossing\n", encoding="utf-8")
+            (var_log / "big.log.2").write_bytes(b"a" * 300_000)
+            (var_log / "big.log.3").write_bytes(b"b" * 300_000)
+            self.stamp(var_log / "big.log", now - 600)
+            self.stamp(var_log / "big.log.1", now - 25 * 3600)
+            self.stamp(var_log / "big.log.2", now - 30 * 86400)
+            self.stamp(var_log / "big.log.3", now - 31 * 86400)
+
+            # The cap is far below the out-of-window bytes and far above what
+            # the window keeps: it can only pass if the window was applied first.
+            result = self.run_collect(
+                root, environment, extra_arguments=("--var-log-max-bytes", "65536")
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            bundle = Path(result.stdout.removeprefix("bundle: ").strip())
+            with tarfile.open(bundle, "r:gz") as archive:
+                self.assertNotIn(
+                    "./nodes/monitor01/logs/var-log/OVER-LIMIT.txt",
+                    archive.getnames(),
+                )
+                merged = archive.extractfile(
+                    "./nodes/monitor01/logs/var-log/merged/tree/files/big.log.merged"
+                )
+                self.assertIsNotNone(merged)
+                self.assertIn(b"crossing", merged.read())
+
+    def test_a_source_the_window_cannot_date_is_collected_and_marked(self) -> None:
+        """Quietly collecting less evidence is worse than collecting more."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            environment, _, _ = self.make_fake_environment(root)
+            undatable = root / "var-log" / "messages"
+            undatable.write_text("undatable evidence\n", encoding="utf-8")
+            # Old enough that the window would drop it if it could read the date.
+            self.stamp(undatable, int(time.time()) - 30 * 86400)
+            environment["CEPH_INCIDENT_TEST_FORCE_SUDO"] = "1"
+            environment["FAKE_STAT_UNDATABLE_PATH"] = str(undatable)
+
+            result = self.run_collect(root, environment)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            bundle = Path(result.stdout.removeprefix("bundle: ").strip())
+            with tarfile.open(bundle, "r:gz") as archive:
+                merged = archive.extractfile(
+                    "./nodes/monitor01/logs/var-log/merged/tree/files/messages.merged"
+                )
+                self.assertIsNotNone(merged)
+                self.assertIn(b"undatable evidence", merged.read())
+                index = self.var_log_index(archive)
+                self.assertEqual(index["messages"][5], "unknown")
+                self.assertEqual(
+                    index["messages"][7], "oldest-to-newest mtime-unknown"
                 )
 
     def test_journal_failure_leaves_complete_log_entries_marked_complete(self) -> None:

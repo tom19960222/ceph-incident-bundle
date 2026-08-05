@@ -1356,6 +1356,11 @@ class PrometheusDisabledTests(PrometheusFixture, unittest.TestCase):
                     "not-a-number",
                     "--since",
                     "yesterday",
+                    # `--since` is no longer a Prometheus-only concern: the
+                    # Evidence Window claims the same grammar whenever
+                    # `/var/log` is collected (ADR 0012), so this scenario has
+                    # to opt out of logs to keep asking its own question.
+                    "--skip-logs",
                 ),
             )
 

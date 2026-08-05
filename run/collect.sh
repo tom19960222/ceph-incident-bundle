@@ -498,6 +498,15 @@ main() {
     die "invalid --kube-context (allowed: A-Za-z0-9._@:/-): $kube_context"
   fi
   [[ "$kube_mode" == "local" || "$kube_mode" == "remote" ]] || die "invalid --kube-mode (local|remote): $kube_mode"
+  # `--since` bounds the Evidence Window, and `/var/log` selection needs an
+  # epoch to compare mtimes against, so the strict duration grammar applies
+  # whenever logs are collected. Failing closed here rather than skipping the
+  # window keeps the old defect — a bounded request answered with months of
+  # `/var/log` — from coming back as a silent fallback (ADR 0012).
+  if [[ $skip_logs -eq 0 ]]; then
+    evidence_window_seconds "$since" >/dev/null \
+      || die "--since must be N/Ns/Nm/Nh/Nd/Nw when collecting /var/log: $since"
+  fi
   if [[ -n "$prom_url" ]]; then
     local num_re='^[0-9]+$' step_re='^[1-9][0-9]*$'
     prom_duration_seconds "$since" >/dev/null \

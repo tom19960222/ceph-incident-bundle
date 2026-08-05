@@ -54,10 +54,10 @@
 | `--mode auto\|cephadm\|rook` | `auto`（run/collect.sh:351） | 其他值 → `die "unsupported mode: ..."`（run/collect.sh:478） |
 | `--kube-context CTX` | 空 | 傳給 rook 層 kubectl 的 `--context`。字元白名單 `A-Za-z0-9._@:/-`，含其他字元 → die（run/collect.sh:486-488） |
 | `--kube-mode remote\|local` | `remote`（run/collect.sh:357） | rook 層 kubectl 執行位置（§7.3）。其他值 → die（run/collect.sh:489） |
-| `--since DURATION` | `24h`（run/collect.sh:351） | log/journal 時間窗。**平常不驗證格式**；只有給了 `--prom-url` 時才要求符合 `N`/`Ns`/`Nm`/`Nh`/`Nd`/`Nw`（run/collect.sh:490-493；lib/collect-prometheus.sh:22-39）。含單引號的值會導致 node 收集失敗（§11.1 shell_quote） |
+| `--since DURATION` | `24h`（run/collect.sh:351） | Evidence Window：journal 查詢與 `/var/log` 選檔共用的時間範圍。收 `/var/log`（未給 `--skip-logs`）或給了 `--prom-url` 時，都要求符合 `N`/`Ns`/`Nm`/`Nh`/`Nd`/`Nw`，否則 die；只有 `--skip-logs` 時才不驗格式（run/collect.sh；lib/common.sh `evidence_window_seconds`）。含單引號的值會導致 node 收集失敗（§11.1 shell_quote） |
 | `--prom-url URL` | 空（= 完全不碰 Prometheus） | Prometheus base URL（§10） |
 | `--prom-job-regex RE` | `ceph\|node`（run/collect.sh:356） | scrape job 過濾（`grep -qiE`，大小寫不敏感） |
-| `--prom-step SECONDS` | 空（自動：`max(15, ceil(window/10000))`，lib/collect-prometheus.sh:43-48） | 須符合 `^[1-9][0-9]*$`，否則 die（run/collect.sh:494） |
+| `--prom-step SECONDS` | 空（自動：`max(15, ceil(window/10000))`，lib/collect-prometheus.sh:33-38） | 須符合 `^[1-9][0-9]*$`，否則 die（run/collect.sh:494） |
 | `--prom-timeout SECONDS` | `600`（run/collect.sh:356） | Prometheus dump 整體時間預算。須為數字（run/collect.sh:495） |
 | `--timeout SECONDS` | `20`（run/collect.sh:351） | 單一指令 / SSH connect timeout。**未做數字驗證** |
 | `--node-timeout SECONDS` | `600`（run/collect.sh:351） | 單台 node 整輪收集的外層 timeout。未做數字驗證 |
@@ -67,7 +67,7 @@
 
 | flag | 預設 | 語意 |
 |---|---|---|
-| `--skip-logs` | off | 傳給 node collector，跳過 `/var/log` 收集，僅寫 `logs/var-log/SKIPPED.txt`（lib/collect-node.sh:429-430） |
+| `--skip-logs` | off | 傳給 node collector，跳過 `/var/log` 收集，僅寫 `logs/var-log/SKIPPED.txt`（lib/collect-node.sh:445-446） |
 | `--keep-original-logs` | off | 合併成功的文字 log 額外在 `original/` 保留來源格式（§12.4） |
 | `--allow-cephadm-shell` | off；**初始值來自環境變數 `CEPH_INCIDENT_ALLOW_CEPHADM_SHELL`**（run/collect.sh:353） | 允許 ceph runner fallback 到 `sudo -n cephadm shell -- ceph`（可能啟動/pull container；§8） |
 | `--allow-kubectl-exec` | off；初始值來自 `CEPH_INCIDENT_ALLOW_KUBECTL_EXEC`（run/collect.sh:354） | 允許 rook toolbox `kubectl exec ... ceph status`（§9） |
@@ -114,14 +114,14 @@
 | `CEPH_INCIDENT_TRUST_SSH_HOST_KEY` | `1` | main export（run/collect.sh:499）；`ssh_base_opts` 讀（lib/common.sh:42） |
 | `CEPH_INCIDENT_KNOWN_HOSTS_FILE` | 無 | main 指向 workdir 暫存 known_hosts（run/collect.sh:528-529）；`ssh_base_opts` 讀（lib/common.sh:44-46） |
 | `CEPH_INCIDENT_QUIET` | 未設 | `--quiet` export（run/collect.sh:460）；`progress` 讀（lib/common.sh:116） |
-| `CEPH_INCIDENT_VAR_LOG_DIR` | `/var/log` | node collector 掃描根目錄覆寫（測試用；lib/collect-node.sh:434） |
+| `CEPH_INCIDENT_VAR_LOG_DIR` | `/var/log` | node collector 掃描根目錄覆寫（測試用；lib/collect-node.sh:450） |
 | `CEPH_INCIDENT_VAR_LIB_CEPH_DIR` | `/var/lib/ceph` | cephadm config 收集根目錄覆寫（lib/collect-node.sh:229） |
 | `CEPH_INCIDENT_TIMESYNCD_CONF` | `/etc/systemd/timesyncd.conf` | timesyncd config 路徑覆寫（lib/collect-node.sh:194） |
 | `CEPH_INCIDENT_TIMESYNCD_CONF_D_DIR` | `/etc/systemd/timesyncd.conf.d` | 同上（lib/collect-node.sh:195） |
-| `CEPH_INCIDENT_VAR_LOG_SCAN_MAX_BYTES` | `67108864`（64 MiB） | find 路徑清單 staging 上限（lib/collect-var-log.sh:314） |
-| `CEPH_INCIDENT_VAR_LOG_MAX_ENTRIES` | `100000` | 掃描檔案數上限（lib/collect-var-log.sh:315） |
-| `CEPH_INCIDENT_VAR_LOG_FREE_RESERVE_BYTES` | `1073741824`（1 GiB） | 遠端輸出目錄需保留的最小剩餘空間（lib/collect-var-log.sh:317） |
-| `CEPH_INCIDENT_TEST_ALLOW_ATIME_READ` | `0` | 測試 escape hatch：允許用 `cat` 讀（略過 dd noatime；lib/collect-var-log.sh:41-44、lib/collect-node.sh:155-158、lib/collect-var-log.sh:60） |
+| `CEPH_INCIDENT_VAR_LOG_SCAN_MAX_BYTES` | `67108864`（64 MiB） | find 路徑清單 staging 上限（lib/collect-var-log.sh:400） |
+| `CEPH_INCIDENT_VAR_LOG_MAX_ENTRIES` | `100000` | 掃描檔案數上限（lib/collect-var-log.sh:401） |
+| `CEPH_INCIDENT_VAR_LOG_FREE_RESERVE_BYTES` | `1073741824`（1 GiB） | 遠端輸出目錄需保留的最小剩餘空間（lib/collect-var-log.sh:403） |
+| `CEPH_INCIDENT_TEST_ALLOW_ATIME_READ` | `0` | 測試 escape hatch：允許用 `cat` 讀（略過 dd noatime；lib/collect-var-log.sh:47-50、lib/collect-node.sh:155-158、lib/collect-var-log.sh:66） |
 | `COLLECT_TEST_ABORT_AFTER_NODES` | 未設 | 測試 hook：node 收完後強制 die（run/collect.sh:622-625） |
 | `COMMAND_TIMEOUT` | `20` | `run_capture` 的單指令 timeout（呼叫端逐次設定；lib/common.sh:389） |
 | `ERROR_LOG` | 無 | `run_capture`/probe 失敗時追加的 errors.log 路徑（lib/common.sh:414-418） |
@@ -370,14 +370,15 @@ kubectl 前綴（:146-153）：有 `--ssh-target` → `ssh <base_opts> <target> 
    - 缺 `manifest.jsonl` → 保留既有 incomplete SKIPPED 語意；空、損壞、不安全或超限 archive → 建立只有 `SKIPPED: no usable node archive returned ...` 的 node directory。Rejected archive 的 member 不會寫入 extraction root 或其外部。
    - 刪除候選 tar；return remote rc（node collector 自己的 2 仍會保留已驗收 evidence，只計入 node_failed）。
 
-### 11.2 node collector（`collect_node_main`，lib/collect-node.sh:273-493）
+### 11.2 node collector（`collect_node_main`，lib/collect-node.sh:273-510）
 
-參數：`--out --host-alias --since(24h) --timeout(20) --skip-logs --keep-original-logs --var-log-max-bytes(10 GiB|unlimited)`。out/host-alias 必填；var-log-max-bytes 格式錯 → return 1。
+參數：`--out --host-alias --since(24h) --timeout(20) --skip-logs --keep-original-logs --var-log-max-bytes(10 GiB|unlimited)`。out/host-alias 必填；var-log-max-bytes 格式錯 → return 1。收 `/var/log` 時 `--since` 必須可解析為 duration（`N[smhdw]?`），否則印出正確文法並 return 1。
 
 輔助行為：
 
 - `journal_since_arg`：`N[smhdw]` 格式 → 前面加 `-`（`24h` → `-24h`）；否則原樣傳給 `journalctl --since`（:124-131）。
-- `heavy_timeout = max(--timeout, 120)`，用於 dmesg / journal 類重指令（:335-338）。
+- Evidence Window 起點：`--skip-logs` 時為 `0`（不設限），否則 = node 自己的 `date -u +%s` 減去 `evidence_window_seconds --since`（下限 1）。在 node 上算，因為它要跟這台的檔案 mtime 比較。
+- `heavy_timeout = max(--timeout, 120)`，用於 dmesg / journal 類重指令（:351-354）。
 - `node_run_capture`（:26-36）：`run_capture` 包裝，失敗 return 2。
 - `node_run_optional`（:38-48）：指令不存在 → artifact 位置寫 `SKIPPED: command not found: <cmd>`、return 0；**指令存在但失敗也 return 0**（`|| return 0`，:47）——optional 指令失敗只留在 manifest/errors.log，不影響 node 成敗。
 - `node_run_privileged`（:50-65）：root 直接跑；非 root 有 sudo → `sudo -n <cmd>`；無 sudo → artifact 寫 `SKIPPED: sudo command not found for privileged read: <cmd>`、return 0。
@@ -385,7 +386,7 @@ kubectl 前綴（:146-153）：有 `--ssh-target` → `ssh <base_opts> <target> 
 
 收集清單（依序）：
 
-**basic（`node_run_capture`，失敗算 node partial）**（:340-360）
+**basic（`node_run_capture`，失敗算 node partial）**（:356-376）
 | artifact | 指令 |
 |---|---|
 | `system/hostname.txt` | `hostname` |
@@ -400,12 +401,12 @@ kubectl 前綴（:146-153）：有 `--ssh-target` → `ssh <base_opts> <target> 
 | artifact | 指令 | 備註 |
 |---|---|---|
 | `storage/lsblk.txt` | `lsblk -a -o NAME,MAJ:MIN,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,SERIAL` | :362 |
-| `kernel/dmesg.txt` | `dmesg -T` | heavy timeout；:365 |
-| `time/systemd-timesyncd-journal.txt` | `journalctl --since <since> -u systemd-timesyncd --no-pager` | `\|\| true`（永不算失敗）；:396 |
-| `cephadm/cephadm-ls.json` | `cephadm ls --format json-pretty` | 只在 cephadm 指令存在時跑且 `\|\| true`；不存在 → SKIPPED `command not found: cephadm`（:416-420） |
+| `kernel/dmesg.txt` | `dmesg -T` | heavy timeout；:381 |
+| `time/systemd-timesyncd-journal.txt` | `journalctl --since <since> -u systemd-timesyncd --no-pager` | `\|\| true`（永不算失敗）；:412 |
+| `cephadm/cephadm-ls.json` | `cephadm ls --format json-pretty` | 只在 cephadm 指令存在時跑且 `\|\| true`；不存在 → SKIPPED `command not found: cephadm`（:432-436） |
 | `cephadm/var-lib-ceph-listing.txt` | `find /var/lib/ceph -maxdepth 3`（prune `*keyring*`/`*private_key*`/`*/.ssh/*`，輸出 `type path` 行） | 目錄不存在 → SKIPPED、return 0；:227-257 |
 
-**optional（`node_run_optional`，失敗不算 partial）**（:368-414）
+**optional（`node_run_optional`，失敗不算 partial）**（:384-430）
 | artifact | 指令 |
 |---|---|
 | `systemd/journal-ceph.txt` | `sudo -n journalctl --since <since> -u 'ceph*' --no-pager`（heavy timeout；**存在性檢查檢查的是 `sudo`**，見 §17） |
@@ -428,9 +429,9 @@ kubectl 前綴（:146-153）：有 `--ssh-target` → `ssh <base_opts> <target> 
 - `time/systemd-timesyncd-config/timesyncd.conf` 與 `timesyncd.conf.d/*.conf`（maxdepth 1）；一個都沒複製到 → 該目錄下 `SKIPPED.txt`（:192-225）。
 - `cephadm/var-lib-ceph-configs/<相對路徑>` ← `/var/lib/ceph` maxdepth 4 內的 `ceph.conf`/`*.conf`/`config`/`*.config`（同樣 prune keyring/private_key/.ssh；:259-268）。
 
-**/var/log 與 journal**（:429-487）
+**/var/log 與 journal**（:445-503）
 - `--skip-logs` → 只寫 `logs/var-log/SKIPPED.txt`：`log collection disabled by --skip-logs`。
-- 否則跑 `collect_var_logs <root> <out>/logs/var-log <max_bytes> <keep_originals>`（§12）；非 0 算 partial。
+- 否則跑 `collect_var_logs <root> <out>/logs/var-log <max_bytes> <keep_originals> <window_start_epoch>`（§12）；非 0 算 partial。
 - journal 全文（`journalctl --since <since> --no-pager` → `logs/var-log/journal-all-since.txt`）：
   - `unlimited`：直接 privileged 收（heavy timeout）。
   - 已有 `OVER-LIMIT.txt` → journal 改寫 SKIPPED（`not collected because /var/log payload exceeded the per-node cap`）、partial。
@@ -441,31 +442,47 @@ kubectl 前綴（:146-153）：有 `--ssh-target` → `ssh <base_opts> <target> 
 
 ---
 
-## 12. /var/log collector（`collect_var_logs ROOT OUT MAX_BYTES KEEP_ORIGINALS`，lib/collect-var-log.sh:300-672）
+## 12. /var/log collector（`collect_var_logs ROOT OUT MAX_BYTES KEEP_ORIGINALS WINDOW_START_EPOCH`，lib/collect-var-log.sh）
 
-原則：只讀不寫 ROOT；讀取一律 `dd iflag=noatime,nofollow`（必要時 `sudo -n`；無法 no-atime read → 該檔 read-failed，**不退回一般 cat**；:35-56）。回傳 0=完整、2=partial 或 not-collected、1=參數錯誤。
+原則：只讀不寫 ROOT；讀取一律 `dd iflag=noatime,nofollow`（必要時 `sudo -n`；無法 no-atime read → 該檔 read-failed，**不退回一般 cat**；:41-62）。回傳 0=完整、2=partial 或 not-collected、1=參數錯誤。
+
+`WINDOW_START_EPOCH` 是 Evidence Window 起點的絕對 epoch 秒數，`0` = 不設限（所有真實 mtime 都大於 0）；非數字 → return 1。傳絕對 epoch 而非 duration，是為了讓收到什麼不取決於「執行當下」，並讓兩個實作都能用固定 mtime 的 fixture 釘住（ADR 0012）。
 
 ### 12.1 前置與掃描
 
-1. ROOT 不是目錄 → `OUT/SKIPPED.txt`、return 0（:328-331）。
-2. 寫 `INDEX.tsv` header：`source family codec stored_bytes decoded_bytes disposition detail`（tab 分隔；:334）。
-3. 剩餘空間檢查（`df -Pk OUT`）：可用 < `reserve(1GiB) + scan_limit(64MiB)` → `INSUFFICIENT-SPACE.txt`（available/reserve/scan_staging/status=not-collected）、return 2（:340-350）。
-4. `find ROOT -type f -print0`（root/sudo；:58-67），輸出經 `head -c scan_limit+1` staging；超過 → `SCAN-LIMIT.txt`（`status=not-collected-metadata-limit`）、return 2；find 自身失敗 → partial + `ERRORS.tsv` 記 scan 錯誤（:352-370）。
-5. 逐檔處理超過 `entry_limit`（100000）→ 刪除所有輸出、`SCAN-LIMIT.txt`（max_entries）、return 2（:372-377、475-481）。
+1. ROOT 不是目錄 → `OUT/SKIPPED.txt`、return 0（:417-420）。
+2. 寫 `INDEX.tsv` header：`source family codec stored_bytes decoded_bytes mtime_epoch disposition detail`（tab 分隔）。`mtime_epoch` 是來源 mtime 的秒數，讀不到時為 `unknown`。
+3. 剩餘空間檢查（`df -Pk OUT`）：可用 < `reserve(1GiB) + scan_limit(64MiB)` → `INSUFFICIENT-SPACE.txt`（available/reserve/scan_staging/status=not-collected）、return 2（:429-439）。
+4. `find ROOT -type f -print0`（root/sudo；:64-73），輸出經 `head -c scan_limit+1` staging；超過 → `SCAN-LIMIT.txt`（`status=not-collected-metadata-limit`）、return 2；find 自身失敗 → partial + `ERRORS.tsv` 記 scan 錯誤（:441-459）。
+5. metadata pass 掃描超過 `entry_limit`（100000）→ 在讀任何內容之前 `SCAN-LIMIT.txt`（max_entries）、return 2。
 
-### 12.2 逐檔分類（:372-472），每檔一行寫進 INDEX.tsv
+### 12.1a Evidence Window 選檔（在讀任何內容、也在位元組上限估算之前）
+
+`WINDOW_START_EPOCH` 為 0 時整段跳過，逐檔行為與沒有窗口時完全相同。否則：
+
+1. metadata pass 先對每個掃到的來源取 size 與 mtime（不讀內容）。
+2. 每個來源歸一個 window group：`.journal`／`.journal~` 依「目錄 + `@` 前的 stream 名」分組（machine-id 目錄 + `system`／`user-1000`），其餘沿用 §12.3 的 merge family。sensitive path 不參與分組（它在任何窗口下都不會被收，佔用跨界名額會排掉真的證據）。
+3. 每組內：mtime ≥ 窗口起點者全收；mtime < 窗口起點者只保留最新的一個（同 mtime 時取 source 名較小者，兩個實作一致），其餘 disposition `outside-window`、detail `older than the evidence window start`，仍然列在 INDEX 裡且不讀內容、不計入估算。
+4. 跨界那一個檔的 detail 後綴 ` window-crossing`；mtime 讀不到的來源**照收**，detail 後綴 ` mtime-unknown`（安靜地少收證據比多收更糟）。
+
+輪替檔的 mtime 是輪替發生的時刻而非內容範圍，所以跨界規則是正確性所必需，實際涵蓋必然寬於 `--since`（ADR 0012）。
+
+### 12.2 逐檔分類，每檔一行寫進 INDEX.tsv
 
 依序判定（先中先贏）：
 
-1. **sensitive path**（大小寫不敏感；含 `keyring`、`.ssh`、`id_ed25519`、`private_key`，或副檔名 `.pem`/`.key`/`.crt`/`.pfx`/`.p12`（含 `.pem.*` 等變體））→ 記進 `SKIPPED-sensitive.txt`，INDEX disposition `skipped-sensitive`，完全不讀內容（:92-106、382-387）。
-2. 之前已有檔案觸發 over-limit → disposition `not-inspected`（:389-392）。
-3. **opaque archive**（`.zip`、`.tar`、`.tgz`、`.tbz`、`.tbz2`、`.txz`、`.tzst`、`.tar.{gz,xz,bz2,zst}`）→ raw 保留候選，記 `UNREDACTED-OPAQUE.txt`，disposition `raw`（detail `not auto-merged`）（:108-121、395-404）。
-4. codec 由副檔名判定（`.gz`/`.xz`/`.bz2`/`.zst`/其他=plain；:123-135）；壓縮 codec 對應工具（gzip/xz/bzip2/zstd）不存在 → raw 保留、`ERRORS.tsv` 記 `missing-codec:<tool>`、disposition `raw-partial`、partial（:406-417）。
-5. 量測解壓後大小（有上限時經 `head -c max+1` bounded；:255-275）。超上限 → 設全域 over_limit、disposition `over-limit`；量測失敗 → raw 保留、`decode-failed`、partial。
-6. **文字判定**：整條 stream 解壓後檢查是否含 NUL byte（用 FIFO 同時算 total 與去 NUL bytes，兩者相等即文字；任何管線環節失敗算非文字；:179-208）。非文字 → raw 保留、記 UNREDACTED-OPAQUE、disposition `raw`（`binary or unknown`）。
-7. 文字 → merge candidate，disposition `merge-candidate`（detail `oldest-to-newest`）。預估輸出 += 解壓大小 + 256（header 預留）；keep_originals 時再 += 原始大小。
+1. **sensitive path**（大小寫不敏感；含 `keyring`、`.ssh`、`id_ed25519`、`private_key`，或副檔名 `.pem`/`.key`/`.crt`/`.pfx`/`.p12`（含 `.pem.*` 等變體））→ 記進 `SKIPPED-sensitive.txt`，INDEX disposition `skipped-sensitive`，完全不讀內容（:98-112）。
+2. **窗口排除** → disposition `outside-window`（§12.1a）。
+3. 之前已有檔案觸發 over-limit → disposition `not-inspected`。
+4. **opaque archive**（`.zip`、`.tar`、`.tgz`、`.tbz`、`.tbz2`、`.txz`、`.tzst`、`.tar.{gz,xz,bz2,zst}`）→ raw 保留候選，記 `UNREDACTED-OPAQUE.txt`，disposition `raw`（detail `not auto-merged`）（:114-127）。
+5. codec 由副檔名判定（`.gz`/`.xz`/`.bz2`/`.zst`/其他=plain；:129-141）；壓縮 codec 對應工具（gzip/xz/bzip2/zstd）不存在 → raw 保留、`ERRORS.tsv` 記 `missing-codec:<tool>`、disposition `raw-partial`、partial。
+6. 量測解壓後大小（有上限時經 `head -c max+1` bounded）。超上限 → 設全域 over_limit、disposition `over-limit`；量測失敗 → raw 保留、`decode-failed`、partial。
+7. **文字判定**：整條 stream 解壓後檢查是否含 NUL byte（用 FIFO 同時算 total 與去 NUL bytes，兩者相等即文字；任何管線環節失敗算非文字）。非文字 → raw 保留、記 UNREDACTED-OPAQUE、disposition `raw`（`binary or unknown`）。
+8. 文字 → merge candidate，disposition `merge-candidate`（detail `oldest-to-newest`）。預估輸出 += 解壓大小 + 256（header 預留）；keep_originals 時再 += 原始大小。
 
-### 12.3 family 與排序（:137-177）
+被窗口保留但跨界／mtime 未知的來源，其 detail 依 §12.1a 加上後綴。
+
+### 12.3 family 與排序（:143-183）
 
 去掉壓縮副檔名後的檔名 stem 依 pattern 分 family 與排序鍵（同目錄同 family 合併）：
 
@@ -473,20 +490,20 @@ kubectl 前綴（:146-153）：有 `--ssh-target` → `ssh <base_opts> <target> 
 - `stem-YYYYMMDD` 或 `stem-YYYY-MM-DD` → family=stem，key = `"0"+日期數字`（日期舊的在前）。
 - 其他（active 檔）→ key = `900000000000`（排最後 = 最新）。
 
-排序：`LC_ALL=C sort -k1,1n(gid) -k2,2(key 字串) -k3,3n(掃描序)`（:541）。
+排序：`LC_ALL=C sort -k1,1n(gid) -k2,2(key 字串) -k3,3n(掃描序)`（:677）。
 
 ### 12.4 輸出
 
-- 預估總量 > max 或任何檔 over-limit → 刪 merged/original/raw、寫 `OVER-LIMIT.txt`（estimated_output_bytes/max_bytes/status=not-collected）、return 2（:483-489）。
-- 第二次剩餘空間檢查（估計輸出 + reserve）→ `INSUFFICIENT-SPACE.txt`、return 2（:491-501）。
-- raw 檔逐一 bounded copy 到 `OUT/raw/<相對路徑>`（共享剩餘 budget；超硬上限 → hard_cap_hit；讀失敗 → `read-failed` 記 ERRORS.tsv；:503-520）。
-- 合併：每個 family 寫到 collision-free tree `OUT/merged/tree[/dirs/<dir>...]/files/<family>.merged`（目錄層放 `dirs/`、檔案層放 `files/`，避免 `foo.1` 與 `foo.merged/bar` 相撞；:210-219、551-554）。每個來源段落前有 header 行：`===== source=<rel> mtime_epoch=<m> stored_bytes=<s> codec=<c> =====`，段落後補一個換行（:556-605）。所有寫入計入 budget；超過 → hard cap。
-- 合併中單一來源讀失敗 → 以 truncate 回滾該段落、記 `merge-read-failed`、改存 raw、partial（:583-604）。
-- 合併後重新 stat 來源，大小或 mtime 改變：plain active 檔（key=900000000000）→ 只記 `WARNINGS.tsv` `active-log-changed-during-collection`；其他 → `changed-during-collection` 記 ERRORS.tsv、partial（:607-617）。
-- keep_originals=1 → 來源 bounded copy 到 `OUT/original/<rel>`（:618-634）。
-- hard cap 命中 → 刪 merged/raw/original、`OVER-LIMIT.txt`（`status=discarded-after-streaming-hard-cap`）、return 2（:641-647）。
-- 最終實測 merged+raw+original 總 bytes；仍超限 → 全刪、`OVER-LIMIT.txt`（`status=discarded-after-hard-cap`）、return 2；否則寫進 `PAYLOAD-BYTES.txt`（:649-663）。
-- 空的 `ERRORS.tsv`/`WARNINGS.tsv`/`UNREDACTED-OPAQUE.txt`/`SKIPPED-sensitive.txt` 刪除（:666-669）。partial → return 2。
+- 預估總量 > max 或任何檔 over-limit → 刪 merged/original/raw、寫 `OVER-LIMIT.txt`（estimated_output_bytes/max_bytes/status=not-collected）、return 2（:619-625）。
+- 第二次剩餘空間檢查（估計輸出 + reserve）→ `INSUFFICIENT-SPACE.txt`、return 2（:627-637）。
+- raw 檔逐一 bounded copy 到 `OUT/raw/<相對路徑>`（共享剩餘 budget；超硬上限 → hard_cap_hit；讀失敗 → `read-failed` 記 ERRORS.tsv；:639-656）。
+- 合併：每個 family 寫到 collision-free tree `OUT/merged/tree[/dirs/<dir>...]/files/<family>.merged`（目錄層放 `dirs/`、檔案層放 `files/`，避免 `foo.1` 與 `foo.merged/bar` 相撞；:294-303、551-554）。每個來源段落前有 header 行：`===== source=<rel> mtime_epoch=<m> stored_bytes=<s> codec=<c> =====`，段落後補一個換行（:692-741）。所有寫入計入 budget；超過 → hard cap。
+- 合併中單一來源讀失敗 → 以 truncate 回滾該段落、記 `merge-read-failed`、改存 raw、partial（:719-740）。
+- 合併後重新 stat 來源，大小或 mtime 改變：plain active 檔（key=900000000000）→ 只記 `WARNINGS.tsv` `active-log-changed-during-collection`；其他 → `changed-during-collection` 記 ERRORS.tsv、partial（:743-753）。
+- keep_originals=1 → 來源 bounded copy 到 `OUT/original/<rel>`（:754-770）。
+- hard cap 命中 → 刪 merged/raw/original、`OVER-LIMIT.txt`（`status=discarded-after-streaming-hard-cap`）、return 2（:777-783）。
+- 最終實測 merged+raw+original 總 bytes；仍超限 → 全刪、`OVER-LIMIT.txt`（`status=discarded-after-hard-cap`）、return 2；否則寫進 `PAYLOAD-BYTES.txt`（:785-799）。
+- 空的 `ERRORS.tsv`/`WARNINGS.tsv`/`UNREDACTED-OPAQUE.txt`/`SKIPPED-sensitive.txt` 刪除（:801-804）。partial → return 2。
 
 ### 12.5 工作機側 post-redaction cap（`enforce_node_log_caps`，lib/bundle.sh:255-288）
 
@@ -556,22 +573,22 @@ NUL 是兩種引擎唯一被允許分歧的位元組，**上一段那條規則�
 
 ---
 
-## 15. Prometheus collector（lib/collect-prometheus.sh:1-356）
+## 15. Prometheus collector（lib/collect-prometheus.sh:1-346）
 
-前置：URL 去尾端 `/`；`--since` 須可解析為秒（`N[smhdw]?`，0 拒絕）否則 return 1；工作機須有 `curl` 與 `python3`，缺 → `cluster/prometheus/SKIPPED.txt`（`<cmd> not found on this workstation`）+ errors.log、return 2（:167-188）。時間窗 = `[now-window, now]`（epoch）；step 未給 → `max(15, ceil(window/10000))`；預算 deadline = `SECONDS + budget`。
+前置：URL 去尾端 `/`；`--since` 須可解析為秒（`N[smhdw]?`，0 拒絕）否則 return 1；工作機須有 `curl` 與 `python3`，缺 → `cluster/prometheus/SKIPPED.txt`（`<cmd> not found on this workstation`）+ errors.log、return 2（:157-178）。時間窗 = `[now-window, now]`（epoch）；step 未給 → `max(15, ceil(window/10000))`；預算 deadline = `SECONDS + budget`。
 
-URL 中 `user:pass@` 在寫入任何 artifact/錯誤訊息前遮蔽為 `user:***@`，外部 curl 診斷也會先替換完整 raw base（:50-81）。curl 統一 `curl -q -fsS -G --connect-timeout T --max-time T -o FILE`，其中置首的 `-q` 禁止工作機 `.curlrc` 改寫 GET-only command surface，額外參數走 `--data-urlencode`（:101-117）。原始 JSON 直接由 curl 寫檔（**不經 run_capture**，避免 header 汙染 JSON），manifest 由本 collector 自行 `manifest_add`（host=`prometheus`，command 記 `GET <masked-url>/...`）。
+URL 中 `user:pass@` 在寫入任何 artifact/錯誤訊息前遮蔽為 `user:***@`，外部 curl 診斷也會先替換完整 raw base（:40-71）。curl 統一 `curl -q -fsS -G --connect-timeout T --max-time T -o FILE`，其中置首的 `-q` 禁止工作機 `.curlrc` 改寫 GET-only command surface，額外參數走 `--data-urlencode`（:91-107）。原始 JSON 直接由 curl 寫檔（**不經 run_capture**，避免 header 汙染 JSON），manifest 由本 collector 自行 `manifest_add`（host=`prometheus`，command 記 `GET <masked-url>/...`）。
 
 流程：
 
-1. `GET /api/v1/status/buildinfo` → `buildinfo.json`；失敗（兼作連通性探測）→ 刪檔、SKIPPED（`prometheus not reachable: <masked> (curl exit N: detail)`）、return 2（:195-205）。
-2. `GET /api/v1/targets` → `targets.json`；失敗只記 errors.log + failed=1（照樣繼續）（:207-216）。
-3. `GET /api/v1/label/job/values` 列 scrape jobs；失敗或 JSON 非 `status=success` → SKIPPED（`prometheus job listing failed ...`）、return 2。job 名過 `grep -qiE <job_regex>` 過濾；名字含 `"` 或 `\` → 記 `prometheus job skipped (unsafe name)`、failed=1、跳過；沒半個 match → SKIPPED（`no scrape job matched regex '<re>' (jobs seen: ...)`）、return 2（:218-253）。
+1. `GET /api/v1/status/buildinfo` → `buildinfo.json`；失敗（兼作連通性探測）→ 刪檔、SKIPPED（`prometheus not reachable: <masked> (curl exit N: detail)`）、return 2（:185-195）。
+2. `GET /api/v1/targets` → `targets.json`；失敗只記 errors.log + failed=1（照樣繼續）（:197-206）。
+3. `GET /api/v1/label/job/values` 列 scrape jobs；失敗或 JSON 非 `status=success` → SKIPPED（`prometheus job listing failed ...`）、return 2。job 名過 `grep -qiE <job_regex>` 過濾；名字含 `"` 或 `\` → 記 `prometheus job skipped (unsafe name)`、failed=1、跳過；沒半個 match → SKIPPED（`no scrape job matched regex '<re>' (jobs seen: ...)`）、return 2（:208-243）。
 4. 每個 matched job（目錄名 = safe 化 job 名）：
-   - `GET /api/v1/label/__name__/values match[]={job="<job>"} start end` 列 metrics；失敗 → job 的 `index.txt` 記 `FAILED: metric listing for job <job>`、manifest exit 2、跳下一個 job（:270-283）。
-   - 每個 metric：超過預算 → `index.txt` 記 `TRUNCATED: budget <s>s exceeded`、整個 dump 停止（:288-297）；metric 名不符 `^[a-zA-Z_:][a-zA-Z0-9_:]*$` → `skipped <m> unsafe-name`（:298-304）；否則 `GET /api/v1/query_range query={__name__="<m>",job="<j>"} start end step` 存 `<jobdir>/<metric（: 換成 __）>.json`，成功判定 = curl 0 且檔案前 512 bytes 含 `"status":"success"`；成功 → `gzip -f` 成 `.json.gz`、index 記 `ok <m> <file>.gz`；失敗 → 刪檔、index 記 `failed <m> -`（:305-321）。
+   - `GET /api/v1/label/__name__/values match[]={job="<job>"} start end` 列 metrics；失敗 → job 的 `index.txt` 記 `FAILED: metric listing for job <job>`、manifest exit 2、跳下一個 job（:260-273）。
+   - 每個 metric：超過預算 → `index.txt` 記 `TRUNCATED: budget <s>s exceeded`、整個 dump 停止（:278-287）；metric 名不符 `^[a-zA-Z_:][a-zA-Z0-9_:]*$` → `skipped <m> unsafe-name`（:288-294）；否則 `GET /api/v1/query_range query={__name__="<m>",job="<j>"} start end step` 存 `<jobdir>/<metric（: 換成 __）>.json`，成功判定 = curl 0 且檔案前 512 bytes 含 `"status":"success"`；成功 → `gzip -f` 成 `.json.gz`、index 記 `ok <m> <file>.gz`；失敗 → 刪檔、index 記 `failed <m> -`（:295-311）。
    - 每個 job 的 index.txt 也 manifest_add 一筆（帶 job_rc）。
-5. 寫 `dump-info.txt`（url/since/window start・end epoch+UTC/step_seconds/job_regex/jobs_seen/jobs_matched/metrics_ok/metrics_failed/truncated；:329-343），並 append `prom_url=`、`prom_jobs=` 到 `environment.txt`（:345-348）。
+5. 寫 `dump-info.txt`（url/since/window start・end epoch+UTC/step_seconds/job_regex/jobs_seen/jobs_matched/metrics_ok/metrics_failed/truncated；:319-333），並 append `prom_url=`、`prom_jobs=` 到 `environment.txt`（:335-338）。
 6. 有任何 failed → return 2，否則 0。
 
 ---
@@ -659,7 +676,7 @@ ceph-incident-<UTC timestamp>.tar.gz
 2. **auto 模式下給了打不通的 `--seed` 不會 fallback**：seed 釘住 ceph_source 後探測迴圈不再找其他 ceph 候選（run/collect.sh:174-177、184）。
 3. **`rook_done` 看 `pods-wide.txt` 是否存在**，不是 collector 回傳值（run/collect.sh:232-234）。
 4. **`node_run_optional` 吞掉失敗**（`|| return 0`，lib/collect-node.sh:47）：optional 指令失敗不影響 node exit code，只留 manifest/errors 紀錄。
-5. **`systemd/journal-ceph.txt` 的存在性檢查檢查的是 `sudo`**（`node_run_optional … sudo -n journalctl …`，command_name=`sudo`；lib/collect-node.sh:368）——node 是 root 且沒裝 sudo 時會被 SKIP，而不是直接跑 journalctl。
+5. **`systemd/journal-ceph.txt` 的存在性檢查檢查的是 `sudo`**（`node_run_optional … sudo -n journalctl …`，command_name=`sudo`；lib/collect-node.sh:384）——node 是 root 且沒裝 sudo 時會被 SKIP，而不是直接跑 journalctl。
 6. **exit 75 有兩個不同語意**：遠端 mktemp 失敗（run/collect.sh:280，ssh exit 75）與 journal 超過剩餘 cap（manifest 內 exit_code 75；lib/collect-node.sh:105）。另有遠端 tar/gzip 串流失敗 = exit 74（run/collect.sh:287）。
 7. **node tar 解開後若無 `manifest.jsonl` 視為截斷失敗**（run/collect.sh:324-330）。
 8. **known_hosts 是「暫存檔 + 使用者檔」兩個路徑塞進同一個 UserKnownHostsFile 選項**，暫存檔於打包前刪除（lib/common.sh:44-46；run/collect.sh:528、639）。
@@ -667,18 +684,18 @@ ceph-incident-<UTC timestamp>.tar.gz
 10. **redaction 排除清單**：prometheus per-metric `.json.gz` 與 var-log `raw/`；壓縮檔解壓失敗「原樣保留且不算錯」，重壓失敗才算錯（§13）。
 11. **verify 跑兩次**（workdir 一次、tar.gz 一次）；失敗 → 保留 workdir、刪 tar、summary.txt 以 final_status=1 **重寫**、exit 1（run/collect.sh:643-676）。
 12. **`--var-log-max-bytes` 在 redaction 後於工作機再驗一次**，可能把已收到的 node log 整批刪掉（§12.5）。
-13. **`--since` 只有配 `--prom-url` 才驗格式**；journalctl 收到的是 `N[smhdw]` 加 `-` 前綴的變形；`/var/log` 檔案完全不受 `--since` 影響；cluster ceph 指令忽略 `since`（§2.2、§9、§11.2）。
-14. **dmesg/journal 的 timeout 下限 120s**（heavy_timeout；lib/collect-node.sh:335-338）。
+13. **`--since` 是 Evidence Window**：收 `/var/log` 或用 `--prom-url` 時都驗格式（`N[smhdw]?`），不合則 fail-closed；journalctl 收到的是 `N[smhdw]` 加 `-` 前綴的變形；`/var/log` 以檔案 mtime 遵守同一個窗口，並額外保留每個 family 跨越窗口起點的那一個最新檔，所以實際涵蓋一定寬於 `--since`；cluster ceph 指令忽略 `since`（§2.2、§9、§11.2、§12）。
+14. **dmesg/journal 的 timeout 下限 120s**（heavy_timeout；lib/collect-node.sh:351-354）。
 15. **crash info 只取前 10 筆**，crash JSON 解析失敗只寫 skip 檔不算失敗（§9.3）。
 16. **工作機沒有 timeout/gtimeout 時所有外層逾時靜默停用**（只印一次警告；run/collect.sh:519-521）。
 17. **`--quiet` 是靠環境變數傳遞**（`CEPH_INCIDENT_QUIET=1` export 給所有子層；run/collect.sh:460）。
 18. **`--allow-cephadm-shell`/`--allow-kubectl-exec` 的預設值來自環境變數**，flag 與 env 雙向（run/collect.sh:353-354、481-482）。
 19. **malformed HOSTS entry 不中止**（記 errors.log + rc=2 繼續）；但 `HOSTS` 全空是 die（§5.3）。
 20. **含單引號的 alias/since/timeout 值會讓該 node 收集直接失敗**（shell_quote；lib/bundle.sh:81-85）。
-21. **active log 在收集期間變動只是 warning，rotated 檔變動是 partial error**（lib/collect-var-log.sh:607-617）。
+21. **active log 在收集期間變動只是 warning，rotated 檔變動是 partial error**（lib/collect-var-log.sh:743-753）。
 22. **`write_skip_artifact_once` 語意**：collector 寫過的具體 SKIPPED 原因不可被 orchestrator 的通用原因覆蓋（lib/common.sh:106-110）。
 23. **stdout 純度**：除 `--help` 與最後的 `bundle:` 行外，stdout 不得有任何輸出；所有 artifact 檔頭有 `# host/# collector/# started/# timeout` 註解行、stdout+stderr 合流。
 24. **INT/TERM 必須立刻停止整輪收集並 exit 130**（不是只清理然後繼續下一台；lib/bundle.sh:220-225）。
-25. **macOS 相容細節**：bsdtar 需 `--no-xattrs` + `COPYFILE_DISABLE=1`；`stat -c`/`stat -f`、`date -r`/`date -d` 雙形式 fallback 散佈各處（run/collect.sh:300-308；lib/collect-var-log.sh:21-33；lib/collect-prometheus.sh:76-78）。
+25. **macOS 相容細節**：bsdtar 需 `--no-xattrs` + `COPYFILE_DISABLE=1`；`stat -c`/`stat -f`、`date -r`/`date -d` 雙形式 fallback 散佈各處（run/collect.sh:300-308；lib/collect-var-log.sh:27-38；lib/collect-prometheus.sh:66-68）。
 26. **prometheus 原始 JSON 不經 run_capture**（避免 header 汙染），manifest 條目由 collector 手寫，host 欄固定 `prometheus`（§15）。
 27. **cluster/rook/prometheus 的 SKIPPED 也算 verify 的「cluster/ 至少一檔」**——verify 只要求 cluster 與 nodes 下各有任一檔案（lib/verify-bundle.sh:80-94）。

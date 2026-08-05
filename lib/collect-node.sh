@@ -324,6 +324,22 @@ collect_node_main() {
     return 1
   }
 
+  # The Evidence Window start is computed here, on the node, because it is
+  # compared against this node's file mtimes and this node's clock is what those
+  # were stamped with. Collecting `/var/log` with a --since the window cannot
+  # parse fails closed: falling back to an unbounded collection would answer a
+  # bounded request with months of evidence and only a warning to say so.
+  local window_start=0 window_seconds
+  if [[ $skip_logs -eq 0 ]]; then
+    if ! window_seconds="$(evidence_window_seconds "$since")"; then
+      printf '--since must be N/Ns/Nm/Nh/Nd/Nw when collecting /var/log: %s\n' \
+        "$since" >&2
+      return 1
+    fi
+    window_start=$(($(date -u +%s) - window_seconds))
+    [[ $window_start -gt 0 ]] || window_start=1
+  fi
+
   ensure_dir "$outdir"
   local manifest="$outdir/manifest.jsonl"
   local failed=0
@@ -434,7 +450,8 @@ collect_node_main() {
       "${CEPH_INCIDENT_VAR_LOG_DIR:-/var/log}" \
       "$outdir/logs/var-log" \
       "$var_log_max_bytes" \
-      "$keep_original_logs" || var_log_rc=$?
+      "$keep_original_logs" \
+      "$window_start" || var_log_rc=$?
     if [[ $var_log_rc -ne 0 ]]; then
       failed=1
     fi
