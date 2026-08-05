@@ -365,15 +365,18 @@ test_engines_agree_on_nul_bearing_files() {
 # one somewhere. `test_engines_agree_on_the_corpus` runs first and leaves the
 # reference output for each fixture behind to compare against.
 test_corpus_can_tell_the_rules_apart() {
-  local corpus="$tmpdir/corpus" rule fixture name mutated counts diverged
+  local corpus="$tmpdir/rule-check" rule fixture name intact mutated counts diverged
+  build_corpus "$corpus"
   for rule in pem keywords key-label base64; do
     diverged=0
     for fixture in "$corpus"/*; do
       name="$(basename -- "$fixture")"
-      mutated="$tmpdir/work/$name/mutated-$rule.out"
-      counts="$tmpdir/work/$name/mutated-$rule.counts"
+      intact="$tmpdir/rule-check-$name.intact"
+      mutated="$tmpdir/rule-check-$name.without-$rule"
+      counts="$tmpdir/rule-check-$name.counts"
+      run_reference "$fixture" "$intact" "$counts"
       run_reference "$fixture" "$mutated" "$counts" "$rule"
-      if ! cmp -s "$tmpdir/work/$name/reference.out" "$mutated"; then
+      if ! cmp -s "$intact" "$mutated"; then
         diverged=1
         break
       fi
@@ -381,6 +384,91 @@ test_corpus_can_tell_the_rules_apart() {
     [[ $diverged -eq 1 ]] ||
       fail "no fixture depends on the $rule rule: the corpus would not notice it disappearing"
   done
+}
+
+# The integrity check exists because a source can stop delivering, and it has to
+# catch a stream that stopped in the middle of a line, not only one that stopped
+# on a boundary. `awk` cannot see the difference by itself — `NR` counts a half
+# record like any other — so if this stops failing, `redact_file` will rewrite an
+# artifact with truncated contents and log it as a success. That is the exact
+# outcome #49's fail-closed rule was written to prevent.
+test_redaction_fails_closed_on_a_stream_cut_mid_line() {
+  local work="$tmpdir/mid-line-cut"
+  local source_file="$work/evidence.log"
+  local fakebin="$work/bin"
+  mkdir -p "$work" "$fakebin"
+
+  # Twenty bytes is `first\nsecond\n` and then seven characters of the last
+  # line. The cut has to land inside the last line rather than on a boundary:
+  # dropping whole records is the easy case, and the count catches it whatever
+  # the engine. What only a stream-aware count catches is a last record that
+  # arrived incomplete, because it is still one record either way.
+  cat >"$fakebin/cat" <<'EOF'
+#!/usr/bin/env bash
+shift
+head -c 20 -- "$1"
+EOF
+  chmod +x "$fakebin/cat"
+
+  printf 'first\nsecond\nthird line with a secret\n' >"$source_file"
+  local before
+  before="$(cat "$source_file")"
+
+  local rc=0 saved_path=$PATH
+  PATH="$fakebin:$PATH"
+  set +e
+  redact_file "$source_file" "$work/redactions.log"
+  rc=$?
+  set -e
+  PATH=$saved_path
+
+  [[ $rc -ne 0 ]] || fail "redact_file accepted a stream that stopped mid-line"
+  [[ "$(cat "$source_file")" == "$before" ]] ||
+    fail "a stream that stopped mid-line replaced the artifact with what did arrive"
+  grep -q "NOT redacted" "$work/redactions.log" ||
+    fail "redactions.log does not record the incomplete read: $(cat "$work/redactions.log")"
+}
+
+# The one place the engines genuinely part company, asserted rather than argued.
+# `LC_ALL=C` makes the rules byte tests, which is what keeps a multibyte-aware
+# awk from aborting on the invalid UTF-8 every real /var/log carries — and it
+# moves two kinds of line, in both directions. The equivalence corpus cannot see
+# this: it runs the oracle in C too, on purpose, so that it compares engines
+# rather than locales.
+test_the_c_locale_pin_is_pinned() {
+  local work="$tmpdir/locale-pin"
+  local source_file="$work/lines.txt"
+  mkdir -p "$work"
+
+  python3 - "$source_file" <<'PY'
+import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).write_bytes(
+    # Non-alphanumeric before `key` is a byte question now, so the CJK character
+    # in front of this one no longer shields it.
+    "密key = 1\n".encode("utf-8")
+    # A line bash's `[[ =~ ]]` could not match at all in a UTF-8 locale, because
+    # the bytes are not a valid character in one.
+    + b"secret \x80\x81\n"
+    # And the other direction: an em space is whitespace to a UTF-8 locale but
+    # three ordinary bytes to a byte one, so `private<em space>key` stops
+    # matching rule 2. The Python candidate's `[\t\v\f\r _-]` agrees with C.
+    + "private key\n".encode("utf-8")
+    + b"ordinary line\n"
+)
+PY
+
+  redact_file "$source_file" "$work/redactions.log"
+
+  [[ "$(sed -n '1p' "$source_file")" == "[REDACTED]" ]] ||
+    fail "a non-ASCII character before 'key =' still shields it from rule 3"
+  [[ "$(sed -n '2p' "$source_file")" == "[REDACTED]" ]] ||
+    fail "a line with invalid UTF-8 was not matched against the rules"
+  [[ "$(sed -n '3p' "$source_file")" != "[REDACTED]" ]] ||
+    fail "an em space now counts as whitespace: the scan is not byte-oriented"
+  [[ "$(sed -n '4p' "$source_file")" == "ordinary line" ]] ||
+    fail "an ordinary line was over-redacted"
 }
 
 # `awk` is not optional and there is no slower path to fall back to: the loop it
@@ -457,6 +545,8 @@ mkdir -p "$tmpdir/empty-path"
 test_engines_agree_on_the_corpus
 test_engines_agree_on_nul_bearing_files
 test_corpus_can_tell_the_rules_apart
+test_the_c_locale_pin_is_pinned
+test_redaction_fails_closed_on_a_stream_cut_mid_line
 test_redaction_fails_without_awk
 test_redaction_fails_without_interval_expressions
 

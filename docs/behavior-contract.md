@@ -123,8 +123,8 @@
 | `CEPH_INCIDENT_VAR_LOG_FREE_RESERVE_BYTES` | `1073741824`（1 GiB） | 遠端輸出目錄需保留的最小剩餘空間（lib/collect-var-log.sh:317） |
 | `CEPH_INCIDENT_TEST_ALLOW_ATIME_READ` | `0` | 測試 escape hatch：允許用 `cat` 讀（略過 dd noatime；lib/collect-var-log.sh:41-44、lib/collect-node.sh:155-158、lib/collect-var-log.sh:60） |
 | `COLLECT_TEST_ABORT_AFTER_NODES` | 未設 | 測試 hook：node 收完後強制 die（run/collect.sh:622-625） |
-| `COMMAND_TIMEOUT` | `20` | `run_capture` 的單指令 timeout（呼叫端逐次設定；lib/common.sh:368） |
-| `ERROR_LOG` | 無 | `run_capture`/probe 失敗時追加的 errors.log 路徑（lib/common.sh:393-397） |
+| `COMMAND_TIMEOUT` | `20` | `run_capture` 的單指令 timeout（呼叫端逐次設定；lib/common.sh:389） |
+| `ERROR_LOG` | 無 | `run_capture`/probe 失敗時追加的 errors.log 路徑（lib/common.sh:414-418） |
 
 注意：node 端相關變數（`CEPH_INCIDENT_VAR_LOG_*`、`TIMESYNCD` 等）是在**遠端 node 的環境**讀取，工作機不會把它們轉送過去。
 
@@ -494,7 +494,7 @@ redaction 之後（redaction 可能改變大小）對每台 node 重算 `merged/
 
 ---
 
-## 13. Redaction（lib/common.sh:157-337；lib/bundle.sh:228-253）
+## 13. Redaction（lib/common.sh:157-358；lib/bundle.sh:228-253）
 
 ### 13.1 範圍（`redact_bundle_text`）
 
@@ -502,7 +502,7 @@ redaction 之後（redaction 可能改變大小）對每台 node 重算 `merged/
 
 ### 13.2 規則（`redact_file`，行為單位 = 整行換成 `[REDACTED]`，大小寫不敏感）
 
-命中條件（:199-224）：
+命中條件（:215-230）：
 
 1. PEM private key 區塊：`-----BEGIN ... PRIVATE KEY-----` 起至 `-----END ... PRIVATE KEY-----` 止的**整段**。
 2. 行含 `password`、`secret`、`token`、`keyring`、`private[ _-]key`（大小寫不敏感）。
@@ -513,17 +513,24 @@ redaction 之後（redaction 可能改變大小）對每台 node 重算 `merged/
 
 **執行引擎**（#59）：一次 `awk` 掃描（`redact_stream`），不是逐行 bash 迴圈。規則、行為單位與 `redactions.log` 格式都不變，換掉的只有掃描方式：逐行迴圈的 92% 成本在 `[[ =~ ]]`，實測 10 MiB/min，一次真 lab collect 的 in-scope 資料要 12.8 小時，超過 qualification harness 的四小時 collect 上限。前三條規則對每行的 `tolower()` 副本比對（印出的仍是原行），第四條直接比對原行。
 
-`awk` 因此是**必要前置條件**，缺席不退回慢路徑：沒有 `awk`、或 `awk` 不支援 `{38,}` 這類 interval expression（mawk 1.3.3 會把它當字面字串，base64 規則會安靜失效），`redact_file` 一律 `die` 並指出缺什麼——比照 [ADR 0011](adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md) 對 `timeout` binary 的處理。
+`awk` 因此是**必要前置條件**，缺席不退回慢路徑：沒有 `awk`、或 `awk` 不支援 `{38,}` 這類 interval expression（mawk 1.3.3 會把它當字面字串，base64 規則會安靜失效），一律 `die` 並指出缺什麼——比照 [ADR 0011](adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md) 對 `timeout` binary 的處理。檢查在兩個地方：`run/collect.sh` 驗完參數後（`--redact` 開啟時）先檢一次，這樣工作機不合格是第一秒就知道、而不是收了幾小時之後才在最後一個 phase 失敗；`redact_file` 自己也檢，seam 不依賴呼叫端。結果快取在 `REDACTION_AWK_CHECKED`，否則每個 artifact 都會多 fork 一支 awk。
 
-掃描固定在 `LC_ALL=C` 下跑，理由與後果都要記著：真實 /var/log 有非法 UTF-8，multibyte-aware 的 awk 拿到它不是直接中止（`illegal byte sequence`）就是比對結果未定義。副作用是規則 3 的「非英數」以**位元組**判定，等同 Python candidate 的 `[^A-Za-z0-9]`；逐行迴圈則跟隨呼叫端 locale，在 UTF-8 locale 下把非 ASCII 字元算成英數。因此 `密key = 1` 這種行、以及任何含非法 UTF-8 的行，現在會被遮蔽而以前不會——**只往多遮的方向偏，且與 Python candidate 一致**。
+掃描固定在 `LC_ALL=C` 下跑，理由與後果都要記著：真實 /var/log 有非法 UTF-8，multibyte-aware 的 awk 拿到它不是直接中止（`illegal byte sequence`）就是比對結果未定義。代價是規則裡的 bracket expression 全部變成**位元組**判定，而逐行迴圈是跟隨呼叫端 locale 的，所以在 UTF-8 locale 的工作機上兩者會有差，**兩個方向都有**：
+
+- 多遮：`密key = 1`（規則 3 的「非英數」以位元組判定，CJK 字元不再擋住 `key`）、以及任何含非法 UTF-8 的行（`[[ =~ ]]` 在 UTF-8 locale 下對這種行整條比對失敗，等於完全不遮）。
+- 少遮：`private<U+2003>key` 這類用非 ASCII 空白的行——`[[:space:]]` 在 UTF-8 locale 含 em space，在 C locale 不含。
+
+兩個方向都與 Python candidate 一致（它用 `[^A-Za-z0-9]` 與 `[\t\v\f\r ]`，本來就是位元組語意），所以這個 pin 是把 shell reference 移向 candidate，不是移離。`tests/test-redaction-equivalence.sh` 的 `test_the_c_locale_pin_is_pinned` 逐條釘住這三種行。
 
 **讀取方式與完整性**（#49）：來源以 `cat "$source" | redact_stream` 串進掃描，**不是**讓掃描自己開檔——bash 對被重導向的一般檔案維持讀取 offset，超過 2 GiB 後 `read` 會失敗且不清空 `line`，逐行迴圈會無上限地重寫同一行。`awk` 沒有這個 bug，但管線保留：下面的完整性檢查檢的是「串流送到了多少」，掃描自己開檔就沒東西可檢。
 
-掃描結束後比對「讀到的換行結尾記錄數」與來源的 `wc -l`。`awk` 的 `NR` 會把「檔尾未終止行」也算一筆而 `wc -l` 不會，所以 `redact_file` 先看來源最後一個 byte 是不是換行（`tail -c 1 | wc -l`，對最後一個 byte 是 NUL 的檔也成立），再把該筆扣掉。不相符時：**原檔原樣保留（不覆寫）**、暫存檔刪除、`redactions.log` 記 `path: read X of Y line(s), original left as-is (NOT redacted)`、return 1（→ 整體 redaction rc=2）。行為單位是「拒絕遮蔽」而不是「遮蔽一半」——安靜地少收證據比拒絕更糟。
+掃描結束後比對「讀到的換行結尾記錄數」與來源的 `wc -l`。`awk` 的 `NR` 分不出「來源本來就以換行結尾」與「串流在某一行中間就斷了」——兩者都算一筆——所以 `cat` 會把來源與**一個額外的換行**串成同一道 stream（`cat -- "$src" <(printf '\n')`），掃描再一律把最後一筆丟掉。最後一筆是空的就代表 stream 停在記錄邊界，非空就是沒送完的半行；兩種都不是來源的換行結尾記錄，所以都不計數。少了這個額外換行，斷在行中間的串流會湊出正確的記錄數而通過檢查，`redact_file` 會把截斷後的內容寫回 artifact 並記成成功——證據被安靜丟掉，正是 #49 這條防線要擋的事。
 
-**檔尾未終止行只在非空時才處理並輸出**。逐行迴圈的補救條件是 `[[ -n "$line" ]]`，而 bash `read` 碰到第一個 byte 是 NUL 時什麼都沒讀到，因此那種檔的結尾段落原本就不會被寫出去；`awk` 掃描保留同一條規則（前瞻一筆記錄，讓 `END` 還來得及決定最後一筆）。macOS 解開 Node Evidence Archive 會在真實 artifact 旁留下 AppleDouble sidecar（`._hostname.txt` 之類，全檔無換行、首 byte 是 NUL、副檔名落在遮蔽目標集合裡），少了這條規則它們會多出一個 byte，打包出來的 bundle 就解不開。
+不相符時：**原檔原樣保留（不覆寫）**、暫存檔刪除、`redactions.log` 記 `path: read X of Y line(s), original left as-is (NOT redacted)`、return 1（→ 整體 redaction rc=2）。行為單位是「拒絕遮蔽」而不是「遮蔽一半」——安靜地少收證據比拒絕更糟。
 
-NUL 是兩種引擎唯一被允許分歧的位元組：bash `read` 與本 repo 開發所用的 awk 都在 NUL 處截斷該行，但 NUL-clean 的 awk（gawk）會把整行帶進比對。記錄數不受影響（分隔符仍是換行），且每條規則都是子字串比對，帶進更多內容只會多遮不會少遮。`tests/test-redaction-equivalence.sh` 因此先探測手上的 awk 會不會在 NUL 截斷：會截斷就照一般 fixture 要求逐位元組相同，不會截斷就只釘住「記錄數相同」與「參考實作遮的行一定也被遮」。
+**丟掉的那一筆只在非空時才會被處理並輸出**。逐行迴圈的補救條件是 `[[ -n "$line" ]]`，而 bash `read` 碰到第一個 byte 是 NUL 時什麼都沒讀到，因此那種檔的結尾段落原本就不會被寫出去。macOS 解開 Node Evidence Archive 會在真實 artifact 旁留下 AppleDouble sidecar（`._hostname.txt` 之類，全檔無換行、首 byte 是 NUL、副檔名落在遮蔽目標集合裡），少了這條規則它們會多出一個 byte，打包出來的 bundle 就解不開。
+
+NUL 是兩種引擎唯一被允許分歧的位元組，**上一段那條規則也因此是 engine-dependent 的**：bash `read` 與本 repo 開發所用的 awk 都在 NUL 處截斷該行，所以 sidecar 的那一筆是空的、會被丟掉；NUL-clean 的 awk（gawk）看到的是整筆非空內容，會照樣輸出並補上換行——在 macOS 上仍會弄壞 bundle。記錄數不受影響（分隔符仍是換行），且每條規則都是子字串比對，帶進更多內容只會多遮不會少遮。`tests/test-redaction-equivalence.sh` 因此先探測手上的 awk 會不會在 NUL 截斷：會截斷就照一般 fixture 要求逐位元組相同，不會截斷就只釘住「記錄數相同」與「參考實作遮的行一定也被遮」。
 
 `redact_file` 的第三個參數是 log 顯示用路徑，預設等於來源路徑；壓縮檔用它記自己的原檔名而不是暫存的解壓檔。
 
@@ -533,16 +540,16 @@ NUL 是兩種引擎唯一被允許分歧的位元組：bash `read` 與本 repo �
 
 ---
 
-## 14. `run_capture` 與 artifact/manifest 格式（lib/common.sh:143-155、339-400）
+## 14. `run_capture` 與 artifact/manifest 格式（lib/common.sh:143-155、360-421）
 
 每個被捕捉的指令：
 
 - artifact 檔頭三～四行註解：`# host: <h>`、`# collector: <c>`、`# started: <UTC>`、`# timeout: <COMMAND_TIMEOUT>s`（無 timeout binary 時 `# timeout: unavailable`；qualification 工作機不允許此模式，見 [ADR 0011](adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md)）。之後是指令 stdout+stderr 合流。
-- **stdin 一律關成 `/dev/null`**（:369、:376）。被捕捉的指令沒有一個是互動程式，但 `ssh` 不管遠端要不要都會把 stdin 讀到 EOF，而呼叫端多半是 `while IFS= read -r … done <<<"$list"` 迴圈——繼承 stdin 等於讓第一次 capture 吃掉迴圈還沒讀的清單。`ceph crash info` 因此在真 lab 上九個 id 只取到兩個（#52）。
-- 指令被 `timeout $COMMAND_TIMEOUT`（預設 20）包住；exit 124/137 時檔尾補 `# TRUNCATED: command timed out after <s>s (exit <rc>)`（:385-387）。
+- **stdin 一律關成 `/dev/null`**（:390、:397）。被捕捉的指令沒有一個是互動程式，但 `ssh` 不管遠端要不要都會把 stdin 讀到 EOF，而呼叫端多半是 `while IFS= read -r … done <<<"$list"` 迴圈——繼承 stdin 等於讓第一次 capture 吃掉迴圈還沒讀的清單。`ceph crash info` 因此在真 lab 上九個 id 只取到兩個（#52）。
+- 指令被 `timeout $COMMAND_TIMEOUT`（預設 20）包住；exit 124/137 時檔尾補 `# TRUNCATED: command timed out after <s>s (exit <rc>)`（:406-408）。
 - 先寫入同目錄 mktemp 暫存檔再 `mv`（不會留半寫檔）。
 - `manifest.jsonl` 追加一行 JSON：`{"host":…,"collector":…,"artifact":<絕對路徑>,"command":<%q quoted 字串>,"exit_code":N,"started":…,"ended":…}`（自製 escape：`\ " \n \r \t`；:133-155）。exit_code 必須是數字，否則 die。
-- 非 0 且設了 `ERROR_LOG` → 追加 `<ended> host=<h> collector=<c> artifact=<a> exit=<rc> command=<cmd>`（:393-397）。
+- 非 0 且設了 `ERROR_LOG` → 追加 `<ended> host=<h> collector=<c> artifact=<a> exit=<rc> command=<cmd>`（:414-418）。
 - cluster 層寫 workdir 根的 `manifest.jsonl`/`errors.log`；node 層寫 node 自己 out 目錄下的（打包後成為 `nodes/<alias>/manifest.jsonl`、`nodes/<alias>/errors.log`）。
 
 `CONTENTS.md`（lib/bundle.sh:169-201）由 manifest 生成：頂層檔案說明 + cluster 表格 + 每個 node 一段表格（`| exit | file | command |`）；node 的 artifact 路徑把遠端 `/tmp/…/out/` 前綴轉成 `nodes/<alias>/`（:152-158）；缺 node manifest 時寫 `Not collected — see nodes/<alias>/SKIPPED.txt`；有 var-log INDEX 時補一行指引。

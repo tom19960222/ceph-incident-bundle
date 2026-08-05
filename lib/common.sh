@@ -162,7 +162,14 @@ manifest_add() {
 # to, and falling back quietly would bring that failure mode back without a
 # message, so a workstation without a usable `awk` stops the collect and says
 # what is missing — the answer ADR 0011 gives for a missing `timeout` binary.
+# `run/collect.sh` calls this before it collects anything, so an unusable awk
+# costs a second rather than a finished collect; `redact_file` calls it too, so
+# the seam holds on its own. The answer is cached because the second call
+# onwards would otherwise fork an awk per artifact, in the one function whose
+# whole purpose is not to spend a process per unit of work.
+REDACTION_AWK_CHECKED=0
 require_redaction_awk() {
+  [[ $REDACTION_AWK_CHECKED -eq 1 ]] && return 0
   command -v awk >/dev/null 2>&1 ||
     die "awk not found: redaction needs it and has no fallback"
   # `{38,}` is the only interval expression in the rules, and it is the one that
@@ -170,34 +177,41 @@ require_redaction_awk() {
   # text, which does not fail — it quietly stops redacting base64 key blobs.
   [[ "$(printf 'aaa\n' | LC_ALL=C awk '/a{3}/ { print "ok" }' 2>/dev/null)" == ok ]] ||
     die "awk does not support interval expressions like {38,}: redaction would miss key material"
+  REDACTION_AWK_CHECKED=1
 }
 
 # Redact stdin to stdout in a single `awk` pass, writing "<redacted> <records>"
 # to $1: how many lines were replaced, and how many newline-terminated records
 # were read. The second number is what proves the whole stream arrived.
 #
-# $2 is 1 when the source's last line carries no newline. `awk` counts that line
-# as a record and `wc -l` does not, so the correction happens here rather than
-# at the comparison below, where it would have to be undone again for the
-# message that quotes both numbers.
+# The stream must carry one extra newline on the end — `redact_file` appends it
+# — because `awk` cannot otherwise tell a source that ended on a newline from a
+# stream that stopped halfway through a line. `NR` counts both the same, and
+# telling them apart is the entire integrity check. With the extra newline the
+# last record answers it: an empty one means the stream ended where a record
+# ended, and a non-empty one is whatever was left dangling. Either way it is not
+# a newline-terminated record of the source, so it never counts.
 #
 # The four rules are unchanged from the loop this replaced (#59). That loop ran
 # under `shopt -s nocasematch`, so the first three match against a lowercased
 # copy of the line while the original stays what gets printed; the fourth needs
 # no copy, its character class already spanning both cases and `=` having none.
 #
-# `LC_ALL=C` makes the scan byte-oriented. Real /var/log carries invalid UTF-8,
-# and a multibyte-aware awk handed it either aborts (`illegal byte sequence`) or
-# matches undefined; bytes also make `[[:alnum:]]` mean ASCII, which is what
-# rule 3 has to mean and what the Python candidate's `[^A-Za-z0-9]` already
-# means. See docs/behavior-contract.md §13.2 for what that pinned down.
+# `LC_ALL=C` makes the scan byte-oriented, because real /var/log carries invalid
+# UTF-8 and a multibyte-aware awk handed it either aborts (`illegal byte
+# sequence`) or matches undefined. The price is that every bracket expression
+# here becomes a byte test, which moves results in both directions against a
+# loop that followed the caller's locale: `密key = 1` and invalid-UTF-8 lines
+# start redacting, `private<U+2003>key` stops. Both directions land on what the
+# Python candidate's `[^A-Za-z0-9]` and `[\t\v\f\r ]` already do — see
+# docs/behavior-contract.md §13.2.
 #
 # Best-effort redaction (NOT a complete DLP): keyword lines, ceph key material
 # (`key = AQB..==`, base64 blobs), and whole multi-line PEM private key blocks.
 # Extensions/encodings outside this are intentionally not covered — see README
 # "安全界線"; operators must self-review before sharing.
 redact_stream() {
-  LC_ALL=C awk -v count_file="$1" -v unterminated="$2" '
+  LC_ALL=C awk -v count_file="$1" '
     function scan(line,   lowered, redact) {
       redact = 0
       lowered = tolower(line)
@@ -217,22 +231,18 @@ redact_stream() {
     # One record of lookahead, so END can still decide about the last one.
     { if (held_set) scan(held); held = $0; held_set = 1 }
     END {
-      records = NR
-      if (held_set) {
-        if (!unterminated) {
-          scan(held)
-        } else {
-          # A final line with no newline is not a newline-terminated record, so
-          # it never counted towards the integrity check. The loop this replaced
-          # also only *processed* it when `read` had left something behind, and
-          # `read` leaves nothing when the first byte is a NUL — so an empty tail
-          # is dropped rather than written out as a blank line. That is what
-          # keeps a binary artifact carrying a text-ish name (macOS AppleDouble
-          # `._name` beside an extracted `name`) from gaining a byte it never had.
-          records--
-          if (held != "") scan(held)
-        }
-      }
+      records = NR - 1
+      if (records < 0) records = 0
+      # The held record is either the unterminated final line of the source or
+      # the empty record the appended newline made. The loop here before only
+      # processed such a line when `read` had left something behind, and `read`
+      # leaves nothing when the first byte is a NUL, so an empty one is dropped
+      # rather than written out as a blank line. That is what keeps a binary
+      # artifact carrying a text-ish name — a macOS AppleDouble `._name` sitting
+      # beside an extracted `name` — from gaining a byte it never had. An awk
+      # that keeps NUL inside a record sees this one differently; see
+      # docs/behavior-contract.md §13.2.
+      if (held_set && held != "") scan(held)
       printf("%d %d\n", count + 0, records) > count_file
     }
   '
@@ -261,26 +271,21 @@ redact_file() {
   ensure_dir "$(dirname -- "$redaction_log")"
 
   local source_dir tmp_file count_file mode expected count='' records='' stream_ok=1
-  local unterminated=0
   source_dir="$(dirname -- "$source_file")"
   tmp_file="$(mktemp "$source_dir/.${source_file##*/}.XXXXXX")"
   count_file="$(mktemp "$source_dir/.${source_file##*/}.count.XXXXXX")"
   expected="$(wc -l <"$source_file")"
   expected=${expected//[[:space:]]/}
-  # `wc -l` counts newlines, and the scan counts records; a last line with no
-  # newline is a record without a newline, so the two disagree by one on exactly
-  # those files. Which kind this is costs a seek to the last byte, and asking
-  # `wc -l` about that byte instead of comparing it keeps the answer right for a
-  # file whose last byte is a NUL.
-  if [[ -s "$source_file" ]] && [[ "$(tail -c 1 <"$source_file" | wc -l)" -eq 0 ]]; then
-    unterminated=1
-  fi
 
+  # `cat` concatenates the source with one more newline, which is what lets the
+  # scan report a record count in the same units `wc -l` counts in — and what
+  # lets it see a stream that stopped mid-line at all. See `redact_stream`.
+  #
   # `if !` rather than `set +e`: toggling errexit here would hand the caller
   # back a different shell than it had, and this function is called from both
   # errexit and non-errexit contexts. A `cat` that dies mid-stream needs no
   # special case — it shows up as a short record count below.
-  if ! cat -- "$source_file" | redact_stream "$count_file" "$unterminated" >"$tmp_file"; then
+  if ! cat -- "$source_file" <(printf '\n') | redact_stream "$count_file" >"$tmp_file"; then
     stream_ok=0
   fi
   read -r count records <"$count_file" || true
