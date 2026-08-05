@@ -227,6 +227,33 @@ case "$command_name" in
     if [ -n "${FAKE_STAT_LOG:-}" ]; then
       printf '%s\n' "$*" >>"$FAKE_STAT_LOG"
     fi
+    # A source can be sizeable but not datable: GNU stat prints `?` for a field
+    # it cannot determine. FAKE_STAT_UNDATABLE_PATH asks for that answer, which
+    # is the only way an unprivileged fake world can produce one.
+    if [ -n "${FAKE_STAT_UNDATABLE_PATH:-}" ]; then
+      for argument in "$@"; do
+        if [ "$argument" = "$FAKE_STAT_UNDATABLE_PATH" ]; then
+          printf '%s ?\n' "$("$FAKE_REAL_STAT" -c '%s' "$argument" 2>/dev/null ||
+            "$FAKE_REAL_STAT" -f '%z' "$argument")"
+          exit 0
+        fi
+      done
+    fi
+    # The node this world stands in for is a GNU one, so `-c FORMAT` has to
+    # answer even when the developer's own stat is BSD.
+    if [ "${1:-}" = "-c" ] && [ "$#" -ge 3 ]; then
+      format=$2
+      shift 2
+      if "$FAKE_REAL_STAT" -c '%s' "$1" >/dev/null 2>&1; then
+        exec "$FAKE_REAL_STAT" -c "$format" "$@"
+      fi
+      case "$format" in
+        "%s %Y") exec "$FAKE_REAL_STAT" -f '%z %m' "$@" ;;
+        "%s") exec "$FAKE_REAL_STAT" -f '%z' "$@" ;;
+        "%Y") exec "$FAKE_REAL_STAT" -f '%m' "$@" ;;
+        *) printf 'unexpected fake stat format: %s\n' "$format" >&2; exit 64 ;;
+      esac
+    fi
     exec "$FAKE_REAL_STAT" "$@"
     ;;
   dd)

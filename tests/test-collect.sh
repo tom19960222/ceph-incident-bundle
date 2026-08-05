@@ -453,6 +453,22 @@ km_bad_out="${km_bad#*$'\n'}"
 [[ "$km_bad_status" == "1" ]] || fail "invalid --kube-mode should exit 1, got $km_bad_status"
 [[ "$km_bad_out" == *"invalid --kube-mode"* ]] || fail "bad --kube-mode should explain failure"
 
+# A --since the Evidence Window cannot parse is rejected up front whenever
+# /var/log is collected, with no --prom-url in sight (exit 1)
+log_bad_since="$(run_and_capture "$ROOT/run/collect.sh" --since yesterday --inventory "$inventory" --ssh-key "$ssh_key")"
+log_bad_since_status="${log_bad_since%%$'\n'*}"
+log_bad_since_out="${log_bad_since#*$'\n'}"
+[[ "$log_bad_since_status" == "1" ]] || fail "bad --since should exit 1 when collecting /var/log, got $log_bad_since_status"
+[[ "$log_bad_since_out" == *"--since must be N/Ns/Nm/Nh/Nd/Nw when collecting /var/log"* ]] \
+  || fail "bad --since should say which grammar /var/log needs"
+
+# ...and the same value is accepted once /var/log is out of scope, because
+# nothing then compares it against file mtimes.
+log_bad_since_skipped="$(run_and_capture "$ROOT/run/collect.sh" --since yesterday --skip-logs --inventory "$inventory" --ssh-key "$ssh_key" --out "$tmpdir/out-skip-logs-since" --mode cephadm --seed tester@10.0.0.1 --timeout 5)"
+log_bad_since_skipped_out="${log_bad_since_skipped#*$'\n'}"
+[[ "$log_bad_since_skipped_out" != *"--since must be"* ]] \
+  || fail "--skip-logs should not be blocked by the /var/log --since grammar: $log_bad_since_skipped_out"
+
 # --prom-url with an unparseable --since is rejected up front (exit 1)
 prom_bad_since="$(run_and_capture "$ROOT/run/collect.sh" --prom-url http://prom.example:9090 --since yesterday --inventory "$inventory" --ssh-key "$ssh_key")"
 prom_bad_since_status="${prom_bad_since%%$'\n'*}"

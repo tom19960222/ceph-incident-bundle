@@ -20,10 +20,10 @@
 
 | 狀態 | 數量 | 意義 |
 |---|---|---|
-| ported | 128 | 已有通過的 Python test 覆蓋該情境語意 |
+| ported | 134 | 已有通過的 Python test 覆蓋該情境語意 |
 | blocked | 0 | Python 實作尚未移植該行為，測試無從撰寫 |
-| not-ported | 10 | inventory 分類為 shell 實作細節，移植後失去意義 |
-| **合計** | **138** | inventory 全部情境 |
+| not-ported | 11 | inventory 分類為 shell 實作細節，移植後失去意義 |
+| **合計** | **145** | inventory 全部情境 |
 
 > Inventory 撰寫時的總數是 137／127／10；之後 #15 補入 `P6a`（Prometheus
 > 憑證邊界）而未更新總覽，因此實際列數為 138／128／10。本 ledger 以實際列數為準。
@@ -118,6 +118,12 @@
 | V12 | 檔案後段才出現 NUL → 視為 binary，raw 保留、不合併為文字 | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_var_log_collision_safe_tree_base10_order_and_late_nul_detection`（raw 逐位元組保留，且不存在對應的 `.merged`） | — |
 | V13 | 第二階段解壓失敗（第一次探測成功、正式解壓失敗）→ 回 2、壓縮原檔保留在 raw、部分解… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_later_decode_failures_roll_back_and_preserve_raw`<br>`test_python_collect_node.CollectSingleNodeCliTests.test_safe_read_failure_is_partial_without_an_unsafe_fallback` | — |
 | V14 | 掃描 metadata 本身有上限：超過 → 回 2、`SCAN-LIMIT.txt`、不… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_var_log_metadata_scan_limit_fails_closed_before_payload_reads`<br>`test_python_collect_node.CollectSingleNodeCliTests.test_var_log_entry_count_limit_fails_closed_before_payload_reads` | — |
+| V15 | Evidence Window 邊界：mtime 在窗口內、正好等於窗口起點、以及窗口前最新的… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_the_evidence_window_bounds_var_log_and_indexes_what_it_left`（窗口內與跨界都在 merged 內、更舊的既不在 merged 也不在 `raw/`、INDEX 三列逐欄比對）<br>**對應關係**：shell 直呼 seam 可用固定 epoch 釘住「正好等於窗口起點」；Python 這一列走完整 CLI，窗口起點是 `--since` 之前的此刻，因此以距窗口起點的距離（1h／25h／30d）釘住，邊界相等那一格由 shell 側負責 | — |
+| V16 | 跨界規則逐 family 獨立：剛輪替過的 family 現行檔與最新輪替檔都收；輪替慢… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_the_evidence_window_crosses_its_start_per_family_and_journal_stream`（fast 家族兩個檔都在、slow 家族只留自己最新的一個、被排除者 INDEX 標 `outside-window`）<br>**對應關係**：「不留空 merged 檔或殘留 staging」在 Python 側由 bundle 的 member 清單保證——staging 一律在收集結束前刪除，殘留會直接出現在 archive 名單中 | — |
+| V17 | binary systemd journal 依 machine-id 目錄與 stream（`@`… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_the_evidence_window_crosses_its_start_per_family_and_journal_stream`（同 stream 只跨界一個、另一 stream 與另一 machine-id 各自保留、被排除的那個不在 `raw/`） | — |
+| V18 | mtime 讀不到的來源**照收**並在 INDEX 標 `unknown` 與 `mtime-un… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_a_source_the_window_cannot_date_is_collected_and_marked`（來源明明比窗口舊仍被合併，INDEX 的 mtime 欄為 `unknown`、detail 帶 `mtime-unknown`）<br>**對應關係**：shell 以假 `stat` 讓 `%Y` 失敗；Python 的 mtime 來自 `lstat`，只有走 `sudo -n stat` 那條路才可能只拿到 size，因此以 `CEPH_INCIDENT_TEST_FORCE_SUDO=1` 加上答 `<size> ?` 的假 `stat` 構成同一個情境 | — |
+| V19 | 窗口先於位元組上限估算：上限遠低於窗口外的量、遠高於窗口內的量時，收集成功且不產生… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_the_evidence_window_is_applied_before_the_byte_cap`（bundle 內沒有 `OVER-LIMIT.txt`，且跨界來源確實被合併） | — |
+| V20 | 窗口起點非數字（如 `24h`）→ 回 1，且不開始收集（不產生 `INDEX.tsv`） | not-ported | shell 的函式參數都是字串，型別得自己驗；Python 的對應 seam 參數是 `int`，同一個誤用在 Python 是型別錯誤而非執行期契約 | — |
 
 ## 6. `tests/test-rook-collector.sh`
 
@@ -214,6 +220,7 @@
 | O34 | `--quiet`：stdout 仍印 `bundle:`，stderr 進度全部靜默 | ported | `test_python_collect_orchestration.CephRunnerSelectionTests.test_quiet_suppresses_default_progress_messages`（`--quiet` 下 stdout 仍恰為 `bundle: …`，stderr 為空字串） | — |
 | O35 | 中斷處理（Ctrl-C 契約）：`on_interrupt` → exit 130、ann… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_interruption_cleans_remote_and_workstation_workspaces`<br>`test_python_collect_node.CollectSingleNodeCliTests.test_packaging_interruption_removes_reserved_archive_and_workdir` | interrupt-cleans-up |
 | O36 | `--keep-workdir` 時中斷處理保留 workdir（`CLEANUP_KEE… | ported | `test_python_collect_node.CollectSingleNodeCliTests.test_keep_workdir_preserves_the_workstation_workspace_on_interrupt` | — |
+| O37 | 收 `/var/log` 時不可解析的 `--since` → 前置檢查 exit 1，訊息指出 `/var/log`… | ported | `test_python_collect_cli.CollectCliContractTests.test_a_since_the_evidence_window_cannot_parse_fails_closed`（exit 1、stdout 空、訊息點名 `/var/log` 需要的文法）<br>`test_python_collect_cli.CollectCliContractTests.test_the_window_grammar_only_binds_when_var_log_is_collected`（合法 duration 通過；同一個 `yesterday` 配 `--skip-logs` 不被擋） | — |
 
 ## Blocked：目前沒有 blocked 情境
 

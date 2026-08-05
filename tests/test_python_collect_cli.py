@@ -136,6 +136,50 @@ class CollectCliContractTests(unittest.TestCase):
             self.assertIn("missing ssh key", result.stderr)
             self.assertFalse((root / "results").exists())
 
+    def test_a_since_the_evidence_window_cannot_parse_fails_closed(self) -> None:
+        """Failing closed is the point: a warning would let the defect return.
+
+        `--since` used to reach `journalctl` only, so an unparseable value
+        silently meant an unbounded `/var/log` — a bounded request answered with
+        months of evidence (ADR 0012).
+        """
+
+        result = self.run_collect(
+            "--inventory", "x", "--ssh-key", "y", "--since", "yesterday"
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(
+            "--since must be N/Ns/Nm/Nh/Nd/Nw when collecting /var/log",
+            result.stderr,
+        )
+
+    def test_the_window_grammar_only_binds_when_var_log_is_collected(self) -> None:
+        for value in ("24h", "7d", "900", "1w"):
+            with self.subTest(since=value):
+                parsed = _parse_collect_arguments(
+                    ("--inventory", "i", "--ssh-key", "k", "--since", value)
+                )
+                self.assertEqual(parsed["since"], value)
+        # Nothing compares it against file mtimes once logs are out of scope, so
+        # the journal's own free-form ranges stay usable. `--mode cephadm` keeps
+        # the separate remote-Rook rule out of this.
+        skipped = _parse_collect_arguments(
+            (
+                "--inventory",
+                "i",
+                "--ssh-key",
+                "k",
+                "--mode",
+                "cephadm",
+                "--since",
+                "yesterday",
+                "--skip-logs",
+            )
+        )
+        self.assertEqual(skipped["since"], "yesterday")
+
     def test_timeout_defaults_match_the_shell_reference(self) -> None:
         """Defaults are part of the CLI contract, not an implementation choice."""
 

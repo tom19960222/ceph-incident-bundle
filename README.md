@@ -181,7 +181,9 @@ bash run/collect.sh \
 - `--node-timeout`（預設 600s）是**單一 node 整輪收集**的逾時。兩者分開：慢或大的 node 不會被單指令逾時誤殺。
 - 每台 node 會遞迴掃描 `/var/log` 的 regular files，不跟隨 symlink，也不讀 socket/device/FIFO。
 - 同目錄、同 family 的 active/rotated log 會依最舊到最新合併；支援 `.gz`、`.xz`、`.bz2`、`.zst`。ZIP、tar、binary、journal raw file 不合併，原樣放在 `raw/` 並列入 `UNREDACTED-OPAQUE.txt`。合併檔使用 collision-free tree：每層來源目錄放在 `merged/tree/dirs/<name>/`，該層的 family 放在 `files/<family>.merged`。
-- `/var/log` file history 不受 `--since` 限制；`journalctl` 的可讀文字輸出仍遵守 `--since`。
+- `--since` 是 **Evidence Window**：`journalctl` 的文字輸出取窗口內的記錄，`/var/log` 的檔案（含輪替檔與 binary journal）取 mtime 在窗口內的，**外加每個 log family 跨越窗口起點的那一個最新檔**——輪替檔的 mtime 是輪替發生的時刻而非內容範圍，若輪替剛好發生在 collect 前不久，窗口內的證據會整批落在那個檔裡。因此實際涵蓋一定比 `--since` 寬，這是檔案層級取捨的必然，不是 bug。
+- 被窗口排除的來源仍然列在 `INDEX.tsv` 裡，帶來源 mtime 與 `outside-window` disposition，所以判讀者能分辨「這台沒有更早的 log」與「有，但被窗口排除了」；跨界與 mtime 讀不到的來源也各自在 detail 標示。mtime 讀不到時一律照收。
+- 收 `/var/log` 時 `--since` 必須是 `N`/`Ns`/`Nm`/`Nh`/`Nd`/`Nw`，否則 collect 在開頭就失敗（fail-closed，不會靜默退回無界限收集）。要用 `journalctl` 的自由格式時間範圍，得配 `--skip-logs`。理由見 `docs/adr/0012-bound-var-log-collection-by-an-evidence-window.md`。
 - 預設每台 log payload 上限 10 GiB。用 `--var-log-max-bytes BYTES|unlimited` 調整；payload 包含 merged/raw/original 與 `journal-all-since.txt`，redaction 後會再驗一次。預估或實際超限、遠端暫存空間不足時只留下 index/原因並回傳 exit 2，不產生看似完整的半套 log。另以 64 MiB scan-path staging 與 100,000 entries 上限約束 metadata/記憶體；超過時留下 `SCAN-LIMIT.txt`。
 - 成功合併後預設不重複保存文字來源；`--keep-original-logs` 才會在 `original/` 保留來源格式。`--skip-logs` 可完全跳過 `/var/log` file collection。
 - 被逾時砍掉（exit 124/137）的指令輸出會在 artifact 末尾標 `# TRUNCATED`，讓判讀者知道內容被截斷。

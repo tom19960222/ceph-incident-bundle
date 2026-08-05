@@ -316,8 +316,13 @@ class CephRunnerSelectionTests(DirectCephFixture, unittest.TestCase):
             root = Path(temporary_directory)
             environment, _ = self.make_fake_environment(root)
 
+            # `--skip-logs` keeps the Evidence Window out of it: it claims the
+            # same strict grammar whenever `/var/log` is collected (ADR 0012),
+            # and this is about the remote Rook rule only.
             result = self.run_collect(
-                root, environment, extra_arguments=("--since", "yesterday")
+                root,
+                environment,
+                extra_arguments=("--since", "yesterday", "--skip-logs"),
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)

@@ -116,7 +116,8 @@ SAFE_INVOCATION_ID = re.compile(r"[a-f0-9]{32}\Z")
 DEFAULT_VAR_LOG_MAX_BYTES = 10 * 1024**3
 MANIFEST_MAX_BYTES = 16 * 1024 * 1024
 INDEX_HEADER = (
-    "source\tfamily\tcodec\tstored_bytes\tdecoded_bytes\tdisposition\tdetail\n"
+    "source\tfamily\tcodec\tstored_bytes\tdecoded_bytes\tmtime_epoch\t"
+    "disposition\tdetail\n"
 )
 CODEC_COMMANDS: dict[str, tuple[str, ...]] = {
     "gz": ("gzip", "-dc"),
@@ -176,7 +177,8 @@ class LogCandidate:
     order_key: str
     stored_bytes: int
     decoded_bytes: int
-    mtime_ns: int
+    # None when the source could be sized but not dated; see `_source_facts`.
+    mtime_ns: int | None
 
 
 @dataclass(frozen=True)
@@ -255,6 +257,13 @@ def _decode_config(encoded: str) -> NodeConfig:
         raise ValueError("invalid var-log payload cap")
     if not isinstance(since, str) or not since:
         raise ValueError("invalid journal time range")
+    # Collecting `/var/log` with a --since the Evidence Window cannot parse fails
+    # closed: falling back to an unbounded collection would answer a bounded
+    # request with months of evidence and only a warning to say so (ADR 0012).
+    if not skip_logs and _evidence_window_seconds(since) is None:
+        raise ValueError(
+            "--since must be N/Ns/Nm/Nh/Nd/Nw when collecting /var/log"
+        )
     return NodeConfig(
         host_alias=alias,
         invocation_id=invocation_id,
@@ -548,7 +557,8 @@ class SourceFacts:
     """The size and mtime `/var/log` accounting needs from one source file."""
 
     st_size: int
-    st_mtime_ns: int
+    # None when the source could be sized but not dated; see `_source_facts`.
+    st_mtime_ns: int | None
 
 
 def _source_facts(source: Path) -> SourceFacts | None:
@@ -563,15 +573,17 @@ def _source_facts(source: Path) -> SourceFacts | None:
     check still compares like with like.
     """
 
-    try:
-        info = source.lstat()
-    except OSError:
-        # Any failure, not just EACCES: `var_log_stat_size` in the reference
-        # tries `sudo -n stat` after any unprivileged `stat` returns non-zero,
-        # and a scan-then-stat race should reach the same answer here.
-        pass
-    else:
-        return SourceFacts(info.st_size, info.st_mtime_ns)
+    if os.environ.get("CEPH_INCIDENT_TEST_FORCE_SUDO") != "1":
+        try:
+            info = source.lstat()
+        except OSError:
+            # Any failure, not just EACCES: `var_log_stat_size` in the reference
+            # tries `sudo -n stat` after any unprivileged `stat` returns
+            # non-zero, and a scan-then-stat race should reach the same answer
+            # here.
+            pass
+        else:
+            return SourceFacts(info.st_size, info.st_mtime_ns)
     if _sudo_path() is None:
         return None
     try:
@@ -590,9 +602,18 @@ def _source_facts(source: Path) -> SourceFacts | None:
     if len(fields) != 2:
         return None
     try:
-        return SourceFacts(int(fields[0]), int(fields[1]) * 1_000_000_000)
+        size = int(fields[0])
     except ValueError:
         return None
+    # The reference asks for size and mtime as separate `stat` calls, so one can
+    # answer while the other does not.  A source whose mtime is unreadable is
+    # still evidence: keep it, and let the Evidence Window record that it could
+    # not be placed in time rather than dropping it.
+    try:
+        mtime_ns: int | None = int(fields[1]) * 1_000_000_000
+    except ValueError:
+        mtime_ns = None
+    return SourceFacts(size, mtime_ns)
 
 
 def _is_symlink(path: Path) -> bool:
@@ -988,6 +1009,78 @@ def _family_and_order(relative: str, codec: str) -> tuple[str, str]:
     return family, order_key
 
 
+def _header_mtime(mtime_ns: int | None) -> str:
+    """The merged-segment header's mtime field, `unknown` when it is not known."""
+
+    return "unknown" if mtime_ns is None else str(mtime_ns // 1_000_000_000)
+
+
+def _mtime_epoch(facts: SourceFacts | None) -> int | None:
+    """Whole-second mtime, which is the resolution `stat %Y` reports."""
+
+    if facts is None or facts.st_mtime_ns is None:
+        return None
+    return facts.st_mtime_ns // 1_000_000_000
+
+
+def _window_group(relative: str, codec: str) -> str:
+    """The group one source belongs to while the Evidence Window picks sources.
+
+    Text logs reuse the merge family, so a whole rotation set is decided as one
+    unit.  Binary systemd journals are never merged, and each of their file
+    names is its own family, so the window would keep every one of them as its
+    own newest-before-the-window file; group them the way journald names them
+    instead — by machine-id directory and stream (`system`, `user-1000`) — so
+    that one archived journal per stream crosses the boundary rather than all.
+    """
+
+    directory, separator, name = relative.rpartition("/")
+    stem = name[:-1] if name.endswith("~") else name
+    if stem.endswith(".journal"):
+        stream = stem[: -len(".journal")].split("@", 1)[0]
+        return f"journal:{directory}/{stream}" if separator else f"journal:{stream}"
+    family, _ = _family_and_order(relative, codec)
+    return f"family:{family}"
+
+
+def _window_dispositions(
+    entries: Sequence[tuple[str, int | None, str]], window_start: int
+) -> list[str]:
+    """Decide which sources the Evidence Window keeps, one log family at a time.
+
+    Each entry is one source as `(group, mtime epoch, relative path)`.  Rotation
+    mtimes say when the rotation happened, not what the file spans, so the
+    newest source older than the window start is kept as well: if logrotate ran
+    shortly before the collect, everything inside the window is in that file
+    (ADR 0012).
+    """
+
+    decisions = ["in-window"] * len(entries)
+    newest: dict[str, int] = {}
+    for index, (group, mtime, relative) in enumerate(entries):
+        if mtime is None:
+            # Collect it and say so, rather than silently dropping evidence over
+            # a metadata read the collector could not make.
+            decisions[index] = "mtime-unknown"
+            continue
+        if mtime >= window_start:
+            continue
+        decisions[index] = "outside-window"
+        candidate = newest.get(group)
+        if candidate is None:
+            newest[group] = index
+            continue
+        _, best_mtime, best_relative = entries[candidate]
+        assert best_mtime is not None
+        # Same mtime in one group is possible (a rotation and its copy); break
+        # the tie on the source name so both implementations pick the same file.
+        if mtime > best_mtime or (mtime == best_mtime and relative < best_relative):
+            newest[group] = index
+    for index in newest.values():
+        decisions[index] = "window-crossing"
+    return decisions
+
+
 def _merged_destination(output: Path, family: str) -> Path:
     parts = family.split("/")
     destination = output / "merged" / "tree"
@@ -1285,7 +1378,17 @@ def _collect_var_logs(
     root: Path,
     output: Path,
     config: NodeConfig,
+    window_start: int,
 ) -> VarLogResult:
+    """Collect `/var/log`, bounded by the Evidence Window.
+
+    `window_start` is the absolute start of the window in seconds since the
+    epoch; 0 means unbounded, because every real mtime is greater.  It is
+    absolute rather than a duration so that what gets collected does not depend
+    on when the collector runs, and so both implementations of the window can be
+    pinned by fixtures with fixed mtimes (ADR 0012).
+    """
+
     output.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not _is_directory(root):
         (output / "SKIPPED.txt").write_text(
@@ -1368,25 +1471,70 @@ def _collect_var_logs(
     partial = bool(scan_errors)
     estimated = 0
     over_limit = False
-    for sequence, source in enumerate(sources):
-        relative = source.relative_to(root).as_posix()
-        source_stat = _source_facts(source)
+    # Metadata pass.  Nothing is read here: the Evidence Window decides which
+    # sources are in scope from stat alone, and it decides before the byte cap is
+    # estimated so that the cap never judges data that is about to be dropped.
+    scanned = [
+        (source, source.relative_to(root).as_posix(), _source_facts(source))
+        for source in sources
+    ]
+    window = ["in-window"] * len(scanned)
+    if window_start > 0:
+        # Sensitive paths are never collected under any window, so leaving them
+        # out keeps them from taking a family's window-crossing slot.  A source
+        # with no readable metadata at all is already accounted for as a failure
+        # below, and the window has nothing to say about it.
+        indices = [
+            index
+            for index, (_, relative, facts) in enumerate(scanned)
+            if facts is not None and not _is_sensitive_path(relative)
+        ]
+        entries = [
+            (
+                _window_group(scanned[index][1], _codec_for(scanned[index][1])),
+                _mtime_epoch(scanned[index][2]),
+                scanned[index][1],
+            )
+            for index in indices
+        ]
+        for index, decision in zip(
+            indices, _window_dispositions(entries, window_start)
+        ):
+            window[index] = decision
+
+    for sequence, (source, relative, source_stat) in enumerate(scanned):
         if source_stat is None:
             partial = True
             errors.append(f"{_escape_tsv(relative)}\tstat-failed\n")
             continue
         codec = _codec_for(relative)
+        mtime = _mtime_epoch(source_stat)
+        mtime_field = "unknown" if mtime is None else str(mtime)
+        # The window annotation rides along on `detail` so that a reader can tell
+        # why coverage reaches further back than --since asked for, and which
+        # sources were kept despite unreadable metadata.
+        note = {
+            "window-crossing": " window-crossing",
+            "mtime-unknown": " mtime-unknown",
+        }.get(window[sequence], "")
         if _is_sensitive_path(relative):
             sensitive.append(f"{_escape_tsv(relative)}\n")
             index_lines.append(
                 f"{_escape_tsv(relative)}\t-\t{codec}\t{source_stat.st_size}\t0\t"
-                "skipped-sensitive\tforbidden path\n"
+                f"{mtime_field}\tskipped-sensitive\tforbidden path\n"
+            )
+            continue
+        if window[sequence] == "outside-window":
+            index_lines.append(
+                f"{_escape_tsv(relative)}\t-\t{codec}\t{source_stat.st_size}\t0\t"
+                f"{mtime_field}\toutside-window\t"
+                "older than the evidence window start\n"
             )
             continue
         if over_limit:
             index_lines.append(
                 f"{_escape_tsv(relative)}\t-\t{codec}\t{source_stat.st_size}\t0\t"
-                "not-inspected\tearlier file exceeded cap\n"
+                f"{mtime_field}\tnot-inspected\tearlier file exceeded cap{note}\n"
             )
             continue
         if _is_opaque_archive(relative):
@@ -1396,7 +1544,7 @@ def _collect_var_logs(
             opaque.append(f"{_escape_tsv(relative)}\n")
             index_lines.append(
                 f"{_escape_tsv(relative)}\t-\topaque\t{source_stat.st_size}\t0\t"
-                "raw\tnot auto-merged\n"
+                f"{mtime_field}\traw\tnot auto-merged{note}\n"
             )
             estimated += source_stat.st_size
             continue
@@ -1410,7 +1558,7 @@ def _collect_var_logs(
             cap = config.var_log_max_bytes
             index_lines.append(
                 f"{_escape_tsv(relative)}\t-\t{codec}\t{source_stat.st_size}\t>{cap}\t"
-                "over-limit\tdecoded stream exceeded cap\n"
+                f"{mtime_field}\tover-limit\tdecoded stream exceeded cap{note}\n"
             )
             continue
         if status != "ok":
@@ -1425,9 +1573,10 @@ def _collect_var_logs(
             raw_candidates.append(
                 RawCandidate(source, relative)
             )
+            detail = "missing codec" if status == "missing-codec" else "decode failed"
             index_lines.append(
                 f"{_escape_tsv(relative)}\t-\t{codec}\t{source_stat.st_size}\t0\t"
-                f"raw-partial\t{'missing codec' if status == 'missing-codec' else 'decode failed'}\n"
+                f"{mtime_field}\traw-partial\t{detail}{note}\n"
             )
             estimated += source_stat.st_size
             continue
@@ -1440,7 +1589,7 @@ def _collect_var_logs(
             raw_candidates.append(RawCandidate(source, relative))
             index_lines.append(
                 f"{_escape_tsv(relative)}\t-\t{codec}\t{source_stat.st_size}\t0\t"
-                "raw-partial\tdecode failed\n"
+                f"{mtime_field}\traw-partial\tdecode failed{note}\n"
             )
             estimated += source_stat.st_size
             continue
@@ -1453,7 +1602,7 @@ def _collect_var_logs(
             opaque.append(f"{_escape_tsv(relative)}\n")
             index_lines.append(
                 f"{_escape_tsv(relative)}\t-\t{codec}\t{source_stat.st_size}\t"
-                f"{decoded_size}\traw\tbinary or unknown\n"
+                f"{decoded_size}\t{mtime_field}\traw\tbinary or unknown{note}\n"
             )
             estimated += source_stat.st_size
             continue
@@ -1472,7 +1621,8 @@ def _collect_var_logs(
         )
         index_lines.append(
             f"{_escape_tsv(relative)}\t{_escape_tsv(family)}\t{codec}\t"
-            f"{source_stat.st_size}\t{decoded_size}\tmerge-candidate\toldest-to-newest\n"
+            f"{source_stat.st_size}\t{decoded_size}\t{mtime_field}\t"
+            f"merge-candidate\toldest-to-newest{note}\n"
         )
         estimated += decoded_size + 256
         if config.keep_original_logs:
@@ -1568,7 +1718,7 @@ def _collect_var_logs(
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         header = (
             f"===== source={_escape_tsv(candidate.relative)} "
-            f"mtime_epoch={candidate.mtime_ns // 1_000_000_000} "
+            f"mtime_epoch={_header_mtime(candidate.mtime_ns)} "
             f"stored_bytes={candidate.stored_bytes} codec={candidate.codec} =====\n"
         ).encode()
         segment_size = len(header) + decoded.stat().st_size + 1
@@ -1677,6 +1827,42 @@ def _journal_since(value: str) -> str:
     if re.fullmatch(r"[0-9]+[smhdw]", value):
         return f"-{value}"
     return value
+
+
+def _evidence_window_seconds(value: str) -> int | None:
+    """Parse an Evidence Window duration: N (seconds) or N{s,m,h,d,w}.
+
+    The grammar stays this strict on purpose.  Absolute file selection needs an
+    epoch to compare mtimes against, and turning a free-form `journalctl` range
+    such as `yesterday` into one would need a date parser shared with the shell
+    reference — which would let one parsing bug pick the wrong files on both
+    sides at once, where the differential gate cannot see it (ADR 0012).
+    """
+
+    match = re.fullmatch(r"([0-9]+)([smhdw]?)", value)
+    if match is None:
+        return None
+    amount = int(match.group(1))
+    if amount <= 0:
+        return None
+    return amount * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[
+        match.group(2)
+    ]
+
+
+def _evidence_window_start(since: str) -> int:
+    """The window start as an absolute epoch, read off this node's clock.
+
+    It is computed here rather than on the workstation because it is compared
+    against this node's file mtimes, and this node's clock is what stamped them.
+    """
+
+    seconds = _evidence_window_seconds(since)
+    if seconds is None:
+        return 0
+    # 0 is the "unbounded" value, so a window that reaches past the epoch — only
+    # possible with a badly wrong clock — still has to bound something.
+    return max(int(time.time()) - seconds, 1)
 
 
 def _capture_command_bounded(
@@ -2011,7 +2197,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
         else:
             root = _node_path("CEPH_INCIDENT_VAR_LOG_DIR", "/var/log")
             log_started = _utc_now()
-            log_result = _collect_var_logs(root, log_output, config)
+            log_result = _collect_var_logs(
+                root, log_output, config, _evidence_window_start(config.since)
+            )
             journal_result = _collect_journal(
                 log_output, config, log_result.exit_code
             )
