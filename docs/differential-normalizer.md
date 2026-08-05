@@ -54,7 +54,7 @@ fake `ssh` 與 fake `kubectl` 都是白名單 adapter：未列入的 remote comm
 | # | 差異 | 處理方式 | 理由 |
 |---|---|---|---|
 | 1 | timestamps（ISO8601 字串、`created_utc`、`started`/`ended`、mtimes） | 值換成 `<timestamp>` | 兩次 run 不可能同時；ADR 0006 只要求 observable contract 等價 |
-| 1a | epoch seconds，**僅限**兩處：`cluster/prometheus/` 層的內容（dump-info window 起迄、metric sample 時間戳，含 JSON 數值），以及任何被記錄的請求裡 `start=`／`end=`／`time=` 這三個具名參數的值 | 值換成 `<epoch>` | 那是查詢時鐘；其他數字（byte 總量、object 數）即使落在同一範圍也是證據，一律逐字比較 |
+| 1a | epoch seconds，**僅限**兩處：`cluster/prometheus/` 層的內容（dump-info window 起迄、metric sample 時間戳，含 JSON 數值），以及任何被記錄的請求裡 `start=`／`end=`／`time=` 這三個具名參數的值 | 值換成 `<epoch>` | 那是查詢時鐘；其他數字（byte 總量、object 數）即使落在同一範圍也是證據，一律逐字比較。**真 lab gate 對 Prometheus 的 `start=`／`end=` 比這條嚴**：它保留 `end - start`（即 Evidence Window 的秒數），只抹掉錨點——因為那裡不比對 artifact body，argv 是窗口寬度唯一還看得到的地方。差異是刻意的，見 `docs/lab-bundle-contract.md` 的 normalizer 表 |
 | 2 | random temporary paths（workdir `tmp.*`、node 端 `/tmp/ceph-incident-node.*`、redaction scratch `.<name>.plain.XXXXXX`、archive 檔名時間戳） | 換成 `<workdir>` / `<node-tmp>` / 原 artifact 名 | 由 mktemp 決定，不是行為 |
 | 3 | JSON formatting 與 key order | 解析後比較資料結構 | ADR 0006 明文不要求 serialization byte-identical |
 | 4 | shell quoting 風格（`printf %q` 對 `shlex.join`） | manifest / CONTENTS.md / ssh-debug 的 command 一律 `shlex.split` 成 argv 後比較 | 同一條 argv 的兩種書寫；argv 本身仍逐字比較 |
