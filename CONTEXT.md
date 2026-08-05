@@ -69,8 +69,12 @@ Real-lab canary 用來證明 collect 沒有改變系統狀態的一組穩定 ide
 _Avoid_: Full state dump, health snapshot
 
 **Full Collect**:
-在同一個 lab、同一次 collect 中取得 Ceph、Rook、Prometheus 與所有 inventory nodes（包含 `/var/log`）的完整 evidence。
-_Avoid_: Collector smoke test, split canaries, partial collect
+在同一個 lab、同一次 collect 中，Ceph、Rook、Prometheus 與所有 inventory nodes（包含 `/var/log`）四條 collector path 全部成功走完，沒有任何一條 partial、missing 或 skipped 的 collect。它描述的是 coverage 完整，不是 evidence 收到底；每條 path 收多少由設定的界線決定。
+_Avoid_: Collector smoke test, split canaries, partial collect, 完整 evidence
+
+**Evidence Window**:
+界定一次 collect 要取得哪些 evidence 的時間範圍。每條 collector path 以自己的資料所能達到的精度遵守它：能逐筆過濾的（如 journal 查詢）取窗口內的記錄，只能整檔取捨的（如 `/var/log` 的輪替檔與 binary journal）取窗口內的檔案，外加跨越窗口起點的那一個最新檔——因為證據可能落在那個檔裡。
+_Avoid_: Since, retention, 保留期限, 時間範圍
 
 **Lab Profile**:
 描述 real-lab canary 連線入口、預期 cluster identity 與必要 collector coverage 的本機 TOML 設定；它只引用憑證路徑，不保存憑證內容。
