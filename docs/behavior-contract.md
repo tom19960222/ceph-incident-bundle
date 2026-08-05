@@ -557,7 +557,7 @@ NUL 是兩種引擎唯一被允許分歧的位元組，**上一段那條規則�
 
 ---
 
-## 14. `run_capture` 與 artifact/manifest 格式（lib/common.sh:160-196、387-448）
+## 14. `run_capture` 與 artifact/manifest 格式（lib/common.sh:160-182、387-448）
 
 每個被捕捉的指令：
 
@@ -565,7 +565,7 @@ NUL 是兩種引擎唯一被允許分歧的位元組，**上一段那條規則�
 - **stdin 一律關成 `/dev/null`**（:417、:424）。被捕捉的指令沒有一個是互動程式，但 `ssh` 不管遠端要不要都會把 stdin 讀到 EOF，而呼叫端多半是 `while IFS= read -r … done <<<"$list"` 迴圈——繼承 stdin 等於讓第一次 capture 吃掉迴圈還沒讀的清單。`ceph crash info` 因此在真 lab 上九個 id 只取到兩個（#52）。
 - 指令被 `timeout $COMMAND_TIMEOUT`（預設 20）包住；exit 124/137 時檔尾補 `# TRUNCATED: command timed out after <s>s (exit <rc>)`（:433-435）。
 - 先寫入同目錄 mktemp 暫存檔再 `mv`（不會留半寫檔）。
-- `manifest.jsonl` 追加一行 JSON：`{"host":…,"collector":…,"artifact":<絕對路徑>,"command":<%q quoted 字串>,"exit_code":N,"started":…,"ended":…}`（自製 escape：`\ " \n \r \t`；:160-196）。exit_code 必須是數字，否則 die。
+- `manifest.jsonl` 追加一行 JSON：`{"host":…,"collector":…,"artifact":<絕對路徑>,"command":<%q quoted 字串>,"exit_code":N,"started":…,"ended":…}`（自製 escape：`\ " \n \r \t`；:160-182）。exit_code 必須是數字，否則 die。
 - 非 0 且設了 `ERROR_LOG` → 追加 `<ended> host=<h> collector=<c> artifact=<a> exit=<rc> command=<cmd>`（:441-445）。
 - cluster 層寫 workdir 根的 `manifest.jsonl`/`errors.log`；node 層寫 node 自己 out 目錄下的（打包後成為 `nodes/<alias>/manifest.jsonl`、`nodes/<alias>/errors.log`）。
 

@@ -287,12 +287,16 @@ class ContractTests(BundleTestCase):
             any("command" in line for line in describe_differences(reference, candidate))
         )
 
-    def with_command(self, command: str, name: str):
+    def with_command(self, command: str, name: str, artifact: str | None = None):
         members = bundle_members()
         record = json.loads(members["manifest.jsonl"].decode("utf-8").splitlines()[0])
         record["command"] = command
+        if artifact is not None:
+            record["artifact"] = artifact
         members["manifest.jsonl"] = (json.dumps(record) + "\n").encode("utf-8")
         return contract_of(read_bundle(self.write(members, name)))
+
+    PROM_INDEX = "/out/tmp.workdir/cluster/prometheus/ceph/index.txt"
 
     def test_each_implementations_own_workdir_name_is_not_a_difference(self) -> None:
         # The reference names its scratch directory `tmp.<stamp>.$$` and the
@@ -314,10 +318,12 @@ class ContractTests(BundleTestCase):
         reference = self.with_command(
             "curl -s /api/v1/query_range start=1785852083 end=1785938483 step=15",
             "window-ref.tar.gz",
+            self.PROM_INDEX,
         )
         candidate = self.with_command(
             "curl -s /api/v1/query_range start=1785853334 end=1785939734 step=15",
             "window-cand.tar.gz",
+            self.PROM_INDEX,
         )
         self.assertEqual(describe_differences(reference, candidate), ())
 
@@ -328,10 +334,26 @@ class ContractTests(BundleTestCase):
         reference = self.with_command(
             "curl -s /api/v1/query_range start=1785852083 end=1785938483 step=15",
             "since-ref.tar.gz",
+            self.PROM_INDEX,
         )
         candidate = self.with_command(
             "curl -s /api/v1/query_range start=1785896534 end=1785939734 step=15",
             "since-cand.tar.gz",
+            self.PROM_INDEX,
+        )
+        self.assertNotEqual(describe_differences(reference, candidate), ())
+
+    def test_the_window_rewrite_does_not_reach_another_layers_argv(self) -> None:
+        # The rewrite exists for the collector that computes those epochs from
+        # its own start.  Any other command carrying a `start=`/`end=` pair is
+        # some other argument, and two differing values there are a difference.
+        reference = self.with_command(
+            "ssh -i /key monitor01 ceph report start=1785852083 end=1785938483",
+            "other-layer-ref.tar.gz",
+        )
+        candidate = self.with_command(
+            "ssh -i /key monitor01 ceph report start=1785853334 end=1785939734",
+            "other-layer-cand.tar.gz",
         )
         self.assertNotEqual(describe_differences(reference, candidate), ())
 
@@ -441,8 +463,8 @@ class ContractTests(BundleTestCase):
 
 
 # The remote workspace as both implementations really name it, `out/` included:
-# each invokes its node collector with `--out <workspace>/out`, so that segment
-# is in every artifact path their manifests record and is gone from the packed
+# each writes its evidence to `<workspace>/out`, so that segment is in every
+# artifact path their manifests record and is gone from the packed
 # `nodes/<alias>/` tree.  A fixture that left it out made every bundle lookup in
 # the ADR 0010 reduction ask about a member that could not exist, which is how
 # these tests stayed green while the real gate let 13 entries through (#52).
@@ -644,24 +666,28 @@ class NodeManifestTests(BundleTestCase):
         # the gate compares that the listing was recorded, not how.
         self.assertEqual(describe_differences(self.reference(), self.candidate()), ())
 
-    def test_a_node_without_a_readable_var_lib_ceph_agrees_it_has_no_listing(self) -> None:
-        # The lab's Kubernetes node has no `/var/lib/ceph`, so both sides write
-        # the same SKIPPED marker — and only the candidate indexes the marker.
-        # The recorded fact is about the *evidence*, so an index entry over a
-        # marker must not make one side claim a listing the archive does not
-        # hold: reading it from the entry instead of from the bundle turned this
-        # node into a disagreement on the real lab (#52).
+    def skipped_listing(self, manifest_lines: list[object], name: str):
+        """A bundle whose `/var/lib/ceph` was not readable, as the k8s node's was not."""
+
         members = bundle_members(hosts=(self.HOST,))
         members[f"nodes/{self.HOST}/cephadm/var-lib-ceph-listing.txt"] = (
             b"SKIPPED: /var/lib/ceph is not a readable directory on this node\n"
         )
         members[f"nodes/{self.HOST}/manifest.jsonl"] = "".join(
-            json.dumps(line) + "\n" for line in self.shared()
+            json.dumps(line) + "\n" for line in manifest_lines
         ).encode("utf-8")
-        reference = contract_of(read_bundle(self.write(members, "no-listing-ref.tar.gz")))
-        members[f"nodes/{self.HOST}/manifest.jsonl"] = "".join(
-            json.dumps(line) + "\n"
-            for line in self.shared()
+        return contract_of(read_bundle(self.write(members, name)))
+
+    def test_a_node_without_a_readable_var_lib_ceph_agrees_it_has_no_listing(self) -> None:
+        # The lab's Kubernetes node has no `/var/lib/ceph`, so both sides write
+        # the same SKIPPED marker — and only the candidate indexes the marker.
+        # An index over a marker is the table's third row, so it drops there;
+        # letting it reach the listing branch instead made the candidate claim a
+        # listing the archive does not hold, and the gate called that a
+        # disagreement about identical evidence (#52).
+        reference = self.skipped_listing(self.shared(), "no-listing-ref.tar.gz")
+        candidate = self.skipped_listing(
+            self.shared()
             + [
                 node_entry(
                     self.HOST,
@@ -669,24 +695,32 @@ class NodeManifestTests(BundleTestCase):
                     "collect-node list /var/lib/ceph",
                     2,
                 )
-            ]
-        ).encode("utf-8")
-        candidate = contract_of(read_bundle(self.write(members, "no-listing-cand.tar.gz")))
+            ],
+            "no-listing-cand.tar.gz",
+        )
         self.assertEqual(describe_differences(reference, candidate), ())
 
-    def test_a_listing_only_one_side_collected_is_still_a_difference(self) -> None:
-        # The convergence is on the evidence, so the evidence still has to
-        # agree: a listing one bundle carries and the other skipped is a real
-        # divergence in what was collected, not a difference in bookkeeping.
-        members = bundle_members(hosts=(self.HOST,))
-        members[f"nodes/{self.HOST}/cephadm/var-lib-ceph-listing.txt"] = (
-            b"SKIPPED: /var/lib/ceph is not a readable directory on this node\n"
+    def test_a_listing_only_one_side_recorded_is_still_a_difference(self) -> None:
+        # Dropping the marker index must not cost the fact itself: a node that
+        # recorded a real listing against one that did not is a divergence in
+        # what was collected.  Both sides are built the same way so the listing
+        # is the only thing that can differ.
+        reference = self.skipped_listing(self.shared(), "one-sided-ref.tar.gz")
+        candidate = self.bundle(
+            self.shared()
+            + [
+                node_entry(
+                    self.HOST,
+                    "cephadm/var-lib-ceph-listing.txt",
+                    "collect-node list /var/lib/ceph",
+                )
+            ],
+            "one-sided-cand.tar.gz",
         )
-        members[f"nodes/{self.HOST}/manifest.jsonl"] = "".join(
-            json.dumps(line) + "\n" for line in self.shared()
-        ).encode("utf-8")
-        reference = contract_of(read_bundle(self.write(members, "skipped-listing.tar.gz")))
-        self.assertNotEqual(describe_differences(reference, self.candidate()), ())
+        differences = describe_differences(reference, candidate)
+        self.assertTrue(
+            any("var_lib_ceph_listing" in line for line in differences), differences
+        )
 
     def test_an_entry_the_reference_claims_is_still_compared(self) -> None:
         reference = self.reference()
