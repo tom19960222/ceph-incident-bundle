@@ -29,6 +29,7 @@ for path in \
   "$ROOT/lib/node-archive.sh" \
   "$ROOT/lib/verify-bundle.sh" \
   "$ROOT/tests/test-collect.sh" \
+  "$ROOT/tests/test-redaction-equivalence.sh" \
   "$ROOT/tests/test-cephadm-collector.sh" \
   "$ROOT/tests/test-node-collector.sh" \
   "$ROOT/tests/test-node-archive-acceptance.sh" \
@@ -80,6 +81,11 @@ common_helpers_args="$(run_and_capture "$ROOT/tests/test-common.sh")"
 common_helpers_status="${common_helpers_args%%$'\n'*}"
 common_helpers_output="${common_helpers_args#*$'\n'}"
 [[ "$common_helpers_status" == "0" ]] || fail "test-common.sh failed: $common_helpers_output"
+
+redaction_equivalence_args="$(run_and_capture "$ROOT/tests/test-redaction-equivalence.sh")"
+redaction_equivalence_status="${redaction_equivalence_args%%$'\n'*}"
+redaction_equivalence_output="${redaction_equivalence_args#*$'\n'}"
+[[ "$redaction_equivalence_status" == "0" ]] || fail "test-redaction-equivalence.sh failed: $redaction_equivalence_output"
 
 verify_bundle_args="$(run_and_capture "$ROOT/tests/test-verify-bundle.sh")"
 verify_bundle_status="${verify_bundle_args%%$'\n'*}"

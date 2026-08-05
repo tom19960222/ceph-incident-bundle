@@ -154,71 +154,120 @@ manifest_add() {
     "$(json_escape "$ended")" >>"$manifest"
 }
 
-# Redact stdin to stdout, writing "<redacted> <records>" to $1: how many lines
-# were replaced, and how many newline-terminated records were read. The second
-# number is what proves the whole stream arrived.
+# Redaction is the phase that decides whether a collect finishes at all. The
+# line-at-a-time bash loop this replaced ran at 10 MiB/min, which for the
+# evidence one real-lab collect produced meant 12.8 hours — past the
+# qualification harness's own four-hour collect timeout, so the run was killed
+# with nothing to show (issue #59). There is no slower path worth falling back
+# to, and falling back quietly would bring that failure mode back without a
+# message, so a workstation without a usable `awk` stops the collect and says
+# what is missing — the answer ADR 0011 gives for a missing `timeout` binary.
+# `run/collect.sh` calls this before it collects anything, so an unusable awk
+# costs a second rather than a finished collect; `redact_file` calls it too, so
+# the seam holds on its own. The answer is cached because the second call
+# onwards would otherwise fork an awk per artifact, in the one function whose
+# whole purpose is not to spend a process per unit of work.
+REDACTION_AWK_CHECKED=0
+require_redaction_awk() {
+  [[ $REDACTION_AWK_CHECKED -eq 1 ]] && return 0
+  command -v awk >/dev/null 2>&1 ||
+    die "awk not found: redaction needs it and has no fallback"
+  # `{38,}` is the only interval expression in the rules, and it is the one that
+  # catches ceph key material. A pre-POSIX awk (mawk 1.3.3) reads it as literal
+  # text, which does not fail — it quietly stops redacting base64 key blobs.
+  [[ "$(printf 'aaa\n' | LC_ALL=C awk '/a{3}/ { print "ok" }' 2>/dev/null)" == ok ]] ||
+    die "awk does not support interval expressions like {38,}: redaction would miss key material"
+  REDACTION_AWK_CHECKED=1
+}
+
+# Redact stdin to stdout in a single `awk` pass, writing "<redacted> <records>"
+# to $1: how many lines were replaced, and how many newline-terminated records
+# were read. The second number is what proves the whole stream arrived.
+#
+# The stream must carry one extra newline on the end — `redact_file` appends it
+# — because `awk` cannot otherwise tell a source that ended on a newline from a
+# stream that stopped halfway through a line. `NR` counts both the same, and
+# telling them apart is the entire integrity check. With the extra newline the
+# last record answers it: an empty one means the stream ended where a record
+# ended, and a non-empty one is whatever was left dangling. Either way it is not
+# a newline-terminated record of the source, so it never counts.
+#
+# The four rules are unchanged from the loop this replaced (#59). That loop ran
+# under `shopt -s nocasematch`, so the first three match against a lowercased
+# copy of the line while the original stays what gets printed; the fourth needs
+# no copy, its character class already spanning both cases and `=` having none.
+#
+# `LC_ALL=C` makes the scan byte-oriented, because real /var/log carries invalid
+# UTF-8 and a multibyte-aware awk handed it either aborts (`illegal byte
+# sequence`) or matches undefined. The price is that every bracket expression
+# here becomes a byte test, which moves results in both directions against a
+# loop that followed the caller's locale: `密key = 1` and invalid-UTF-8 lines
+# start redacting, `private<U+2003>key` stops. Both directions land on what the
+# Python candidate's `[^A-Za-z0-9]` and `[\t\v\f\r ]` already do — see
+# docs/behavior-contract.md §13.2.
 #
 # Best-effort redaction (NOT a complete DLP): keyword lines, ceph key material
 # (`key = AQB..==`, base64 blobs), and whole multi-line PEM private key blocks.
 # Extensions/encodings outside this are intentionally not covered — see README
 # "安全界線"; operators must self-review before sharing.
 redact_stream() {
-  local count_file=$1
-  local count=0 records=0 line in_pem=0 redact nocase_was_set=0 tail_done=0
-  shopt -q nocasematch && nocase_was_set=1
-  shopt -s nocasematch
-
-  # The `||` arm exists for a final line with no newline. It is latched so it
-  # can fire at most once: a `read` that fails without clearing `line` would
-  # otherwise keep the condition true forever — see issue #49.
-  while IFS= read -r line || { [[ $tail_done -eq 0 && -n "$line" ]] && tail_done=1; }; do
-    [[ $tail_done -eq 0 ]] && records=$((records + 1))
-    redact=0
-    if [[ "$line" =~ -----BEGIN[[:space:]].*PRIVATE[[:space:]]KEY----- ]]; then
-      in_pem=1
-    fi
-    if [[ $in_pem -eq 1 ]]; then
-      redact=1
-      if [[ "$line" =~ -----END[[:space:]].*PRIVATE[[:space:]]KEY----- ]]; then
-        in_pem=0
-      fi
-    elif [[ "$line" =~ (password|secret|token|keyring|private([[:space:]_-]+)?key) ]]; then
-      redact=1
-    elif [[ "$line" =~ (^|[^[:alnum:]])key[[:space:]]*[:=] ]]; then
-      redact=1
-    elif [[ "$line" =~ [A-Za-z0-9+/]{38,}={1,2} ]]; then
-      redact=1
-    fi
-    if [[ $redact -eq 1 ]]; then
-      printf '[REDACTED]\n'
-      count=$((count + 1))
-    else
-      printf '%s\n' "$line"
-    fi
-    [[ $tail_done -eq 1 ]] && break
-  done
-
-  if [[ $nocase_was_set -eq 1 ]]; then shopt -s nocasematch; else shopt -u nocasematch; fi
-  printf '%s %s\n' "$count" "$records" >"$count_file"
+  LC_ALL=C awk -v count_file="$1" '
+    function scan(line,   lowered, redact) {
+      redact = 0
+      lowered = tolower(line)
+      if (lowered ~ /-----begin[[:space:]].*private[[:space:]]key-----/) in_pem = 1
+      if (in_pem) {
+        redact = 1
+        if (lowered ~ /-----end[[:space:]].*private[[:space:]]key-----/) in_pem = 0
+      } else if (lowered ~ /(password|secret|token|keyring|private([[:space:]_-]+)?key)/) {
+        redact = 1
+      } else if (lowered ~ /(^|[^[:alnum:]])key[[:space:]]*[:=]/) {
+        redact = 1
+      } else if (line ~ /[A-Za-z0-9+\/]{38,}={1,2}/) {
+        redact = 1
+      }
+      if (redact) { print "[REDACTED]"; count++ } else { print line }
+    }
+    # One record of lookahead, so END can still decide about the last one.
+    { if (held_set) scan(held); held = $0; held_set = 1 }
+    END {
+      records = NR - 1
+      if (records < 0) records = 0
+      # The held record is either the unterminated final line of the source or
+      # the empty record the appended newline made. The loop here before only
+      # processed such a line when `read` had left something behind, and `read`
+      # leaves nothing when the first byte is a NUL, so an empty one is dropped
+      # rather than written out as a blank line. That is what keeps a binary
+      # artifact carrying a text-ish name — a macOS AppleDouble `._name` sitting
+      # beside an extracted `name` — from gaining a byte it never had. An awk
+      # that keeps NUL inside a record sees this one differently; see
+      # docs/behavior-contract.md §13.2.
+      if (held_set && held != "") scan(held)
+      printf("%d %d\n", count + 0, records) > count_file
+    }
+  '
 }
 
 # Redact one text artifact in place.
 #
-# The source is streamed through a pipe rather than read with `<"$source_file"`.
-# Bash keeps a file offset for a redirected regular file and can stop making
-# forward progress on a large one: past 2 GiB `read` began failing without
-# clearing `line`, and the loop rewrote the same line until the disk filled —
-# one 3.25 GB node log produced 11.75 GB of output with a single line repeated
-# 75,056,647 times (issue #49). The same content read at a lower offset, and
-# the same content read through a pipe, are both fine. A pipe carries no offset.
+# The source is streamed through a pipe rather than opened by the scanner. Bash
+# keeps a file offset for a redirected regular file and can stop making forward
+# progress on a large one: past 2 GiB `read` began failing without clearing
+# `line`, and the loop rewrote the same line until the disk filled — one 3.25 GB
+# node log produced 11.75 GB of output with a single line repeated 75,056,647
+# times (issue #49). #59 replaced that loop with an `awk` scan, which does not
+# share the bug, but the pipe stays: the check below is a check on what a stream
+# delivered, and it is only worth something while the scanner is reading a
+# stream somebody else opened.
 #
-# Forward progress is then checked rather than assumed: the stream must deliver
-# every newline-terminated record the source holds. A stall shows up as a short
-# count, and the answer is to leave the original artifact in place and report it
-# as NOT redacted — silently dropping evidence is worse than refusing to redact.
+# Forward progress is checked rather than assumed: the stream must deliver every
+# newline-terminated record the source holds. A stall shows up as a short count,
+# and the answer is to leave the original artifact in place and report it as NOT
+# redacted — silently dropping evidence is worse than refusing to redact.
 redact_file() {
   local source_file=$1 redaction_log=$2 display_file=${3-$1}
   require_file "$source_file"
+  require_redaction_awk
   ensure_dir "$(dirname -- "$redaction_log")"
 
   local source_dir tmp_file count_file mode expected count='' records='' stream_ok=1
@@ -228,11 +277,15 @@ redact_file() {
   expected="$(wc -l <"$source_file")"
   expected=${expected//[[:space:]]/}
 
+  # `cat` concatenates the source with one more newline, which is what lets the
+  # scan report a record count in the same units `wc -l` counts in — and what
+  # lets it see a stream that stopped mid-line at all. See `redact_stream`.
+  #
   # `if !` rather than `set +e`: toggling errexit here would hand the caller
   # back a different shell than it had, and this function is called from both
   # errexit and non-errexit contexts. A `cat` that dies mid-stream needs no
   # special case — it shows up as a short record count below.
-  if ! cat -- "$source_file" | redact_stream "$count_file" >"$tmp_file"; then
+  if ! cat -- "$source_file" <(printf '\n') | redact_stream "$count_file" >"$tmp_file"; then
     stream_ok=0
   fi
   read -r count records <"$count_file" || true

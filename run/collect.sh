@@ -507,6 +507,10 @@ main() {
   fi
   [[ -n "$inventory" && -f "$inventory" ]] || die "missing inventory: ${inventory:-<unset>}"
   [[ -n "$ssh_key" && -f "$ssh_key" ]] || die "missing ssh key: ${ssh_key:-<unset>}"
+  # Redaction runs in the last phase, so an unusable `awk` would otherwise be
+  # discovered after hours of collecting. `redact_file` checks too — this only
+  # moves the same failure to the second it costs nothing.
+  [[ $redact_enabled -eq 0 ]] || require_redaction_awk
   export CEPH_INCIDENT_TRUST_SSH_HOST_KEY=$trust_ssh_host_key
 
   load_inventory "$inventory" || die "inventory must contain only supported quoted assignments and HOSTS entries"
