@@ -138,6 +138,11 @@ source／runner 選擇也都不受影響。
 `validation/lab_bundle.py` 的 `_default_substitutions()`，加上 `_argv()` 對 argv 逐
 筆做的 query-window 改寫。每一條都是時鐘或亂數：
 
+**與離線 gate 的差異是刻意的。** `docs/differential-normalizer.md` 規則 1a 把任何被
+記錄的請求裡 `start=`／`end=`／`time=` 的值整個換成 `<epoch>`，窗口寬度一起丟；下表
+那一條保留寬度，比 1a **更嚴**。兩份文件並排讀不要誤以為其中一邊是 bug——理由記在該
+列的「理由」欄。
+
 | 規則 | 理由 |
 | --- | --- |
 | `ceph-incident-<YYYYMMDDTHHMMSSZ>` → `ceph-incident-<stamp>` | bundle 檔名帶採集時刻 |
@@ -145,7 +150,7 @@ source／runner 選擇也都不受影響。
 | `.../ceph-incident-node[.-]<suffix>` → `<node-workspace>` | 遠端 workspace 的 mktemp 後綴／invocation id |
 | `<dir>/.<name>.{plain,encoded}.<random>` → `<dir>/<name>` | redaction 暫存檔指向同一個 artifact |
 | `.../tmp.<random>[.<pid>]` → `<workdir>` | 工作機暫存目錄。兩邊命名法不同——reference 是 `tmp.<stamp>.$$`，candidate 是 `mkdtemp` 的後綴（字母表含 `_`）——這條規則必須兩種都吃完整，只吃掉一半會留下 `<workdir>.61493` 這種尾巴（#52） |
-| `start=<epoch>`／`end=<epoch>` → `start=<epoch-Ns>`／`end=<epoch>`，**僅限 artifact 落在 `cluster/prometheus/` 的 entry** | Prometheus query window 的兩端是採集起始時刻算出來的 epoch，兩次 run 必然不同。**窗口寬度 `N` 保留**：`--since` 是決策不是時鐘，換了寬度仍然是差異。這是唯一一條「改寫」而非「抹除」的規則，已知代價是窗口的絕對錨點不再可觀測——寬度對、但把 `end` 算在錯誤時間基準上的 candidate 會靜默通過，那要靠別的方式抓 |
+| `start=<epoch>`／`end=<epoch>` → `start=<epoch-Ns>`／`end=<epoch>`，**僅限 artifact 落在 `cluster/prometheus/` 的 entry** | Prometheus query window 的兩端是採集起始時刻算出來的 epoch，兩次 run 必然不同。**窗口寬度 `N` 保留**：`end - start` 恆等於 Evidence Window 的秒數（兩邊都是 `end = now()`、`start = end - since`），而這裡是本 gate 唯一還看得到「Prometheus path 有沒有照 Evidence Window 取窗口」的地方——`dump-info.txt` 的 `since=` 在 body 裡，而本 gate 不比對 artifact body。已知代價是窗口的絕對錨點不再可觀測：寬度對、但把 `end` 算在錯誤時間基準上的 candidate 會靜默通過 |
 | 32 位 hex → `<invocation>` | node invocation identifier |
 | 各自的 `--out` 目錄與 run directory → `<bundle>`／`<run>` | 兩次 run 依定義寫在不同目錄 |
 
