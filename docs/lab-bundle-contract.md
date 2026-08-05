@@ -93,23 +93,41 @@ Index verb 的意思是「這份 evidence 沒有任何指令為它執行過」�
 說了不算：artifact 只要帶著 `# host: ` capture 檔頭，就代表真的跑過指令，該筆 entry
 留在比對裡。否則任何一筆 entry 只要換上 verb 就能從 gate 消失。
 
+上表**三列都要拿 entry 去問 bundle**，所以 entry 記的 artifact 路徑必須先解析成
+bundle 裡的 member 路徑：node manifest 記的是 evidence 在 node 上的絕對路徑
+`<workspace>/out/<relative>`（shell reference 以 `--out "$tmp/out"` 呼叫 node
+collector，Python candidate 自己算 `workspace / "out"`——旗標不同，`out/` 這段相同），
+打包後同一份 evidence 是 `nodes/<alias>/<relative>`，所以 workspace 與 `out/` 兩段都
+要脫掉。少脫一段問到的就是一個不存在的 member，而 bundle 對不存在的 member 只會回答
+「不是 skip marker」「沒有 capture 檔頭」——剛好是讓三列**全部永遠不成立**的答案。
+#52 的真 lab 上就是這樣讓 13 筆 entry 溜過整條化約，而離線測試全綠，因為 fixture 寫
+的 artifact 沒有真實收集器會加的那段 `out/`。
+
 **`logs/var-log/` 不是整包排除。** 那棵樹裡的 `journal-all-since.txt` 是兩邊都執行
 並記錄的 capture，`sudo -n` 與 `--since` 時間窗都在它的 argv 上，所以它照常逐筆比
 對；被移除的是那棵樹其餘由 `collect-var-log` 索引起來的產出。
 
-`/var/lib/ceph` listing 是另一種情況：兩邊都有這筆 entry，但記法不同。Python 記
-ADR 0010 的穩定 verb `collect-node list <dir>`；shell 記真正的 `find` argv，而那串
-expression 裡有 `*keyring*`，會被 content safety 整行遮成 `[REDACTED]`。同一件事的
-兩種記法，因此各自收斂成「這台有沒有記到 listing」一個事實——ADR 0010 早已把這筆的
-command policy 交給 N9 的 argv ledger 斷言。收斂是**認 artifact 而不是認 verb**，所
-以 #44 把 content safety 移掉、shell 的 `find` entry 不再被遮之後，這條規則不會反過
-來讓 gate 誤判。
+`/var/lib/ceph` listing 是另一種情況：這台有 listing 時兩邊都會記，但記法不同。
+Python 記 ADR 0010 的穩定 verb `collect-node list <dir>`；shell 記真正的 `find`
+argv，而那串 expression 裡有 `*keyring*`，會被 content safety 整行遮成
+`[REDACTED]`。同一件事的兩種記法，因此各自收斂成「這台有沒有記到 listing」一個事實
+——ADR 0010 早已把這筆的 command policy 交給 N9 的 argv ledger 斷言。收斂是**認
+artifact 而不是認 verb**，所以 #44 把 content safety 移掉、shell 的 `find` entry 不
+再被遮之後，這條規則不會反過來讓 gate 誤判。
 
-界線寫死在兩處：**只有**該 node 的 `cephadm/var-lib-ceph-listing.txt` 真的在 bundle
-裡（且不是 skip）時才會去吃被遮蔽的行，而且**只吃掉一行**。第二行 `[REDACTED]` 是
-這裡沒有解釋的遮蔽，會原樣留在比對裡讓 gate 失敗。已知代價：一行 `[REDACTED]` 本身
-不帶任何資訊，所以在 listing artifact 存在的前提下，「被遮蔽的 listing entry」與
-「少索引了 listing 又剛好有一行別的被遮蔽」這兩種情況分不出來。
+**順序是規則的一部分**：上表三列先判，判掉的不會走到這條收斂。`/var/lib/ceph` 不存
+在的 node 上兩邊都寫同一份 SKIPPED marker，只有 candidate 會把那份 marker 也編進索
+引；那筆 entry 是第三列的 marker index，就在那裡被移除。先判收斂的話，candidate 會
+因為「有一筆 entry 指到 listing artifact」而宣稱這台記到了 listing，reference 宣稱沒
+有——兩邊寫出一模一樣的證據，卻被 gate 講成有分歧。#52 的 k8s node 就是這樣被誤報
+的。反過來，真的只有一邊記到 listing 仍然是差異，照報。
+
+被遮蔽的那一行另外算：**只有**該 node 的 listing 真的在 bundle 裡（且不是 skip）、
+且這份 manifest 自己沒有任何一筆 entry 收斂成 listing 時，才會去吃被遮蔽的行，而且
+**只吃掉一行**。第二行 `[REDACTED]` 是這裡沒有解釋的遮蔽，會原樣留在比對裡讓
+gate 失敗。已知代價：一行 `[REDACTED]` 本身不帶任何資訊，所以在 listing artifact 存
+在的前提下，「被遮蔽的 listing entry」與「少索引了 listing 又剛好有一行別的被遮蔽」
+這兩種情況分不出來。
 
 沒有落入上表任何一類的 entry 一律留在比對裡。放寬只到 node manifest 為止：頂層
 `manifest.jsonl` 仍然逐筆比對，cluster artifact 的 exit code、skip 分類與
@@ -117,7 +135,8 @@ source／runner 選擇也都不受影響。
 
 ## Normalizer 允許忽略的差異（完整清單）
 
-`validation/lab_bundle.py` 的 `_default_substitutions()`，每一條都是時鐘或亂數：
+`validation/lab_bundle.py` 的 `_default_substitutions()`，加上 `_argv()` 對 argv 逐
+筆做的 query-window 改寫。每一條都是時鐘或亂數：
 
 | 規則 | 理由 |
 | --- | --- |
@@ -125,7 +144,8 @@ source／runner 選擇也都不受影響。
 | ISO-8601 timestamp → `<timestamp>` | 採集時刻 |
 | `.../ceph-incident-node[.-]<suffix>` → `<node-workspace>` | 遠端 workspace 的 mktemp 後綴／invocation id |
 | `<dir>/.<name>.{plain,encoded}.<random>` → `<dir>/<name>` | redaction 暫存檔指向同一個 artifact |
-| `.../tmp.<random>` → `<workdir>` | 工作機暫存目錄 |
+| `.../tmp.<random>[.<pid>]` → `<workdir>` | 工作機暫存目錄。兩邊命名法不同——reference 是 `tmp.<stamp>.$$`，candidate 是 `mkdtemp` 的後綴（字母表含 `_`）——這條規則必須兩種都吃完整，只吃掉一半會留下 `<workdir>.61493` 這種尾巴（#52） |
+| `start=<epoch>`／`end=<epoch>` → `start=<epoch-Ns>`／`end=<epoch>`，**僅限 artifact 落在 `cluster/prometheus/` 的 entry** | Prometheus query window 的兩端是採集起始時刻算出來的 epoch，兩次 run 必然不同。**窗口寬度 `N` 保留**：`--since` 是決策不是時鐘，換了寬度仍然是差異。這是唯一一條「改寫」而非「抹除」的規則，已知代價是窗口的絕對錨點不再可觀測——寬度對、但把 `end` 算在錯誤時間基準上的 candidate 會靜默通過，那要靠別的方式抓 |
 | 32 位 hex → `<invocation>` | node invocation identifier |
 | 各自的 `--out` 目錄與 run directory → `<bundle>`／`<run>` | 兩次 run 依定義寫在不同目錄 |
 

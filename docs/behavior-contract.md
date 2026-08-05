@@ -275,13 +275,13 @@ runner token → 遠端指令前綴（`ceph_runner_argv`）：
 
 ---
 
-## 9. cluster-ceph collector（lib/collect-cluster-cephadm.sh:130-209）
+## 9. cluster-ceph collector（lib/collect-cluster-cephadm.sh:140-219）
 
-`collect_cluster_cephadm workdir manifest seed ssh_key since timeout runner`。`since` 參數**刻意不使用**（cluster 指令是 point-in-time snapshot；:136-137）。runner 預設值 `cephadm`（:131，實務上 orchestrator 一定會傳）。
+`collect_cluster_cephadm workdir manifest seed ssh_key since timeout runner`。`since` 參數**刻意不使用**（cluster 指令是 point-in-time snapshot；:146-147）。runner 預設值 `cephadm`（:141，實務上 orchestrator 一定會傳）。
 
 每條指令 = `ssh <base_opts> <seed> <runner前綴> <指令字詞...>`，經 `run_capture`（§14）收進 artifact；exit 255/124/137 追加 ssh-debug（:39-41）。任何一條失敗 → 最後 return 2，但**全部照跑**。
 
-### 9.1 JSON artifacts（`cluster/ceph/json/`，:142-163，指令都加 `--format json-pretty`）
+### 9.1 JSON artifacts（`cluster/ceph/json/`，:152-173，指令都加 `--format json-pretty`）
 
 | 檔名 | ceph 指令 |
 |---|---|
@@ -306,13 +306,13 @@ runner token → 遠端指令前綴（`ceph_runner_argv`）：
 | config-dump.json | `config dump` |
 | crash-ls.json | `crash ls` |
 
-### 9.2 純文字 artifacts（`cluster/ceph/text/`，:165-170）
+### 9.2 純文字 artifacts（`cluster/ceph/text/`，:175-180）
 
 `status.txt`（`status`）、`health-detail.txt`（`health detail`）、`osd-tree.txt`（`osd tree`）、`orch-ps.txt`（`orch ps`）。
 
 進度顯示 `[k/24] ceph <cmd>`（20 json + 4 text）。
 
-### 9.3 recent crashes（:103-128、49-101）
+### 9.3 recent crashes（:103-138、49-101）
 
 1. 從 `json/crash-ls.json`（去掉 `#` header 行後）用 regex 抽 `"crash_id":"..."`，**只取前 10 個**（:58-63）。
 2. 抽不到且內容不是已知空清單形（`[]`、`{}`、`{"crashes":[]}`、`{"items":[]}`、`{"entries":[]}`、`{"crash_ls":[]}` 去空白比對）→ 寫 `cluster/ceph/text/crash-info-skip.txt`：`SKIPPED: unable to parse crash list JSON for recent crash inspection`，**return 0（不算失敗）**（:110-113）。
@@ -511,7 +511,7 @@ redaction 之後（redaction 可能改變大小）對每台 node 重算 `merged/
 
 ---
 
-## 13. Redaction（lib/common.sh:157-358；lib/bundle.sh:228-253）
+## 13. Redaction（lib/common.sh:198-385；lib/bundle.sh:228-253）
 
 ### 13.1 範圍（`redact_bundle_text`）
 
@@ -519,7 +519,7 @@ redaction 之後（redaction 可能改變大小）對每台 node 重算 `merged/
 
 ### 13.2 規則（`redact_file`，行為單位 = 整行換成 `[REDACTED]`，大小寫不敏感）
 
-命中條件（:215-230）：
+命中條件（:245-255）：
 
 1. PEM private key 區塊：`-----BEGIN ... PRIVATE KEY-----` 起至 `-----END ... PRIVATE KEY-----` 止的**整段**。
 2. 行含 `password`、`secret`、`token`、`keyring`、`private[ _-]key`（大小寫不敏感）。
@@ -557,16 +557,16 @@ NUL 是兩種引擎唯一被允許分歧的位元組，**上一段那條規則�
 
 ---
 
-## 14. `run_capture` 與 artifact/manifest 格式（lib/common.sh:143-155、360-421）
+## 14. `run_capture` 與 artifact/manifest 格式（lib/common.sh:160-182、387-448）
 
 每個被捕捉的指令：
 
 - artifact 檔頭三～四行註解：`# host: <h>`、`# collector: <c>`、`# started: <UTC>`、`# timeout: <COMMAND_TIMEOUT>s`（無 timeout binary 時 `# timeout: unavailable`；qualification 工作機不允許此模式，見 [ADR 0011](adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md)）。之後是指令 stdout+stderr 合流。
-- **stdin 一律關成 `/dev/null`**（:390、:397）。被捕捉的指令沒有一個是互動程式，但 `ssh` 不管遠端要不要都會把 stdin 讀到 EOF，而呼叫端多半是 `while IFS= read -r … done <<<"$list"` 迴圈——繼承 stdin 等於讓第一次 capture 吃掉迴圈還沒讀的清單。`ceph crash info` 因此在真 lab 上九個 id 只取到兩個（#52）。
-- 指令被 `timeout $COMMAND_TIMEOUT`（預設 20）包住；exit 124/137 時檔尾補 `# TRUNCATED: command timed out after <s>s (exit <rc>)`（:406-408）。
+- **stdin 一律關成 `/dev/null`**（:417、:424）。被捕捉的指令沒有一個是互動程式，但 `ssh` 不管遠端要不要都會把 stdin 讀到 EOF，而呼叫端多半是 `while IFS= read -r … done <<<"$list"` 迴圈——繼承 stdin 等於讓第一次 capture 吃掉迴圈還沒讀的清單。`ceph crash info` 因此在真 lab 上九個 id 只取到兩個（#52）。
+- 指令被 `timeout $COMMAND_TIMEOUT`（預設 20）包住；exit 124/137 時檔尾補 `# TRUNCATED: command timed out after <s>s (exit <rc>)`（:433-435）。
 - 先寫入同目錄 mktemp 暫存檔再 `mv`（不會留半寫檔）。
-- `manifest.jsonl` 追加一行 JSON：`{"host":…,"collector":…,"artifact":<絕對路徑>,"command":<%q quoted 字串>,"exit_code":N,"started":…,"ended":…}`（自製 escape：`\ " \n \r \t`；:133-155）。exit_code 必須是數字，否則 die。
-- 非 0 且設了 `ERROR_LOG` → 追加 `<ended> host=<h> collector=<c> artifact=<a> exit=<rc> command=<cmd>`（:414-418）。
+- `manifest.jsonl` 追加一行 JSON：`{"host":…,"collector":…,"artifact":<絕對路徑>,"command":<%q quoted 字串>,"exit_code":N,"started":…,"ended":…}`（自製 escape：`\ " \n \r \t`；:160-182）。exit_code 必須是數字，否則 die。
+- 非 0 且設了 `ERROR_LOG` → 追加 `<ended> host=<h> collector=<c> artifact=<a> exit=<rc> command=<cmd>`（:441-445）。
 - cluster 層寫 workdir 根的 `manifest.jsonl`/`errors.log`；node 層寫 node 自己 out 目錄下的（打包後成為 `nodes/<alias>/manifest.jsonl`、`nodes/<alias>/errors.log`）。
 
 `CONTENTS.md`（lib/bundle.sh:169-201）由 manifest 生成：頂層檔案說明 + cluster 表格 + 每個 node 一段表格（`| exit | file | command |`）；node 的 artifact 路徑把遠端 `/tmp/…/out/` 前綴轉成 `nodes/<alias>/`（:152-158）；缺 node manifest 時寫 `Not collected — see nodes/<alias>/SKIPPED.txt`；有 var-log INDEX 時補一行指引。
