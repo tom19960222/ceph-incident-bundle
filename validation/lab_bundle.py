@@ -134,6 +134,11 @@ MARKER_EXIT_CODES = (2, 127)
 # A node manifest entry names its artifact by the absolute path it had inside the
 # node's workspace, which the normalizer has already collapsed to this marker.
 NODE_WORKSPACE_MARK = "<node-workspace>/"
+# Both node collectors are invoked with `--out <workspace>/out`, so every artifact
+# path their manifests record carries that segment; packing drops it, and the same
+# evidence becomes `nodes/<alias>/<relative>` in the bundle.  Stripping it is what
+# lets the rules below ask the bundle about the member the entry actually names.
+NODE_WORKSPACE_OUT = "out/"
 # All that survives of a manifest line whose command matched content safety.
 BLANKED_LINE = "[REDACTED]"
 CLUSTER_LAYERS = {"ceph": "cluster/ceph/", "rook": "cluster/rook/", "prometheus": "cluster/prometheus/"}
@@ -151,7 +156,14 @@ REDACTION_SCRATCH = re.compile(r"/\.([^/]+)\.(?:plain|encoded)\.[A-Za-z0-9]{6,}"
 # The workstation workdir's `mktemp` component.  Matched on its own rather than
 # with a leading path, because by then the caller's rules have already replaced
 # the directory it sits in.
-LOCAL_WORKDIR = re.compile(r"tmp\.[A-Za-z0-9]{6,}")
+#
+# The two implementations build the name differently and the rule has to cover
+# both, or the difference it exists to erase comes back: the reference uses
+# `tmp.<stamp>.$$`, so a pattern ending at the stamp leaves the pid behind as
+# `<workdir>.61493` (#52), and `tempfile.mkdtemp` draws its suffix from an
+# alphabet that includes `_`, so an alphanumeric-only run can stop short of the
+# candidate's whole name — intermittently, which is worse than never.
+LOCAL_WORKDIR = re.compile(r"tmp\.[A-Za-z0-9_]{6,}(?:\.\d+)?")
 
 SKIP_CLASSES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"no cephadm-capable node", re.I), "ceph-source-missing"),
@@ -413,7 +425,14 @@ def _node_manifest(
     listing_present = _has_listing(contents, alias)
     entries: list[dict[str, object]] = []
     blanked = 0
-    listing = "absent"
+    listing_entry = False
+    # The one fact both sides state about the listing: whether this node's
+    # listing reached the bundle as evidence.  Read from the archive, not from
+    # whichever side wrote a manifest entry for it — a node without a readable
+    # `/var/lib/ceph` gets a SKIPPED marker from both, but only the candidate
+    # indexes that marker, and keying the fact on the entry would turn the
+    # candidate's extra index into a disagreement about the evidence (#52).
+    listing = "recorded" if listing_present else "absent"
     for record in records:
         if record.get("unparseable") == BLANKED_LINE:
             blanked += 1
@@ -423,24 +442,23 @@ def _node_manifest(
             continue
         relative = _node_relative(alias, str(record.get("artifact", "")))
         if relative == VAR_LIB_CEPH_LISTING:
-            # Both implementations record this entry; only the command differs,
-            # and ADR 0010 moved that command's policy to the N9 argv ledger.
-            # Keyed on the artifact rather than on the candidate's verb, so the
-            # reference's `find` entry collapses the same way if content safety
-            # ever stops blanking it (#44).
-            listing = "recorded"
+            # However this side worded the entry, the fact it carries is already
+            # in `listing` above, and ADR 0010 moved the command's policy to the
+            # N9 argv ledger.  Keyed on the artifact rather than on the
+            # candidate's verb, so the reference's `find` entry collapses the
+            # same way if content safety ever stops blanking it (#44).
+            listing_entry = True
             continue
         if _is_index_only(contents, alias, relative, record):
             continue
         entries.append(record)
-    if listing == "absent" and listing_present and blanked:
+    if not listing_entry and listing_present and blanked:
         # The reference records this same entry, but its real `find` expression
         # names `*keyring*`, so content safety blanks the whole line before the
         # bundle is packed.  One blanked line against a listing that is in the
         # archive is that entry; ADR 0010 already moved its command policy to the
         # N9 argv ledger.  A second blanked line is a redaction nothing here
         # accounts for, so it stays visible below.
-        listing = "recorded"
         blanked -= 1
     return {
         "entries": entries,
@@ -483,11 +501,23 @@ def _is_index_only(
 
 
 def _node_relative(alias: str, artifact: str) -> str | None:
-    """Where one node manifest entry's artifact sits inside the node's archive."""
+    """Where one node manifest entry's artifact sits inside the node's archive.
+
+    The answer has to be the *bundle* member path, because every rule above uses
+    it to ask the bundle a question.  A workspace-absolute artifact therefore
+    loses both the workspace and the `out/` directory the collector was pointed
+    at: keeping `out/` names a member that cannot exist, and a bundle asked about
+    a member it does not have answers "not a skip marker" and "no capture
+    header" — the two answers that make the ADR 0010 rules do nothing.  That is
+    how a reduction with tests over it still let 13 entries through on the real
+    lab (#52): the fixtures wrote the artifact without the `out/` real collectors
+    put there.
+    """
 
     marker = artifact.rfind(NODE_WORKSPACE_MARK)
     if marker >= 0:
-        return artifact[marker + len(NODE_WORKSPACE_MARK) :]
+        relative = artifact[marker + len(NODE_WORKSPACE_MARK) :]
+        return relative[len(NODE_WORKSPACE_OUT) :] if relative.startswith(NODE_WORKSPACE_OUT) else relative
     prefix = f"nodes/{alias}/"
     return artifact[len(prefix) :] if artifact.startswith(prefix) else None
 
@@ -530,10 +560,47 @@ def _manifest_records(
 def _argv(command: str, rules: Sequence[tuple[re.Pattern[str], str]]) -> list[str]:
     normalized = normalize(command, rules)
     try:
-        return shlex.split(normalized)
+        argv = shlex.split(normalized)
     except ValueError:
         # An unsplittable command string is itself a difference worth seeing.
         return [normalized]
+    return _relative_query_window(argv)
+
+
+def _relative_query_window(argv: list[str]) -> list[str]:
+    """Restate a Prometheus query window relative to its own end.
+
+    `start=`/`end=` are absolute epoch seconds taken from the moment the collect
+    began, so two collects minutes apart can never write the same pair — the
+    only argv in either implementation that is a clock rather than a decision.
+    Erasing both would also erase `--since`, which is exactly the decision this
+    gate has to keep watching, so the end becomes the origin and the start keeps
+    its distance from it: a candidate that queried a different window still says
+    so, and one that queried the same window twenty minutes later does not.
+    """
+
+    start = _epoch_argument(argv, "start=")
+    end = _epoch_argument(argv, "end=")
+    if start is None or end is None or end < start:
+        return argv
+    return [
+        f"start=<epoch-{end - start}s>"
+        if argument.startswith("start=")
+        else "end=<epoch>"
+        if argument.startswith("end=")
+        else argument
+        for argument in argv
+    ]
+
+
+def _epoch_argument(argv: Sequence[str], prefix: str) -> int | None:
+    """The one `<prefix><digits>` argument in `argv`, or None if it is not that."""
+
+    found = [argument for argument in argv if argument.startswith(prefix)]
+    if len(found) != 1:
+        return None
+    value = found[0][len(prefix) :]
+    return int(value) if value.isdigit() else None
 
 
 def _artifacts(
