@@ -32,6 +32,8 @@ The non-negotiable rules are:
 - Profiles and reports may reference credential paths, but must never contain private keys, keyrings, passwords, tokens, or other credential contents.
 - Ordinary `make validate` must remain offline. Real-lab execution always requires a separate explicit opt-in and a reviewed active Lab Profile.
 
+A failed `validate-lab` keeps its workdir on purpose and nothing deletes it for you, so **after you have read why your run failed, reclaim it**: `make lab-clean` previews what would go, and `make lab-clean CEPH_INCIDENT_LAB_CLEAN=1` removes it, keeping the most recent run plus every `report.md`, `report.json` and command ledger. One failed run costs several GB and they are spread across each agent's own worktree, where nobody else will find them. `make lab-status` reports how many have accumulated, how much they weigh and how far back they go. Never wire cleanup into a collect or into the gate: retaining a failed run's evidence is the read-only safety contract's behaviour, not an oversight.
+
 `make lab-status`, `make lab-profile-discover`, `make lab-profile-activate` and `make lab-preflight` are implemented (issue #19), as is `make validate-lab` — the dual-run full-collect gate (issue #20). Start from `make lab-status LAB_PROFILE=/absolute/path/to/lab.toml` and follow its single `next_action`. A passing `lab-preflight` proves lab identity only; only a `validate-lab` report with `status: pass` is qualification evidence. The harness existing is not the same as qualification having happened: running it in a real lab and deciding cutover is issue #21, so until such a report exists, do not claim the candidate passed the real-lab gate and do not assemble an ad-hoc substitute for it.
 
 ## Equivalence claims

@@ -17,10 +17,14 @@ from pathlib import Path
 
 ACTIVATION_CONFIRMATION_VARIABLE = "CEPH_INCIDENT_LAB_ACTIVATE"
 PREFLIGHT_CONFIRMATION_VARIABLE = "CEPH_INCIDENT_LAB_CONFIRM"
+# Reclaiming a failed run's retained evidence is destructive and unrecoverable,
+# so it gets its own opt-in rather than sharing one with a command that reads.
+CLEAN_CONFIRMATION_VARIABLE = "CEPH_INCIDENT_LAB_CLEAN"
 STATUS_TARGET = "lab-status"
 DISCOVER_TARGET = "lab-profile-discover"
 ACTIVATE_TARGET = "lab-profile-activate"
 PREFLIGHT_TARGET = "lab-preflight"
+CLEAN_TARGET = "lab-clean"
 # The full real-lab gate.  Every earlier step's "you are done for now" message
 # points here, so the name lives with the rest of the command vocabulary.
 QUALIFICATION_TARGET = "validate-lab"
@@ -64,3 +68,26 @@ def qualify_command(profile: Path) -> str:
         f"make {QUALIFICATION_TARGET} LAB_PROFILE={profile} "
         f"{PREFLIGHT_CONFIRMATION_VARIABLE}=1"
     )
+
+
+def clean_command(
+    *, root: Path | None = None, keep: int | None = None, confirmed: bool = False
+) -> str:
+    """The retained-artifact cleanup command, with the arguments it was given.
+
+    No Lab Profile appears here, and that is the point: cleanup writes only
+    inside the artifact root it is handed, so nothing about a profile — least of
+    all a path read out of one — takes part in deciding what gets deleted.
+    """
+
+    arguments = []
+    if root is not None:
+        arguments.append(f"--runs-dir {root}")
+    if keep is not None:
+        arguments.append(f"--keep {keep}")
+    command = f"make {CLEAN_TARGET}"
+    if arguments:
+        command += " LAB_ARGS='" + " ".join(arguments) + "'"
+    if confirmed:
+        command += f" {CLEAN_CONFIRMATION_VARIABLE}=1"
+    return command

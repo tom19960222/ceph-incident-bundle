@@ -11,6 +11,7 @@ Issue #19 已實作 Lab Profile、status/discovery/activation workflow、strict 
 - `make lab-profile-activate LAB_PROFILE=... LAB_CANDIDATE=... CEPH_INCIDENT_LAB_ACTIVATE=1` — 顯式且留下稽核紀錄的 activation。
 - `make lab-preflight LAB_PROFILE=... CEPH_INCIDENT_LAB_CONFIRM=1` — strict identity preflight，寫出一份 Lab Validation Report。
 - `make validate-lab LAB_PROFILE=... CEPH_INCIDENT_LAB_CONFIRM=1` — 完整 real-lab gate。
+- `make lab-clean [CEPH_INCIDENT_LAB_CLEAN=1]` — 顯式回收先前 run 留下的 evidence 與 bundle；不帶確認時只列出會刪什麼。
 
 `lab-preflight` 通過**只證明 lab identity，不是 qualification evidence**；它產生的 report 中 collector coverage、兩次 full collect、bundle comparison、stable-state diff 與 residue 一律是 `not-run`。只有 `validate-lab` 寫出 `status: pass` 的 report 才是 qualification evidence。
 
@@ -38,7 +39,9 @@ Shell reference 的 Node Evidence Archive receiver 已由 issue #23 完成 pre-e
 3. 先執行 `make lab-status LAB_PROFILE=/absolute/path/to/lab.toml`（加 `LAB_ARGS=--json` 可取得 machine-readable 版本）。
 4. 只執行 status/report 提供的唯一 `next_action`。若它要求人工確認 candidate 或 identity 差異，停止並交給操作人員；不要自行信任新 identity。
 
-`lab-status` 是純讀取本機狀態的入口，不連線 lab、不改寫 active profile、不執行任何外部指令。它顯示 profile state/hash、missing identity、credential path 是否可用、待審 candidate、最近一次 activation 與 report，以及唯一下一步；只顯示 credential **路徑**，不顯示內容。Exit code：`0` 表示可以繼續，`2` 表示被擋住且必須先做 `next_action`。
+`lab-status` 是純讀取本機狀態的入口，不連線 lab、不改寫 active profile、不執行任何外部指令。它顯示 profile state/hash、missing identity、credential path 是否可用、待審 candidate、最近一次 activation 與 report、留存 run 產物的份數／合計體積／最舊的 run，以及唯一下一步；只顯示 credential **路徑**，不顯示內容。Exit code：`0` 表示可以繼續，`2` 表示被擋住且必須先做 `next_action`。
+
+留存 run 產物是**資訊**，不會變成 `next_action`：失敗時保留 workdir 是刻意的，累積多少只是要讓人看見，不能跟工作流程的下一步搶位置。回收是 `make lab-clean` 自己的顯式操作。
 
 `lab-status` 的下一步依序判斷：credential path 不可用 → 待審 candidate → bootstrap profile → candidate profile → 最近一次 report 的結果 → 可執行 preflight。Candidate 排在 profile state 之前，避免已經產出 candidate 的流程被反覆送回 discovery。
 
@@ -161,6 +164,26 @@ Report 不得包含 private key、keyring、password、token、Authorization hea
 
 `lab-preflight` 的每一次嘗試都會留下 report，包含連 profile 都讀不進來的情況；那種 report 的 `profile.hash`／`state` 為 `null`，`preflight` 只有一筆失敗的 `profile-load`，`status` 是具體的 profile failure class。`lab-status` 只會沿用 report 記錄的 `next_action`，且只在它確實是單行非空字串時沿用；否則改用本機推導的下一步。
 
+## Run Artifact Cleanup
+
+失敗的 `validate-lab` 會保留整個 workdir——這是 read-only safety 契約刻意的行為：驗證失敗時保留現場，不產生看似完整的 bundle。**collect 與 verify 失敗時都不會有任何路徑自動刪除 workdir**，這一點由測試釘住。代價是每一次失敗都在磁碟上留下數 GB 到數十 GB，而且散落在各個 agent 自己的 worktree 底下。
+
+回收是獨立、顯式的操作：
+
+```text
+make lab-clean                             # 預覽：列出會刪什麼、能回收多少，不刪任何東西
+make lab-clean CEPH_INCIDENT_LAB_CLEAN=1   # 實際刪除
+```
+
+規則：
+
+- **慣例**：跑完 `validate-lab` 且已判讀完失敗原因後，負責回收自己 worktree 的 run 產物。這是操作人員／agent 的一步，不是 gate 的一步。
+- 不帶 `CEPH_INCIDENT_LAB_CLEAN=1` 時只做預覽，exit `2`，唯一的 `next_action` 就是帶確認的同一道指令——比照 `lab-profile-activate` 的 opt-in 風格。
+- 預設保留**最近一次仍有產物的 run**（不論成敗）。`LAB_ARGS='--keep N'` 改保留最近 N 次，`--keep 0` 連最新的一起刪。只留 report 的 run（例如 preflight）不佔份數，也因此不會意外把剛失敗的那一輪擠出保留範圍。
+- 永遠保留 `report.md`、`report.json` 與每次 invocation 的 command ledger（`<run>/<impl>/collect.log`、`verify.log`）；`LATEST` 與 run directory 本身也保留，所以既有的 handoff 位址不會失效。要刪的是 collect 產出的 evidence 樹與 bundle。Activation ledger 放在 Lab Profile 旁邊，根本不在 run 產物根目錄裡，不可能被掃到。
+- 寫入邊界就是呼叫者指定的 run 產物根目錄，比照 Collector-Owned Workspace 的界線：`lab-clean` **不吃 `--profile`**，只認 `--runs-dir`（必須是絕對路徑，預設 `results/lab-validation/`）。它只看該目錄自己的直接子目錄、只認 `reserve_run_directory` 產生的 run id 形狀、且只認真正的目錄——根目錄下的 symlink 既不追進去也不刪除。沒有任何來自 profile、report、`LATEST` 或其他檔案的路徑能指定刪除目標。
+- Run 內部的 symlink 只會被 unlink，不會被追到它指向的地方。刪不掉的東西會如實回報為 `purge-incomplete`，不會被算進「已回收」。
+
 ## Failure and Handoff Rules
 
 - Identity/profile failure：不開始 collect；唯一 `next_action` 指向 profile review/discovery/activation 中的一步。
@@ -169,5 +192,6 @@ Report 不得包含 private key、keyring、password、token、Authorization hea
 - Stable-state diff：視為可能的 read-only regression，停止 cutover；唯一 `next_action` 是 review 被改變的 stable field 與對應 command ledger。
 - Remote residue：停止 cutover，不做廣泛自動清理；唯一 `next_action` 是依 invocation ownership 資訊進行人工審核。
 - Agent handoff 必須提供 report directory 與 `LATEST` 狀態，不要只貼聊天摘要。接手 agent 從 `lab-status` 與唯一 `next_action` 繼續。
+- 判讀完失敗原因後依上節回收自己這輪的 run 產物；若交接時現場仍要留著，明確說明哪一個 run directory 還不能刪。
 
 Shell reference 必須保留到正式 qualification 通過且最終 cutover ticket 明確允許移除；本 runbook 本身不授權刪除 shell 或放寬任何 safety gate。

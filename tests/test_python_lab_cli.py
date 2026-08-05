@@ -325,6 +325,102 @@ class QualifyCommandTests(CliTestCase):
         self.assertIn("not valid for preflight", completed.stderr)
 
 
+class CleanCommandTests(CliTestCase):
+    """The `lab-clean` entry point: the only command that deletes anything.
+
+    The purge's own rules are covered against a synthetic artifact root in
+    `test_python_lab_artifacts`; what the CLI owns is the confirmation, refusing
+    a profile, and naming the root outright.
+    """
+
+    def leave_run_artifacts(self, run_id: str) -> Path:
+        run = self.runs / run_id
+        (run / "shell").mkdir(parents=True)
+        (run / "report.json").write_text("{}\n", encoding="utf-8")
+        (run / "shell" / "collect.log").write_text("# exit: 2\n", encoding="utf-8")
+        (run / "shell" / f"ceph-incident-{run_id}.tar.gz").write_bytes(b"\0" * 4096)
+        return run
+
+    def test_without_the_confirmation_it_previews_and_removes_nothing(self) -> None:
+        run = self.leave_run_artifacts("20260801T230957Z")
+        completed = self.run_cli("clean", "--runs-dir", str(self.runs), "--keep", "0")
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("purge-not-confirmed", completed.stdout)
+        self.assertIn("CEPH_INCIDENT_LAB_CLEAN=1", self.next_action(completed))
+        self.assertTrue(
+            (run / "shell" / "ceph-incident-20260801T230957Z.tar.gz").is_file()
+        )
+
+    def test_with_the_confirmation_it_reclaims_and_keeps_the_report(self) -> None:
+        run = self.leave_run_artifacts("20260801T230957Z")
+        completed = self.run_cli(
+            "clean",
+            "--runs-dir",
+            str(self.runs),
+            "--keep",
+            "0",
+            CEPH_INCIDENT_LAB_CLEAN="1",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("artifacts-purged", completed.stdout)
+        self.assertFalse(
+            (run / "shell" / "ceph-incident-20260801T230957Z.tar.gz").exists()
+        )
+        self.assertTrue((run / "report.json").is_file())
+        self.assertTrue((run / "shell" / "collect.log").is_file())
+
+    def test_the_default_keeps_the_most_recent_run(self) -> None:
+        older = self.leave_run_artifacts("20260801T230957Z")
+        newer = self.leave_run_artifacts("20260802T070709Z")
+        completed = self.run_cli(
+            "clean", "--runs-dir", str(self.runs), CEPH_INCIDENT_LAB_CLEAN="1"
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse((older / "shell" / "ceph-incident-20260801T230957Z.tar.gz").exists())
+        self.assertTrue((newer / "shell" / "ceph-incident-20260802T070709Z.tar.gz").is_file())
+
+    def test_a_lab_profile_cannot_take_part_in_deciding_what_is_deleted(self) -> None:
+        profile = self.lab.write_profile()
+        completed = self.run_cli(
+            "clean", "--profile", str(profile), "--runs-dir", str(self.runs)
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("--profile is not valid for clean", completed.stderr)
+
+    def test_the_artifact_root_must_be_named_absolutely(self) -> None:
+        completed = self.run_cli("clean", "--runs-dir", "results/lab-validation")
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("must be an absolute path", completed.stderr)
+
+    def test_rejects_an_unusable_keep_count(self) -> None:
+        for value in ("-1", "all", "1.5"):
+            with self.subTest(value=value):
+                completed = self.run_cli(
+                    "clean", "--runs-dir", str(self.runs), "--keep", value
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertIn("count of runs to keep", completed.stderr)
+
+    def test_the_keep_count_belongs_to_this_command_only(self) -> None:
+        completed = self.run_cli(
+            "status", "--profile", "/labs/lab.toml", "--keep", "1"
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("not valid for status", completed.stderr)
+
+    def test_json_output_is_machine_readable(self) -> None:
+        self.leave_run_artifacts("20260801T230957Z")
+        completed = self.run_cli(
+            "clean", "--runs-dir", str(self.runs), "--keep", "0", "--json"
+        )
+        document = json.loads(completed.stdout)
+        self.assertEqual(document["status"], "purge-not-confirmed")
+        self.assertEqual(
+            [entry["run"] for entry in document["purged"]], ["20260801T230957Z"]
+        )
+        self.assertIn("next_action", document)
+
+
 class WorkflowTests(CliTestCase):
     def test_a_fresh_agent_can_walk_the_whole_workflow_from_status(self) -> None:
         bootstrap = self.lab.write_profile(state="bootstrap", identity=False)

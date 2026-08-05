@@ -7,9 +7,12 @@ from pathlib import Path
 from validation import lab_commands
 from validation.lab_commands import (
     ACTIVATION_CONFIRMATION_VARIABLE,
+    CLEAN_CONFIRMATION_VARIABLE,
+    CLEAN_TARGET,
     PREFLIGHT_CONFIRMATION_VARIABLE,
     QUALIFICATION_TARGET,
     activate_command,
+    clean_command,
     discover_command,
     preflight_command,
     qualify_command,
@@ -21,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MAKEFILE = ROOT / "Makefile"
 PROFILE = Path("/labs/lab.toml")
 CANDIDATE = Path("/labs/lab.candidate.toml")
+ARTIFACT_ROOT = Path("/labs/results/lab-validation")
 
 
 def make_targets() -> set[str]:
@@ -58,6 +62,28 @@ class RunnableActionTests(unittest.TestCase):
         self.assertIn(f"LAB_PROFILE={PROFILE}", command)
         self.assertIn(f"{PREFLIGHT_CONFIRMATION_VARIABLE}=1", command)
 
+    def test_the_cleanup_is_a_real_confirmed_target_that_takes_no_profile(self) -> None:
+        # Cleanup deletes, so it carries its own opt-in; and it names no Lab
+        # Profile, because nothing a profile says takes part in deciding what
+        # gets removed.
+        self.assertIn(CLEAN_TARGET, make_targets())
+        bare = clean_command()
+        self.assertEqual(bare, f"make {CLEAN_TARGET}")
+        confirmed = clean_command(root=ARTIFACT_ROOT, keep=2, confirmed=True)
+        self.assertIn(f"make {CLEAN_TARGET}", confirmed)
+        self.assertIn(f"--runs-dir {ARTIFACT_ROOT}", confirmed)
+        self.assertIn("--keep 2", confirmed)
+        self.assertIn(f"{CLEAN_CONFIRMATION_VARIABLE}=1", confirmed)
+        for command in (bare, confirmed):
+            self.assertNotIn("LAB_PROFILE", command)
+
+    def test_the_cleanup_confirmation_is_not_the_lab_facing_one(self) -> None:
+        # Reusing the preflight's opt-in would let one exported variable both
+        # reach the lab and delete evidence.
+        self.assertNotEqual(CLEAN_CONFIRMATION_VARIABLE, PREFLIGHT_CONFIRMATION_VARIABLE)
+        self.assertNotEqual(CLEAN_CONFIRMATION_VARIABLE, ACTIVATION_CONFIRMATION_VARIABLE)
+        self.assertIn(CLEAN_CONFIRMATION_VARIABLE, MAKEFILE.read_text(encoding="utf-8"))
+
     def test_ordinary_validation_can_never_reach_a_lab(self) -> None:
         # `make validate` must stay offline: no lab target may become one of its
         # prerequisites, directly or through another target it depends on.
@@ -75,7 +101,7 @@ class RunnableActionTests(unittest.TestCase):
             reachable.add(target)
             pending += list(prerequisites.get(target, ()))
         for target in ("lab-status", "lab-profile-discover", "lab-profile-activate",
-                       "lab-preflight", QUALIFICATION_TARGET):
+                       "lab-preflight", QUALIFICATION_TARGET, CLEAN_TARGET):
             self.assertNotIn(target, reachable)
 
     def test_the_confirmation_variables_are_the_ones_the_makefile_documents(self) -> None:
@@ -120,8 +146,10 @@ class VocabularyTests(unittest.TestCase):
             "make lab-profile-discover",
             "make lab-profile-activate",
             "make lab-preflight",
+            "make lab-clean",
             ACTIVATION_CONFIRMATION_VARIABLE,
             PREFLIGHT_CONFIRMATION_VARIABLE,
+            CLEAN_CONFIRMATION_VARIABLE,
         )
         for module in sorted((ROOT / "validation").glob("*.py")):
             if module.name == "lab_commands.py":
@@ -147,6 +175,7 @@ class VocabularyTests(unittest.TestCase):
                 "activate_command",
                 "preflight_command",
                 "qualify_command",
+                "clean_command",
             },
         )
 
