@@ -237,6 +237,54 @@ class ReportHistoryTests(StatusTestCase):
         self.assertIn("latest report:  none", status.text())
 
 
+class RetainedArtifactTests(StatusTestCase):
+    """What earlier runs left on disk, reported but never turned into a step."""
+
+    def leave_run_artifacts(self, run_id: str, size: int = 4096) -> Path:
+        run = self.runs / run_id
+        (run / "shell").mkdir(parents=True)
+        (run / "report.json").write_text("{}\n", encoding="utf-8")
+        (run / "shell" / "collect.log").write_text("# exit: 2\n", encoding="utf-8")
+        (run / "shell" / f"ceph-incident-{run_id}.tar.gz").write_bytes(b"\0" * size)
+        return run
+
+    def test_reports_the_count_total_size_and_oldest_retained_run(self) -> None:
+        self.leave_run_artifacts("20260801T230957Z", size=2048)
+        self.leave_run_artifacts("20260802T070709Z", size=4096)
+        status = self.status(self.lab.write_profile())
+        retained = status.summary()["retained_artifacts"]
+        self.assertEqual(retained["runs"], 2)
+        self.assertEqual(retained["bytes"], 6144)
+        self.assertEqual(retained["oldest_run"], "20260801T230957Z")
+        self.assertEqual(retained["oldest_timestamp"], "2026-08-01T23:09:57Z")
+        self.assertIn("run artifacts:  2 run(s), 6.0 KiB", status.text())
+        self.assertIn("20260801T230957Z", status.text())
+
+    def test_says_so_plainly_when_nothing_is_retained(self) -> None:
+        status = self.status(self.lab.write_profile())
+        self.assertEqual(status.summary()["retained_artifacts"]["runs"], 0)
+        self.assertIn("run artifacts:  none retained", status.text())
+
+    def test_retained_artifacts_never_become_the_next_action(self) -> None:
+        # A failed run keeps its workdir deliberately, so however much has piled
+        # up, the workflow's own next step is still the only one offered.
+        for _ in range(4):
+            self.leave_run_artifacts(f"2026080{_}T230957Z", size=1024 * 1024)
+        profile = self.lab.write_profile()
+        self.record_preflight(profile)
+        status = self.status(profile)
+        self.assertEqual(status.state, "preflight-passed")
+        self.assertIn("make validate-lab", status.next_action)
+        self.assertNotIn("lab-clean", status.next_action)
+
+    def test_a_status_read_never_removes_a_retained_artifact(self) -> None:
+        run = self.leave_run_artifacts("20260801T230957Z")
+        self.status(self.lab.write_profile())
+        self.assertTrue(
+            (run / "shell" / "ceph-incident-20260801T230957Z.tar.gz").is_file()
+        )
+
+
 class OutputTests(StatusTestCase):
     def test_the_text_output_ends_with_exactly_one_next_action(self) -> None:
         for path in (
@@ -264,6 +312,7 @@ class OutputTests(StatusTestCase):
             "last_activation",
             "latest_report",
             "runs_directory",
+            "retained_artifacts",
             "state",
             "next_action",
         ):

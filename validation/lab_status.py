@@ -2,9 +2,15 @@
 
 An agent taking over must not need a previous chat.  This module reads local
 state only — the profile, the credential paths' existence and permissions, any
-pending candidate, the activation ledger and the latest Lab Validation Report —
-and reports where the workflow is, what is blocking it, and exactly one next
-step.  It runs no external command, reaches no lab and rewrites nothing.
+pending candidate, the activation ledger, the latest Lab Validation Report and
+what earlier runs left on disk — and reports where the workflow is, what is
+blocking it, and exactly one next step.  It runs no external command, reaches no
+lab and rewrites nothing.
+
+Retained run artifacts are reported here and nowhere else in the workflow, but
+they never become the next step: a failed run keeps its workdir deliberately, so
+"you have 44 GiB of evidence lying around" is something to see, not a competing
+instruction.  Reclaiming it is `validation/lab_artifacts.py`'s own opt-in.
 """
 
 from __future__ import annotations
@@ -14,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from validation.lab_activation import ACTIVATION_LOG_NAME
+from validation.lab_artifacts import ArtifactInventory, scan_artifacts
 from validation.lab_commands import (
     activate_command,
     discover_command,
@@ -85,6 +92,7 @@ class LabStatus:
     last_activation: dict[str, object] | None = None
     latest_report: dict[str, object] | None = None
     runs_directory: Path = field(default_factory=Path)
+    artifacts: ArtifactInventory = field(default_factory=ArtifactInventory)
     blocked_reason: str | None = None
 
     @property
@@ -127,6 +135,7 @@ class LabStatus:
             ],
             "last_activation": self.last_activation,
             "runs_directory": safe_display_path(self.runs_directory),
+            "retained_artifacts": self.artifacts.summary(),
             "latest_report": self.latest_report,
             "state": self.state,
             "blocked_reason": self.blocked_reason,
@@ -178,6 +187,10 @@ class LabStatus:
             )
         else:
             lines.append(f"  latest report:  none in {safe_display_path(self.runs_directory)}")
+        # Informational only.  A failed run keeps its workdir on purpose, so how
+        # much has piled up never competes with the workflow's own next step —
+        # it is reported so the operator can see it, not acted on here.
+        lines.append(f"  run artifacts:  {self.artifacts.line()}")
         lines += [
             f"  state:          {self.state}",
         ]
@@ -193,6 +206,7 @@ def lab_status(profile_path: Path, *, runs_directory: Path) -> LabStatus:
     candidates = _candidates(profile_path)
     report = latest_report(runs_directory)
     activation = _last_activation(profile_path)
+    artifacts = scan_artifacts(runs_directory)
     try:
         profile = load_profile(profile_path)
     except LabProfileError as error:
@@ -212,6 +226,7 @@ def lab_status(profile_path: Path, *, runs_directory: Path) -> LabStatus:
             last_activation=activation,
             latest_report=report,
             runs_directory=runs_directory,
+            artifacts=artifacts,
         )
 
     credential_paths = _credential_paths(profile)
@@ -228,6 +243,7 @@ def lab_status(profile_path: Path, *, runs_directory: Path) -> LabStatus:
         last_activation=activation,
         latest_report=report,
         runs_directory=runs_directory,
+        artifacts=artifacts,
     )
 
 

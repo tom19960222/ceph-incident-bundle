@@ -1,6 +1,6 @@
 .PHONY: test check-python test-python test-differential shellcheck validate \
 	lab-status lab-profile-discover lab-profile-activate lab-preflight \
-	validate-lab
+	validate-lab lab-clean
 
 PYTHON ?= python3
 
@@ -53,6 +53,14 @@ lab-preflight: check-python require-lab-profile
 # confirmation as `lab-preflight` and is never reachable from `make validate`.
 validate-lab: check-python require-lab-profile
 	$(PYTHON) -m validation.lab qualify --profile "$(LAB_PROFILE)" $(LAB_ARGS)
+
+# Reclaim what earlier runs left behind.  A failed `validate-lab` keeps its
+# workdir on purpose and nothing deletes it automatically, so this is where the
+# gigabytes go — after the failure has been read.  It needs no Lab Profile
+# (nothing about one decides what is deleted) and removes nothing at all until
+# CEPH_INCIDENT_LAB_CLEAN=1 is set; without it, the run is a preview.
+lab-clean: check-python
+	$(PYTHON) -m validation.lab clean $(LAB_ARGS)
 
 .PHONY: require-lab-profile
 require-lab-profile:

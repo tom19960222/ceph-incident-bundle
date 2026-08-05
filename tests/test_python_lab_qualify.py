@@ -16,6 +16,8 @@ from pathlib import Path
 from unittest import mock
 
 from tests.lab_fixture import FakeLab, fake_entrypoints
+from validation.lab_artifacts import purge_artifacts, scan_artifacts
+from validation.lab_report import CodeIdentity, report_from_qualification, write_report
 from validation.lab_qualify import (
     FORBIDDEN_ARGUMENTS,
     QUALIFICATION_ARGUMENTS,
@@ -37,10 +39,14 @@ class QualifyTestCase(unittest.TestCase):
         self.kubectl_log = self.root / "kubectl.log"
 
     def run_gate(
-        self, profile: Path | None = None, checkout: Path | None = None, **knobs: str
+        self,
+        profile: Path | None = None,
+        checkout: Path | None = None,
+        run_id: str = "run",
+        **knobs: str,
     ):
         profile = profile or self.lab.write_profile()
-        run_directory = self.runs / "run"
+        run_directory = self.runs / run_id
         run_directory.mkdir(mode=0o700, exist_ok=True)
         environment = self.lab.environment(
             FAKE_LAB_SSH_LOG=str(self.ssh_log),
@@ -231,6 +237,68 @@ class CollectGateTests(QualifyTestCase):
         self.assertEqual(result.status, "verify-failed")
         self.assertEqual(result.runs[-1].verify_result, "fail (exit 1)")
         self.assertEqual(result.comparison.result, "not-run")
+
+
+class RetainedWorkdirTests(QualifyTestCase):
+    """A failed run keeps its workdir, and only an operator ever takes it back.
+
+    The retention is the read-only safety contract's, not an oversight: a gate
+    that failed leaves the scene intact instead of producing a bundle that looks
+    complete.  Reclaiming the disk it costs is `lab-clean`'s job — an explicit,
+    confirmed step taken after the failure has been read — so these tests pin
+    both halves: the gate never deletes, and the purge never takes the ledgers.
+    """
+
+    def test_a_failed_collect_keeps_everything_it_produced(self) -> None:
+        result = self.run_gate(FAKE_COLLECT_EXIT_shell="2")
+        self.assertEqual(result.status, "collect-failed")
+        output = result.run_directory / "shell"
+        self.assertTrue(output.is_dir())
+        self.assertTrue((output / "collect.log").is_file())
+        self.assertEqual(len(sorted(output.glob("ceph-incident-*.tar.gz"))), 1)
+
+    def test_a_failed_verification_keeps_the_bundle_it_rejected(self) -> None:
+        result = self.run_gate(FAKE_VERIFY_FAIL_python="1")
+        self.assertEqual(result.status, "verify-failed")
+        bundle = Path(result.runs[-1].bundle_path or "")
+        self.assertTrue(bundle.is_file())
+        self.assertTrue((result.run_directory / "python" / "verify.log").is_file())
+
+    def test_the_gate_never_reaches_the_purge(self) -> None:
+        # Belt and braces over the two tests above: if a future edit wires
+        # cleanup into the gate, this fails wherever it was wired in.
+        with mock.patch(
+            "validation.lab_artifacts.purge_artifacts",
+            side_effect=AssertionError("the gate must never purge its own workdir"),
+        ):
+            self.assertEqual(self.run_gate(FAKE_COLLECT_EXIT_shell="2").status,
+                             "collect-failed")
+
+    def test_reclaiming_a_failed_run_keeps_its_report_and_ledgers(self) -> None:
+        # Under the run id `reserve_run_directory` really gives a run: the
+        # cleanup only ever looks inside directories of that exact shape.
+        result = self.run_gate(run_id="20260801T230957Z", FAKE_COLLECT_EXIT_shell="2")
+        write_report(
+            self.runs,
+            report_from_qualification(result, code=CodeIdentity("0" * 40, dirty=False)),
+            directory=result.run_directory,
+        )
+        retained = scan_artifacts(self.runs)
+        self.assertEqual(retained.count, 1)
+        self.assertGreater(retained.size, 0)
+
+        preview = purge_artifacts(self.runs, confirmed=False, keep=0)
+        self.assertFalse(preview.ok)
+        self.assertEqual(scan_artifacts(self.runs).count, 1)
+
+        purged = purge_artifacts(self.runs, confirmed=True, keep=0)
+        self.assertTrue(purged.ok)
+        self.assertEqual(sorted(item.name for item in result.run_directory.iterdir()),
+                         ["report.json", "report.md", "shell"])
+        self.assertEqual(
+            sorted(item.name for item in (result.run_directory / "shell").iterdir()),
+            ["collect.log"],
+        )
 
 
 class CoverageGateTests(QualifyTestCase):

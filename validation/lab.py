@@ -8,13 +8,18 @@
     python3 -m validation.lab preflight --profile PATH [--runs-dir PATH] [--json]
     python3 -m validation.lab qualify   --profile PATH [--runs-dir PATH]
                                         [--collect-timeout SECONDS] [--json]
+    python3 -m validation.lab clean     [--runs-dir PATH] [--keep N] [--json]
 
 `status` is local-only.  `discover` and `preflight` reach the lab with read-only
 queries, and `preflight` additionally requires `CEPH_INCIDENT_LAB_CONFIRM=1`
 because it is part of the qualification path.  `activate` writes the trusted
 profile and requires `CEPH_INCIDENT_LAB_ACTIVATE=1`.  `qualify` is the full
 dual-run gate behind `make validate-lab`; it runs two real collects and therefore
-requires the same explicit confirmation as the preflight.
+requires the same explicit confirmation as the preflight.  `clean` is local-only
+too, and is the one command that deletes: it reclaims what earlier runs left
+behind, needs `CEPH_INCIDENT_LAB_CLEAN=1` to remove anything, and takes no
+profile at all — an artifact root is the only thing that can name what it
+touches.
 
 Exit codes: 0 when the command reached its intended state, 1 for a usage or
 configuration error, 2 when the workflow is blocked and the printed `next_action`
@@ -30,8 +35,10 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from validation.lab_activation import activate
+from validation.lab_artifacts import DEFAULT_KEEP, purge_artifacts
 from validation.lab_commands import (
     ACTIVATION_CONFIRMATION_VARIABLE,
+    CLEAN_CONFIRMATION_VARIABLE,
     PREFLIGHT_CONFIRMATION_VARIABLE,
     preflight_command,
     status_command,
@@ -54,7 +61,10 @@ from validation.lab_status import lab_status
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUNS_DIRECTORY = REPOSITORY_ROOT / "results" / "lab-validation"
-COMMANDS = ("status", "discover", "activate", "preflight", "qualify")
+COMMANDS = ("status", "discover", "activate", "preflight", "qualify", "clean")
+# The one command that takes no profile: what it deletes is decided by an
+# artifact root and a count, and by nothing a profile could say.
+PROFILE_FREE_COMMANDS = ("clean",)
 USAGE = """Usage:
   python3 -m validation.lab status --profile PATH [--runs-dir PATH] [--json]
   python3 -m validation.lab discover --profile PATH [--candidate-out PATH]
@@ -63,7 +73,8 @@ USAGE = """Usage:
       [--replace-active] [--json]
   python3 -m validation.lab preflight --profile PATH [--runs-dir PATH] [--json]
   python3 -m validation.lab qualify --profile PATH [--runs-dir PATH]
-      [--collect-timeout SECONDS] [--json]"""
+      [--collect-timeout SECONDS] [--json]
+  python3 -m validation.lab clean [--runs-dir PATH] [--keep N] [--json]"""
 
 EXIT_OK = 0
 EXIT_USAGE = 1
@@ -105,6 +116,8 @@ def _dispatch(options: dict[str, object]) -> int:
         return _activate(options)
     if command == "preflight":
         return _preflight(options)
+    if command == "clean":
+        return _clean(options)
     return _qualify(options)
 
 
@@ -246,6 +259,24 @@ def _qualify(options: dict[str, object]) -> int:
     return EXIT_OK if result.ok else EXIT_BLOCKED
 
 
+def _clean(options: dict[str, object]) -> int:
+    """Reclaim retained run artifacts, or — unconfirmed — say what that would be.
+
+    Running it without the confirmation is not an error, it is the preview: the
+    unconfirmed pass removes nothing and its single next action is the same
+    command with the opt-in, so nobody has to guess the incantation from a
+    manual.
+    """
+
+    result = purge_artifacts(
+        options["runs_directory"],  # type: ignore[arg-type]
+        confirmed=os.environ.get(CLEAN_CONFIRMATION_VARIABLE) == "1",
+        keep=int(options["keep"]),  # type: ignore[arg-type]
+    )
+    _emit(result.summary(), result.text(), as_json=bool(options["as_json"]))
+    return EXIT_OK if result.ok else EXIT_BLOCKED
+
+
 def _report_unusable_profile(
     profile_path: Path,
     error: LabProfileError,
@@ -299,6 +330,7 @@ def _parse(argv: list[str]) -> dict[str, object]:
         "replace_candidate": False,
         "replace_active": False,
         "collect_timeout": DEFAULT_COLLECT_TIMEOUT_SECONDS,
+        "keep": DEFAULT_KEEP,
         "as_json": False,
     }
     rest = argv[1:]
@@ -332,15 +364,38 @@ def _parse(argv: list[str]) -> dict[str, object]:
             values["collect_timeout"] = int(value)
             index += 2
             continue
+        if option == "--keep":
+            if command != "clean":
+                raise UsageError(f"{option} is not valid for {command}")
+            if index + 1 >= len(rest):
+                raise UsageError(f"{option} requires a value")
+            value = rest[index + 1]
+            if not value.isdecimal():
+                raise UsageError(f"{option} must be a count of runs to keep")
+            values["keep"] = int(value)
+            index += 2
+            continue
         if option in ("--profile", "--candidate", "--candidate-out", "--runs-dir"):
             if index + 1 >= len(rest):
                 raise UsageError(f"{option} requires a value")
             value = rest[index + 1]
             index += 2
             if option == "--profile":
+                if command in PROFILE_FREE_COMMANDS:
+                    raise UsageError(
+                        f"{option} is not valid for {command}: it acts only on "
+                        "the artifact root given by --runs-dir"
+                    )
                 values["profile"] = _absolute(option, value)
             elif option == "--runs-dir":
-                values["runs_directory"] = Path(value).expanduser()
+                # `clean` is the one command that deletes, so it names its root
+                # outright rather than inheriting whatever the caller's cwd made
+                # of a relative path.
+                values["runs_directory"] = (
+                    _absolute(option, value)
+                    if command == "clean"
+                    else Path(value).expanduser()
+                )
             else:
                 if option == "--candidate-out" and command != "discover":
                     raise UsageError(f"{option} is not valid for {command}")
@@ -349,7 +404,7 @@ def _parse(argv: list[str]) -> dict[str, object]:
                 values["candidate"] = _absolute(option, value)
             continue
         raise UsageError(f"unknown option: {option}")
-    if values["profile"] is None:
+    if values["profile"] is None and command not in PROFILE_FREE_COMMANDS:
         raise UsageError("--profile is required")
     if command == "activate" and values["candidate"] is None:
         raise UsageError("--candidate is required for activate")
