@@ -95,15 +95,17 @@ def bundle_members(
             "truncated=0\n"
         ).encode("utf-8")
     for host in hosts:
-        members[f"nodes/{host}/system/hostname.txt"] = capture(
+        hostname_member = node_bundle_member(host, "system/hostname.txt")
+        members[hostname_member] = capture(
             host, "node", started, f"{host}\n"
         )
-        members[f"nodes/{host}/manifest.jsonl"] = (
+        manifest_member = node_bundle_member(host, "manifest.jsonl")
+        members[manifest_member] = (
             json.dumps(
                 {
                     "host": host,
                     "collector": "node",
-                    "artifact": f"nodes/{host}/system/hostname.txt",
+                    "artifact": node_manifest_artifact("system/hostname.txt"),
                     "command": "hostname",
                     "exit_code": 0,
                     "started": started,
@@ -113,7 +115,10 @@ def bundle_members(
             + "\n"
         ).encode("utf-8")
         if var_log:
-            members[f"nodes/{host}/logs/var-log/merged/syslog.merged"] = (
+            var_log_member = node_bundle_member(
+                host, "logs/var-log/merged/syslog.merged"
+            )
+            members[var_log_member] = (
                 f"{started} {host} kernel: line {counter}\n".encode("utf-8")
             )
     members["manifest.jsonl"] = "".join(
@@ -121,6 +126,20 @@ def bundle_members(
     ).encode("utf-8")
     members.update(extra or {})
     return members
+
+
+class FixtureProductShapeTests(unittest.TestCase):
+    def test_node_manifest_and_member_match_the_real_product_shape(self) -> None:
+        members = bundle_members(hosts=("monitor01",))
+        manifest = members[node_bundle_member("monitor01", "manifest.jsonl")]
+        record = json.loads(manifest.decode("utf-8"))
+
+        self.assertEqual(
+            record["artifact"], node_manifest_artifact("system/hostname.txt")
+        )
+        self.assertIn(
+            node_bundle_member("monitor01", "system/hostname.txt"), members
+        )
 
 
 class BundleTestCase(unittest.TestCase):

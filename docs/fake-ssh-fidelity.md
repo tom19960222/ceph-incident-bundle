@@ -23,7 +23,7 @@ not a claim that OpenSSH writes debug output to stdout.
 | Fake | Invocation surface | stdin | Exit status | argv and quoting model |
 | --- | --- | --- | --- | --- |
 | `tests/fixtures/bin/ssh` | Shell reference's direct Ceph reads | Drains every non-TTY invocation before dispatch | `0`, configured `17`, or reject `99` | Flattens argv through `$*` and pattern-matches the resulting command string; argument boundaries are not preserved |
-| `tests/fixtures/python-node/bin/ssh` | Python node bootstrap and its transport-failure modes | Reads the payload before canned modes; timeout mode `exec`s the remote shell with stdin still attached | Passes through the remote shell status, or the selected canned status | Records the outer argv list, then executes the final remote-command string with `/bin/sh -c`; it does not whitelist the outer option vector |
+| `tests/fixtures/python-node/bin/ssh` | Python node bootstrap and its transport-failure modes | Drains the client pipe first; timeout mode replays the same bytes to the remote shell from a seekable descriptor | Passes through the remote shell status, or the selected canned status | Records the outer argv list, then executes the final remote-command string with `/bin/sh -c`; it does not whitelist the outer option vector |
 | `tests/fixtures/python-ceph/bin/ssh` | Debug, capability, node bootstrap, Ceph runner probes, direct/sudo Ceph reads | Drains every non-TTY invocation before dispatch | Canned remote/transport statuses, including configured Ceph failures | Matches the complete outer argv list; parses the one-string bootstrap with `shlex`; direct Ceph commands remain token lists |
 | `tests/fixtures/python-prometheus/bin/ssh` | Debug and the node bootstrap needed by the public collect CLI | Drains every non-TTY invocation before dispatch | Bootstrap's configured status, debug `255`, or reject `99` | Matches the complete outer argv list and a digest-pinned, `shlex`-parsed bootstrap string |
 | `tests/fixtures/python-rook/bin/ssh` | Debug, capability, node bootstrap and remote read-only kubectl | Drains every non-TTY invocation before dispatch | Preserves the delegated fake-kubectl status; other statuses are canned | Matches the complete outer argv list; passes remote kubectl tokens without a shell; parses only the bootstrap string |
@@ -46,11 +46,20 @@ Share assertions instead:
 - `tests/test_python_fake_fidelity.py` gives every executable a pipe and a
   rejected invocation. The observer end must be empty after exit. Exercising
   the earliest reject path proves stdin consumption happens before route
-  selection instead of only in a node-bootstrap branch.
+  selection instead of only in a node-bootstrap branch. The timeout route has
+  its own case because it hands stdin onward after the fake drains the original
+  client pipe.
+- The same shared suite pins each reject exit code, requires diagnostics to stay
+  on stderr with an empty stdout, and round-trips a space-containing argv token
+  through a lossless ledger. The shell fixture keeps its older flattened ledger
+  for human-readable assertions and exposes a separate opt-in NUL ledger for
+  this boundary check.
 - `tests/fixture_product.py` is the single source used by fabricated lab-bundle
   records for the node product shape: manifests name
   `<workspace>/out/<relative>`, while workstation bundles name
-  `nodes/<alias>/<relative>`. A worked example pins both paths.
+  `nodes/<alias>/<relative>`. The Python and generated shell fixture producers
+  all call this helper, and a worked example plus the lab-bundle fixture pins
+  both paths.
 
 The fakes may continue to differ in whitelist, ledger and failure knobs. A new
 fake must join the shared stdin contract and document its argv and stream model
