@@ -7,6 +7,14 @@ import os
 import subprocess
 import sys
 import tarfile
+import tempfile
+from pathlib import Path
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from tests.fixture_product import node_manifest_artifact
 
 
 arguments = sys.argv[1:]
@@ -27,18 +35,25 @@ if mode == "remote-failure":
         os.environ["FAKE_REMOTE_BIN"] + os.pathsep + child_environment["PATH"]
     )
 
-if mode == "timeout":
-    os.execve(
-        "/bin/sh",
-        ["sh", "-c", "exec " + remote_command],
-        child_environment,
-    )
-
 payload = sys.stdin.buffer.read()
 payload_path = os.environ.get("FAKE_SSH_PAYLOAD")
 if payload_path:
     with open(payload_path, "wb") as output:
         output.write(payload)
+
+if mode == "timeout":
+    # Drain the client-side pipe first, as OpenSSH does, then give the same bytes
+    # to the remote command on a seekable descriptor. A remote command that
+    # ignores stdin must not leave the caller's pipe unread.
+    with tempfile.TemporaryFile() as forwarded_stdin:
+        forwarded_stdin.write(payload)
+        forwarded_stdin.seek(0)
+        os.dup2(forwarded_stdin.fileno(), 0)
+        os.execve(
+            "/bin/sh",
+            ["sh", "-c", "exec " + remote_command],
+            child_environment,
+        )
 
 if mode == "unsupported":
     print("SKIPPED: Python 3.11 or newer is required", file=sys.stderr)
@@ -69,7 +84,9 @@ if mode in (
             entry = {
                 "host": "monitor01",
                 "collector": "collect-node",
-                "artifact": "/tmp/owned/out/system/hostname.txt",
+                "artifact": node_manifest_artifact(
+                    "system/hostname.txt", workspace="/tmp/owned"
+                ),
                 "command": "hostname",
                 "exit_code": 0,
                 "started": "2026-07-29T00:00:00Z",

@@ -8,6 +8,13 @@ import io
 import os
 import sys
 import tarfile
+from pathlib import Path
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from tests.fixture_product import node_manifest_artifact
 
 
 def add_file(archive: tarfile.TarFile, name: str, content: bytes) -> None:
@@ -63,17 +70,20 @@ def main() -> None:
             raise SystemExit(f"unknown fake node archive case: {case}")
 
         if case != "missing-manifest":
+            fixture_artifact = node_manifest_artifact(
+                "system/hostname.txt", workspace="/rmt"
+            )
             manifest = (
                 '{"host":"%s","collector":"collect-node",'
-                '"artifact":"/rmt/out/system/hostname.txt",'
+                '"artifact":"%s",'
                 '"command":"hostname","exit_code":0,'
-                '"started":"t0","ended":"t1"}\n' % alias
+                '"started":"t0","ended":"t1"}\n' % (alias, fixture_artifact)
             ).encode()
             if case == "malformed-manifest":
                 manifest = b"{not-json\n"
             elif case == "unsafe-manifest-artifact":
                 manifest = manifest.replace(
-                    b'"/rmt/out/system/hostname.txt"', b'"/etc/passwd"'
+                    f'"{fixture_artifact}"'.encode(), b'"/etc/passwd"'
                 )
             add_file(
                 archive,

@@ -3,9 +3,16 @@
 # Shared offline fake environment for public shell Collect process tests.
 # Callers own the supplied test root and are responsible for cleaning it.
 # The function sets fakebin, ssh_key, and inventory in caller scope, and exports
-# FAKE_SSH_LOG, FAKE_TIMEOUT_LOG, and FIXTURE_SSH for the generated commands.
+# FAKE_SSH_LOG, FAKE_TIMEOUT_LOG, FIXTURE_SSH, and the canonical fabricated node
+# artifact path for the generated commands.
 setup_shell_collect_environment() {
   local repo_root=$1 test_root=$2
+
+  FIXTURE_NODE_MANIFEST_ARTIFACT="$(
+    PYTHONPATH="$repo_root" python3 -c \
+      'from tests.fixture_product import node_manifest_artifact; print(node_manifest_artifact("system/hostname.txt", workspace="/rmt"))'
+  )"
+  export FIXTURE_NODE_MANIFEST_ARTIFACT
 
   fakebin="$test_root/fakebin"
   mkdir -p "$fakebin"
@@ -122,7 +129,8 @@ case "$whole" in
     printf 'node %s\n' "$alias_name" >"$t/system/hostname.txt"
     printf 'secret = should-redact\n' >"$t/cephadm/var-lib-ceph-configs/fsid/mon.a/config"
     if [[ "${FAKE_SSH_NO_MANIFEST_ALIAS:-}" != "$alias_name" ]]; then
-      printf '{"host":"%s","collector":"collect-node","artifact":"/rmt/out/system/hostname.txt","command":"hostname","exit_code":0,"started":"t0","ended":"t1"}\n' "$alias_name" >"$t/manifest.jsonl"
+      printf '{"host":"%s","collector":"collect-node","artifact":"%s","command":"hostname","exit_code":0,"started":"t0","ended":"t1"}\n' \
+        "$alias_name" "${FIXTURE_NODE_MANIFEST_ARTIFACT:?}" >"$t/manifest.jsonl"
     fi
     [[ "${FAKE_SSH_PEM_ALIAS:-}" == "$alias_name" ]] && printf 'cert\n' >"$t/system/leak.pem"
     tar -czf - -C "$t" .

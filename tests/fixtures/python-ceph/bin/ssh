@@ -30,6 +30,13 @@ import sys
 import tarfile
 import time
 import base64
+from pathlib import Path
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from tests.fixture_product import node_manifest_artifact
 
 
 CEPH_RESPONSES = {
@@ -241,7 +248,7 @@ def node_archive(alias: str, *, skip_logs: bool) -> bytes:
             {
                 "host": alias,
                 "collector": "collect-node",
-                "artifact": f"/tmp/ceph-incident-node.fixture/out/{name}",
+                "artifact": node_manifest_artifact(name),
                 "command": (
                     "hostname"
                     if name == "system/hostname.txt"
@@ -281,7 +288,6 @@ def serve_bootstrap(remote_command: str) -> None:
         reject("unparseable remote command")
     if not matches_all(("python3", "-c", BOOTSTRAP_SOURCE, ENCODED_CONFIG), words):
         reject("node bootstrap remote command")
-    sys.stdin.buffer.read()
     padding = "=" * (-len(words[3]) % 4)
     config: dict[str, object] = {}
     try:
@@ -399,6 +405,13 @@ def serve_ceph(words: list[str]) -> None:
 
 
 arguments = sys.argv[1:]
+# OpenSSH forwards stdin and reads it to EOF independently of which remote
+# command shape was selected. Drain before argv dispatch so probes, direct
+# Ceph reads, bootstrap requests and rejected invocations all model that fact.
+# Match the shell fixture's guard so a developer running the fake directly does
+# not block forever on an interactive terminal.
+if not sys.stdin.isatty():
+    sys.stdin.buffer.read()
 log_path = os.environ.get("FAKE_SSH_LOG")
 if log_path:
     with open(log_path, "a", encoding="utf-8") as output:

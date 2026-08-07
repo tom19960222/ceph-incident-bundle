@@ -13,10 +13,22 @@ import gzip
 import io
 import json
 import re
+import sys
 import tarfile
+from pathlib import Path
 
 
-NODE_TMP_ROOT = "/tmp/ceph-incident-node.differential/out"
+try:
+    # `build_world` copies the canonical helper next to this module.
+    from fixture_product import node_manifest_artifact
+except ModuleNotFoundError:
+    # The fidelity contract also executes the checked-in fake in place.
+    repository_root = Path(__file__).resolve().parents[3]
+    sys.path.insert(0, str(repository_root))
+    from tests.fixture_product import node_manifest_artifact
+
+
+NODE_WORKSPACE = "/tmp/ceph-incident-node.differential"
 
 # Redaction bait. Each line is a documented secret shape from the content-safety
 # contract, so a redact/no-redact pair of runs is decided by the collector's
@@ -130,7 +142,7 @@ def node_archive_bytes(alias: str, *, skip_logs: bool, case: str = "normal") -> 
             {
                 "host": alias,
                 "collector": "collect-node",
-                "artifact": f"{NODE_TMP_ROOT}/{name}",
+                "artifact": node_manifest_artifact(name, workspace=NODE_WORKSPACE),
                 "command": _command_for(name),
                 "exit_code": 0,
                 "started": "2026-07-29T00:00:00Z",

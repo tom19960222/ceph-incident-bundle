@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.fixture_product import node_bundle_member, node_manifest_artifact
 from validation.lab_bundle import (
     BLANKED_LINE,
     BundleUnreadable,
@@ -94,15 +95,17 @@ def bundle_members(
             "truncated=0\n"
         ).encode("utf-8")
     for host in hosts:
-        members[f"nodes/{host}/system/hostname.txt"] = capture(
+        hostname_member = node_bundle_member(host, "system/hostname.txt")
+        members[hostname_member] = capture(
             host, "node", started, f"{host}\n"
         )
-        members[f"nodes/{host}/manifest.jsonl"] = (
+        manifest_member = node_bundle_member(host, "manifest.jsonl")
+        members[manifest_member] = (
             json.dumps(
                 {
                     "host": host,
                     "collector": "node",
-                    "artifact": f"nodes/{host}/system/hostname.txt",
+                    "artifact": node_manifest_artifact("system/hostname.txt"),
                     "command": "hostname",
                     "exit_code": 0,
                     "started": started,
@@ -112,7 +115,10 @@ def bundle_members(
             + "\n"
         ).encode("utf-8")
         if var_log:
-            members[f"nodes/{host}/logs/var-log/merged/syslog.merged"] = (
+            var_log_member = node_bundle_member(
+                host, "logs/var-log/merged/syslog.merged"
+            )
+            members[var_log_member] = (
                 f"{started} {host} kernel: line {counter}\n".encode("utf-8")
             )
     members["manifest.jsonl"] = "".join(
@@ -120,6 +126,20 @@ def bundle_members(
     ).encode("utf-8")
     members.update(extra or {})
     return members
+
+
+class FixtureProductShapeTests(unittest.TestCase):
+    def test_node_manifest_and_member_match_the_real_product_shape(self) -> None:
+        members = bundle_members(hosts=("monitor01",))
+        manifest = members[node_bundle_member("monitor01", "manifest.jsonl")]
+        record = json.loads(manifest.decode("utf-8"))
+
+        self.assertEqual(
+            record["artifact"], node_manifest_artifact("system/hostname.txt")
+        )
+        self.assertIn(
+            node_bundle_member("monitor01", "system/hostname.txt"), members
+        )
 
 
 class BundleTestCase(unittest.TestCase):
@@ -555,15 +575,6 @@ class ContractTests(BundleTestCase):
         self.assertEqual(describe_differences(reference, candidate), ())
 
 
-# The remote workspace as both implementations really name it, `out/` included:
-# each writes its evidence to `<workspace>/out`, so that segment is in every
-# artifact path their manifests record and is gone from the packed
-# `nodes/<alias>/` tree.  A fixture that left it out made every bundle lookup in
-# the ADR 0010 reduction ask about a member that could not exist, which is how
-# these tests stayed green while the real gate let 13 entries through (#52).
-WORKSPACE = "/tmp/ceph-incident-node.Ab3xY9/out"
-
-
 def node_entry(
     host: str, artifact: str, command: str, exit_code: int = 0
 ) -> dict[str, object]:
@@ -572,7 +583,7 @@ def node_entry(
     return {
         "host": host,
         "collector": "collect-node",
-        "artifact": f"{WORKSPACE}/{artifact}",
+        "artifact": node_manifest_artifact(artifact),
         "command": command,
         "exit_code": exit_code,
         "started": "2026-07-31T01:00:00Z",
@@ -600,22 +611,28 @@ class NodeManifestTests(BundleTestCase):
         """
 
         members = bundle_members(hosts=(self.HOST,))
-        members[f"nodes/{self.HOST}/cephadm/var-lib-ceph-listing.txt"] = capture(
+        listing = node_bundle_member(self.HOST, "cephadm/var-lib-ceph-listing.txt")
+        members[listing] = capture(
             self.HOST, "collect-node", "2026-07-31T01:00:00Z", "d /var/lib/ceph\n"
         )
-        members[f"nodes/{self.HOST}/time/systemd-timesyncd-config/timesyncd.conf"] = (
-            b"[Time]\nNTP=10.0.0.1\n"
+        timesyncd = node_bundle_member(
+            self.HOST, "time/systemd-timesyncd-config/timesyncd.conf"
         )
-        members[f"nodes/{self.HOST}/resources/iostat.txt"] = (
+        members[timesyncd] = b"[Time]\nNTP=10.0.0.1\n"
+        members[node_bundle_member(self.HOST, "resources/iostat.txt")] = (
             b"SKIPPED: command not found: iostat\n"
         )
         # Both implementations run and record this one, so it is evidence with a
         # capture header — not part of the generated tree around it.
-        members[f"nodes/{self.HOST}/logs/var-log/journal-all-since.txt"] = capture(
+        journal = node_bundle_member(
+            self.HOST, "logs/var-log/journal-all-since.txt"
+        )
+        members[journal] = capture(
             self.HOST, "collect-node", "2026-07-31T01:00:00Z", "-- Journal begins --\n"
         )
-        members[f"nodes/{self.HOST}/logs/var-log/INDEX.tsv"] = b"path\tbytes\n"
-        members[f"nodes/{self.HOST}/manifest.jsonl"] = "".join(
+        index = node_bundle_member(self.HOST, "logs/var-log/INDEX.tsv")
+        members[index] = b"path\tbytes\n"
+        members[node_bundle_member(self.HOST, "manifest.jsonl")] = "".join(
             (line if isinstance(line, str) else json.dumps(line)) + "\n"
             for line in manifest_lines
         ).encode("utf-8")
@@ -716,18 +733,25 @@ class NodeManifestTests(BundleTestCase):
             ),
         ]
         members = bundle_members(hosts=(self.HOST,))
-        members[f"nodes/{self.HOST}/logs/var-log/journal-all-since.txt"] = (
+        journal = node_bundle_member(
+            self.HOST, "logs/var-log/journal-all-since.txt"
+        )
+        members[journal] = (
             b"SKIPPED: not collected because combined /var/log and journal text "
             b"exceeded the per-node cap\n"
         )
-        members[f"nodes/{self.HOST}/manifest.jsonl"] = "".join(
+        members[node_bundle_member(self.HOST, "manifest.jsonl")] = "".join(
             json.dumps(record) + "\n" for record in over_limit
         ).encode("utf-8")
-        reference = contract_of(read_bundle(self.write(members, "over-limit-a.tar.gz")))
-        members[f"nodes/{self.HOST}/manifest.jsonl"] = "".join(
+        reference = contract_of(
+            read_bundle(self.write(members, "over-limit-a.tar.gz"))
+        )
+        members[node_bundle_member(self.HOST, "manifest.jsonl")] = "".join(
             json.dumps(record) + "\n" for record in over_limit[:2]
         ).encode("utf-8")
-        candidate = contract_of(read_bundle(self.write(members, "over-limit-b.tar.gz")))
+        candidate = contract_of(
+            read_bundle(self.write(members, "over-limit-b.tar.gz"))
+        )
         self.assertNotEqual(describe_differences(reference, candidate), ())
 
     def test_an_index_verb_over_a_real_capture_is_still_compared(self) -> None:
@@ -763,10 +787,11 @@ class NodeManifestTests(BundleTestCase):
         """A bundle whose `/var/lib/ceph` was not readable, as the k8s node's was not."""
 
         members = bundle_members(hosts=(self.HOST,))
-        members[f"nodes/{self.HOST}/cephadm/var-lib-ceph-listing.txt"] = (
+        listing = node_bundle_member(self.HOST, "cephadm/var-lib-ceph-listing.txt")
+        members[listing] = (
             b"SKIPPED: /var/lib/ceph is not a readable directory on this node\n"
         )
-        members[f"nodes/{self.HOST}/manifest.jsonl"] = "".join(
+        members[node_bundle_member(self.HOST, "manifest.jsonl")] = "".join(
             json.dumps(line) + "\n" for line in manifest_lines
         ).encode("utf-8")
         return contract_of(read_bundle(self.write(members, name)))

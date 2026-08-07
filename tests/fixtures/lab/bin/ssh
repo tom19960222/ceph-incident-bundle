@@ -136,6 +136,10 @@ DEFAULT_CEPH_STATE = {
 }
 
 arguments = sys.argv[1:]
+# Identity, stable-state and residue probes all run through real OpenSSH in the
+# lab. Drain before whitelist dispatch so failures and rejected commands agree.
+if not sys.stdin.isatty():
+    sys.stdin.buffer.read()
 log_path = os.environ.get("FAKE_LAB_SSH_LOG")
 if log_path:
     with open(log_path, "a", encoding="utf-8") as output:

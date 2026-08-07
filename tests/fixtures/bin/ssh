@@ -2,6 +2,7 @@
 set -euo pipefail
 
 log_file=${FAKE_SSH_LOG:-}
+argv_log=${FAKE_SSH_ARGV_NUL_LOG:-}
 fail_on=${FAKE_SSH_FAIL_ON:-}
 crash_ls_broken=${FAKE_SSH_CRASH_LS_BROKEN:-0}
 
@@ -12,6 +13,13 @@ crash_ls_broken=${FAKE_SSH_CRASH_LS_BROKEN:-0}
 # would otherwise block on the terminal.
 if [[ ! -t 0 ]]; then
   cat >/dev/null 2>&1 || true
+fi
+
+# The human-readable ledger below intentionally flattens argv for old shell
+# assertions. This opt-in lossless ledger lets the shared fidelity contract
+# prove that the executable received argument boundaries before dispatch.
+if [[ -n "$argv_log" ]]; then
+  printf '%s\0' "$@" >"$argv_log"
 fi
 
 if [[ -n "$log_file" ]]; then

@@ -158,6 +158,11 @@ FORBIDDEN_NODE_TOKENS = ("sudo", "cephadm", "kubectl", "curl", "chmod", "systemc
 PYTHON_NODE_COMMAND = re.compile(r"^python3 -c ")
 
 arguments = sys.argv[1:]
+# The differential world must model OpenSSH before it chooses a canned remote
+# route: OpenSSH reads stdin to EOF for probes, reads and rejected invocations
+# as well as node bootstraps. Node routes retain the bytes for their ledgers.
+# The TTY exception exists only to keep direct developer runs interactive.
+stdin_payload = b"" if sys.stdin.isatty() else sys.stdin.buffer.read()
 
 
 def log(path_variable: str, record: object) -> None:
@@ -279,13 +284,6 @@ def serve_kubectl(words: list[str]) -> None:
     os.execv(kubectl, [kubectl, *words])
 
 
-def read_stdin() -> bytes:
-    stream = getattr(sys.stdin, "buffer", None)
-    if stream is None:
-        return b""
-    return stream.read()
-
-
 def node_request(implementation: str, options: dict[str, object], stdin: bytes) -> None:
     """Answer one node collection, logging what each implementation asked for."""
 
@@ -357,7 +355,7 @@ def serve_shell_node(match: "re.Match[str]") -> None:
             "skip_logs": "--skip-logs" in flags,
             "keep_original_logs": "--keep-original-logs" in flags,
         },
-        read_stdin(),
+        stdin_payload,
     )
 
 
@@ -392,7 +390,7 @@ def serve_python_node(remote_command: str) -> None:
             "skip_logs": bool(config.get("skip_logs")),
             "keep_original_logs": bool(config.get("keep_original_logs")),
         },
-        read_stdin(),
+        stdin_payload,
     )
 
 

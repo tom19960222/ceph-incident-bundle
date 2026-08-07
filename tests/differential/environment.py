@@ -24,6 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 FAKES = ROOT / "tests" / "differential" / "fakes"
 SHARED_CURL = ROOT / "tests" / "fixtures" / "bin" / "curl"
+FIXTURE_PRODUCT = ROOT / "tests" / "fixture_product.py"
 
 SHELL_ENTRYPOINT = ("bash", str(ROOT / "run" / "collect.sh"))
 PYTHON_ENTRYPOINT = (sys.executable, str(ROOT / "ceph_incident_bundle.py"), "collect")
@@ -65,6 +66,7 @@ def build_world(root: Path, *, inventory_text: str, knobs: dict[str, str]) -> di
     for name in ("ssh", "kubectl", "timeout"):
         shutil.copy2(FAKES / name, fake_bin / name)
     shutil.copy2(FAKES / "node_archive.py", fake_bin / "node_archive.py")
+    shutil.copy2(FIXTURE_PRODUCT, fake_bin / "fixture_product.py")
     shutil.copy2(SHARED_CURL, fake_bin / "curl")
     for name in ("ssh", "kubectl", "timeout", "curl"):
         (fake_bin / name).chmod(0o755)

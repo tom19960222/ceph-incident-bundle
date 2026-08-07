@@ -22,6 +22,13 @@ import shlex
 import subprocess
 import sys
 import tarfile
+from pathlib import Path
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from tests.fixture_product import node_manifest_artifact
 
 
 # Dynamic-but-constrained argv slots: identity path, timeouts, known_hosts file
@@ -126,7 +133,7 @@ def node_archive(alias: str) -> bytes:
     entry = {
         "host": alias,
         "collector": "collect-node",
-        "artifact": "/tmp/ceph-incident-node.fixture/out/system/hostname.txt",
+        "artifact": node_manifest_artifact("system/hostname.txt"),
         "command": "hostname",
         "exit_code": 0,
         "started": "2026-07-29T00:00:00Z",
@@ -160,7 +167,6 @@ def serve_bootstrap(remote_command: str) -> None:
         reject("unparseable remote command")
     if not matches_all(("python3", "-c", BOOTSTRAP_SOURCE, ENCODED_CONFIG), words):
         reject("node bootstrap remote command")
-    sys.stdin.buffer.read()
     alias = os.environ.get("FAKE_NODE_ALIAS", "monitor01")
     sys.stdout.buffer.write(node_archive(alias))
     raise SystemExit(int(os.environ.get("FAKE_NODE_EXIT", "0")))
@@ -183,6 +189,10 @@ def serve_remote_kubectl(words: list[str]) -> None:
 FAKE_KUBECTL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kubectl")
 
 arguments = sys.argv[1:]
+# Real ssh drains stdin for every invocation, not only for the node bootstrap.
+# Do this before dispatch so early rejects, probes and kubectl calls agree.
+if not sys.stdin.isatty():
+    sys.stdin.buffer.read()
 log_path = os.environ.get("FAKE_SSH_LOG")
 if log_path:
     with open(log_path, "a", encoding="utf-8") as output:
