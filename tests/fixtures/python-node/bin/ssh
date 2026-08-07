@@ -17,11 +17,21 @@ if log_path:
     with open(log_path, "w", encoding="utf-8") as output:
         json.dump(arguments, output)
 
+child_environment = os.environ.copy()
+if os.environ.get("FAKE_REMOTE_TMPDIR"):
+    child_environment["TMPDIR"] = os.environ["FAKE_REMOTE_TMPDIR"]
+if os.environ.get("FAKE_REMOTE_PATH"):
+    child_environment["PATH"] = os.environ["FAKE_REMOTE_PATH"]
+if mode == "remote-failure":
+    child_environment["PATH"] = (
+        os.environ["FAKE_REMOTE_BIN"] + os.pathsep + child_environment["PATH"]
+    )
+
 if mode == "timeout":
     os.execve(
         "/bin/sh",
         ["sh", "-c", "exec " + remote_command],
-        os.environ,
+        child_environment,
     )
 
 payload = sys.stdin.buffer.read()
@@ -80,13 +90,6 @@ if mode in (
     sys.stdout.buffer.write(archive_buffer.getvalue())
     raise SystemExit(0)
 
-child_environment = os.environ.copy()
-if os.environ.get("FAKE_REMOTE_PATH"):
-    child_environment["PATH"] = os.environ["FAKE_REMOTE_PATH"]
-if mode == "remote-failure":
-    child_environment["PATH"] = (
-        os.environ["FAKE_REMOTE_BIN"] + os.pathsep + child_environment["PATH"]
-    )
 result = subprocess.run(
     ["/bin/sh", "-c", "exec " + remote_command],
     input=payload,

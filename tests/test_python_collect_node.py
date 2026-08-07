@@ -82,6 +82,8 @@ class NodeCollectorFixture:
         real_bin.mkdir()
         ssh_log = root / "ssh-argv.json"
         payload_log = root / "ssh-stdin.py"
+        workstation_tmp = root / "workstation-tmp"
+        workstation_tmp.mkdir()
         remote_tmp = root / "remote-tmp"
         remote_tmp.mkdir()
         remote_bin = root / "remote-bin"
@@ -104,7 +106,8 @@ class NodeCollectorFixture:
             **os.environ,
             "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
             "FAKE_REMOTE_PATH": f"{fake_bin}{os.pathsep}{real_bin}",
-            "TMPDIR": str(remote_tmp),
+            "TMPDIR": str(workstation_tmp),
+            "FAKE_REMOTE_TMPDIR": str(remote_tmp),
             "FAKE_SSH_LOG": str(ssh_log),
             "FAKE_SSH_PAYLOAD": str(payload_log),
             "FAKE_REMOTE_BIN": str(remote_bin),
