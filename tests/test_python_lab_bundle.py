@@ -21,6 +21,7 @@ from validation.lab_contract import describe_differences
 
 
 HOSTS = ("monitor01", "osd01")
+PROMETHEUS_DUMP_INFO = "cluster/prometheus/dump-info.txt"
 
 
 def capture(host: str, collector: str, started: str, body: str) -> bytes:
@@ -77,6 +78,21 @@ def bundle_members(
         members["cluster/prometheus/ceph/up.json.gz"] = gzip.compress(
             json.dumps({"samples": counter}).encode("utf-8")
         )
+        members[PROMETHEUS_DUMP_INFO] = (
+            "url=http://prometheus.example:9090\n"
+            "since=24h\n"
+            f"window_start_epoch={counter}\n"
+            f"window_start_utc={started}\n"
+            f"window_end_epoch={counter + 86400}\n"
+            f"window_end_utc={started}\n"
+            "step_seconds=15\n"
+            "job_regex=ceph|node\n"
+            f"jobs_seen={counter}\n"
+            "jobs_matched=ceph node-exporter\n"
+            f"metrics_ok={counter}\n"
+            f"metrics_failed={counter}\n"
+            "truncated=0\n"
+        ).encode("utf-8")
     for host in hosts:
         members[f"nodes/{host}/system/hostname.txt"] = capture(
             host, "node", started, f"{host}\n"
@@ -255,6 +271,17 @@ class ContractTests(BundleTestCase):
             read_bundle(self.write(bundle_members(**kwargs), f"run-{self.written}.tar.gz"))
         )
 
+    def contract_with_prometheus_dump_changes(
+        self, changes: dict[bytes, bytes], name: str
+    ):
+        members = bundle_members()
+        dump_info = members[PROMETHEUS_DUMP_INFO]
+        for original, changed in changes.items():
+            self.assertIn(original, dump_info)
+            dump_info = dump_info.replace(original, changed)
+        members[PROMETHEUS_DUMP_INFO] = dump_info
+        return contract_of(read_bundle(self.write(members, name)))
+
     def test_two_collects_of_a_live_cluster_are_equivalent(self) -> None:
         reference = self.contract(started="2026-07-31T01:00:00Z", counter=11)
         candidate = self.contract(started="2026-07-31T01:07:42Z", counter=93)
@@ -405,6 +432,72 @@ class ContractTests(BundleTestCase):
         self.assertTrue(
             any("ceph_runner" in line for line in describe_differences(reference, candidate))
         )
+
+    def test_a_different_prometheus_since_decision_is_a_difference(self) -> None:
+        reference = self.contract()
+        candidate = self.contract_with_prometheus_dump_changes(
+            {b"since=24h": b"since=12h"}, "prom-since.tar.gz"
+        )
+        differences = describe_differences(reference, candidate)
+        self.assertTrue(any("since" in line for line in differences), differences)
+
+    def test_each_prometheus_dump_decision_is_compared(self) -> None:
+        changes = {
+            b"step_seconds=15": b"step_seconds=60",
+            b"job_regex=ceph|node": b"job_regex=ceph",
+            b"jobs_matched=ceph node-exporter": b"jobs_matched=ceph",
+            b"truncated=0": b"truncated=1",
+        }
+        for original, changed in changes.items():
+            with self.subTest(field=original.partition(b"=")[0].decode("ascii")):
+                reference = self.contract()
+                candidate = self.contract_with_prometheus_dump_changes(
+                    {original: changed},
+                    f"prom-{original.partition(b'=')[0].decode('ascii')}.tar.gz",
+                )
+                self.assertNotEqual(describe_differences(reference, candidate), ())
+
+    def test_a_missing_prometheus_dump_decision_is_a_difference(self) -> None:
+        reference = self.contract()
+        candidate = self.contract_with_prometheus_dump_changes(
+            {b"job_regex=ceph|node\n": b""}, "prom-missing-field.tar.gz"
+        )
+        differences = describe_differences(reference, candidate)
+        self.assertTrue(any("job_regex" in line for line in differences), differences)
+
+    def test_prometheus_dump_live_and_clock_fields_are_not_compared(self) -> None:
+        reference = self.contract()
+        changes = {
+            b"window_start_epoch=1": b"window_start_epoch=999",
+            b"window_start_utc=2026-07-31T01:00:00Z": (
+                b"window_start_utc=2026-08-01T02:03:04Z"
+            ),
+            b"window_end_epoch=86401": b"window_end_epoch=999999",
+            b"window_end_utc=2026-07-31T01:00:00Z": (
+                b"window_end_utc=2026-08-02T03:04:05Z"
+            ),
+            b"jobs_seen=1": b"jobs_seen=ceph grafana node-exporter",
+            b"metrics_ok=1": b"metrics_ok=200",
+            b"metrics_failed=1": b"metrics_failed=3",
+        }
+        candidate = self.contract_with_prometheus_dump_changes(
+            changes, "prom-live-values.tar.gz"
+        )
+        self.assertEqual(describe_differences(reference, candidate), ())
+
+    def test_prometheus_job_index_body_is_live_evidence(self) -> None:
+        path = "cluster/prometheus/ceph/index.txt"
+        reference = self.contract(extra={path: b"ok ceph_health status.json.gz\n"})
+        candidate = self.contract(
+            extra={
+                path: (
+                    b"failed ceph_health -\n"
+                    b"skipped unsafe_metric unsafe-name\n"
+                    b"TRUNCATED: budget 600s exceeded\n"
+                )
+            }
+        )
+        self.assertEqual(describe_differences(reference, candidate), ())
 
     def test_a_different_partial_status_is_a_difference(self) -> None:
         reference = self.contract()
