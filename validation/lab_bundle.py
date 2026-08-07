@@ -27,27 +27,31 @@ taken:
   gives anything up;
 - each captured artifact's header (host, collector, timeout, truncation) and
   whether its body parses as JSON at all;
+- the collector decisions recorded in top-level metadata and Prometheus
+  `dump-info.txt`, selected field by field so live observations stay out;
 - how each SKIPPED or partial outcome was classified;
 - which of the four collector paths were covered.
 
 Evidence *bodies*, `/var/log` payloads and recompressed metric dumps are recorded
-as present-and-opaque, down to their JSON key paths.  Neither implementation
+as present-and-opaque, down to their JSON key paths.  Collector-authored control
+documents are the exception: the explicit field lists below retain decisions
+without turning live observations into contract.  Neither implementation
 *transforms* cluster evidence: each runs a command and records its output
 verbatim, and the manifest above already pins which command ran and what it
-exited with.  If both manifests agree, the two bodies came from the same question
-asked of the same cluster, and any difference between them is the cluster
-answering at two different moments — `health.checks` is `{}` on a healthy cluster
-and grows a key the moment a slow op is reported.  A gate that fails on a
+exited with.  If both manifests agree, the two evidence bodies came from the same
+question asked of the same cluster, and any difference between them is the
+cluster answering at two different moments — `health.checks` is `{}` on a healthy
+cluster and grows a key the moment a slow op is reported.  A gate that fails on a
 transient HEALTH_WARN is one people learn to re-run until it passes, which is
 worse than one that compares less and means it.
 
-A difference in any of the compared fields fails the gate.  Three things are
-deliberately ignored, and each is enumerated rather than described: the clocks,
-run directories, random temporary names and invocation identifiers the
-normalizer removes below; the node manifest entries ADR 0010 already
+A difference in any of the compared fields fails the gate.  Four surfaces are
+deliberately ignored, and each is enumerated rather than hidden behind a
+catch-all: the clocks, run directories, random temporary names and invocation
+identifiers the normalizer removes below; unselected live fields in
+collector-authored control documents; the node manifest entries ADR 0010 already
 adjudicated as divergent; and which files the `/var/log` payload trees hold,
 which belongs to the machine and the hour rather than to either implementation.
-There is no fourth list.
 
 Reading is untrusting.  A bundle is a tar archive, so every member is checked for
 absolute paths, traversal, links and special files before anything is read, and
@@ -77,6 +81,7 @@ COMPRESSED_SUFFIXES = (".gz", ".xz", ".bz2", ".zst")
 MANIFEST_NAME = "manifest.jsonl"
 ENVIRONMENT_NAME = "environment.txt"
 SUMMARY_NAME = "summary.txt"
+PROMETHEUS_DUMP_INFO_NAME = "cluster/prometheus/dump-info.txt"
 # `environment.txt` is where the run records which source and runner it chose, so
 # these keys are the comparison's view of source and runner selection.
 # `created_utc` is the clock, and the candidate-only keys (`node_target_*`,
@@ -102,6 +107,15 @@ SUMMARY_KEYS = (
     "node_ok",
     "node_failed",
     "final_status",
+)
+# `dump-info.txt` records both the Prometheus collector's decisions and values
+# observed from a live target.  Only the former belong in a two-run contract.
+PROMETHEUS_DUMP_INFO_KEYS = (
+    "since",
+    "step_seconds",
+    "job_regex",
+    "jobs_matched",
+    "truncated",
 )
 NODE_MANIFEST = re.compile(r"nodes/([^/]+)/manifest\.jsonl\Z")
 # The `/var/log` payload trees.  Their bytes are never interpreted, and their
@@ -658,6 +672,11 @@ def _artifact_contract(
         }
     if name == SUMMARY_NAME:
         return {"kind": "summary", "fields": _fields(text, ":", SUMMARY_KEYS, rules)}
+    if name == PROMETHEUS_DUMP_INFO_NAME:
+        return {
+            "kind": "prometheus-dump-info",
+            "decisions": _fields(text, "=", PROMETHEUS_DUMP_INFO_KEYS, rules),
+        }
     header, body = _split_capture_header(text)
     contract: dict[str, object] = {
         # Whether the captured body parses as JSON *is* the implementation's

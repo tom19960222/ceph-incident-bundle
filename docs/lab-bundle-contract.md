@@ -30,6 +30,7 @@ Real lab 兩者都不是。兩次 qualification collect 相隔數分鐘打在活
 | 每個 captured artifact 的 `# key: value` header | host、collector、timeout 與 truncation 標記——`# timeout` 逐字比對，qualification 工作機因此必須提供 timeout binary（[ADR 0011](adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md)） |
 | artifact body 是否解析得出 JSON | 「是不是 JSON」是實作決定的：把 evidence 包裝、截斷或重新序列化的 candidate 會在這裡現形 |
 | `environment.txt` 的選擇欄位 | `mode`、`seed`、`since`、`timeout`、`git_commit`、`ceph_source`、`ceph_runner`、`rook_source`、`prom_url`、`prom_jobs` |
+| `cluster/prometheus/dump-info.txt` 的決策欄位 | `since`、`step_seconds`、`job_regex`、`jobs_matched`、`truncated`；清單中的欄位缺失會明確記成 `None`，不會因文件變短而縮小比較範圍 |
 | `summary.txt` | `cluster_status`、`node_ok`、`node_failed`、`final_status` — partial collection 在這裡變成可觀測 |
 | SKIPPED／partial artifact 的分類 | 兩邊必須以同一個原因略過同一件事 |
 | `errors.log` 的事件分類集合 | 兩邊記錄粒度不同，但事件必須相同 |
@@ -52,6 +53,11 @@ covered。
 - 重壓縮後的 metric dump bytes（任何 `.gz`／`.xz`／`.bz2`／`.zst`）。這些只比對
   「存在與路徑」。
 - 超過 4 MiB 的 artifact 內容；同樣只比對存在與路徑。
+- `cluster/prometheus/dump-info.txt` 清單外的欄位。`metrics_ok`／
+  `metrics_failed` 是兩次 collect 之間會改變的活體 metric 集合；
+  `window_*_epoch`／`window_*_utc` 是採集時鐘，實際套用的窗口寬度另由 manifest argv
+  normalizer 保留；`jobs_seen` 是 Prometheus 當時的 target 狀態。`url` 已由
+  `environment.txt` 的 `prom_url` 比對，不在這裡重複建立第二份 contract。
 - `/var/log` payload 樹（`nodes/*/logs/var-log/{merged,raw,original}/`）**連存在與
   路徑都不比**。這棵樹的檔案集合是活體機器的作為，不是實作的：兩次 collect 跨過
   UTC 日界，`sysstat/sa03` 就只在第二次存在；journald 也會在兩次之間輪替、改名它
@@ -65,6 +71,20 @@ covered。
 
 Evidence 處理本身的 byte-level 等價是 offline gate 的職責：那裡的輸入是凍結的，所以
 它可以精確比對。
+
+### Collector-authored 文字檔盤點
+
+`cluster/prometheus/<job>/index.txt` 已逐欄檢查，但不選取 body 欄位。它的 metric
+名稱與逐筆 `ok`／`failed`／`skipped` 是活體 Prometheus 在該次 collect 回答的集合與
+結果；`TRUNCATED` 則已由 `dump-info.txt` 的 `truncated` 決策欄位表達。Gate 仍比較
+`index.txt` 的 member 路徑，以及 manifest 中產生它的 argv 與 exit code，所以路徑、
+窗口、step 或成功／partial 語意不會因此消失。
+
+其餘同類文件也沒有未承接的穩定決策：`CONTENTS.md` 是 manifests 與 member set 的人讀
+投影；`README-FIRST.txt` 是固定說明；`errors.log` 已化約成事件分類集合；
+`nodes/*/logs/var-log/INDEX.tsv` 與相鄰的 size／warning／error metadata 描述當時活體
+`/var/log` 的來源檔、bytes 與讀取結果。後一組保留 member／manifest／skip／coverage
+比較，但不比較會隨 log rotation 和兩次讀取時刻改變的 body。
 
 ## Node manifest：只比對兩邊都宣稱的那一面（ADR 0010）
 
@@ -150,7 +170,7 @@ source／runner 選擇也都不受影響。
 | `.../ceph-incident-node[.-]<suffix>` → `<node-workspace>` | 遠端 workspace 的 mktemp 後綴／invocation id |
 | `<dir>/.<name>.{plain,encoded}.<random>` → `<dir>/<name>` | redaction 暫存檔指向同一個 artifact |
 | `.../tmp.<random>[.<pid>]` → `<workdir>` | 工作機暫存目錄。兩邊命名法不同——reference 是 `tmp.<stamp>.$$`，candidate 是 `mkdtemp` 的後綴（字母表含 `_`）——這條規則必須兩種都吃完整，只吃掉一半會留下 `<workdir>.61493` 這種尾巴（#52） |
-| `start=<epoch>`／`end=<epoch>` → `start=<epoch-Ns>`／`end=<epoch>`，**僅限 artifact 落在 `cluster/prometheus/` 的 entry** | Prometheus query window 的兩端是採集起始時刻算出來的 epoch，兩次 run 必然不同。**窗口寬度 `N` 保留**：`end - start` 恆等於 Evidence Window 的秒數（兩邊都是 `end = now()`、`start = end - since`），而這裡是本 gate 唯一還看得到「Prometheus path 有沒有照 Evidence Window 取窗口」的地方——`dump-info.txt` 的 `since=` 在 body 裡，而本 gate 不比對 artifact body。已知代價是窗口的絕對錨點不再可觀測：寬度對、但把 `end` 算在錯誤時間基準上的 candidate 會靜默通過 |
+| `start=<epoch>`／`end=<epoch>` → `start=<epoch-Ns>`／`end=<epoch>`，**僅限 artifact 落在 `cluster/prometheus/` 的 entry** | Prometheus query window 的兩端是採集起始時刻算出來的 epoch，兩次 run 必然不同。**窗口寬度 `N` 保留**：`dump-info.txt` 的 selected `since` 記錄 collector 宣告的 Evidence Window；manifest argv 的 `end - start` 則獨立證明它實際套用的秒數。兩者都要保留，才看得見「宣告 24h 卻查 12h」。已知代價是窗口的絕對錨點不再可觀測：寬度對、但把 `end` 算在錯誤時間基準上的 candidate 會靜默通過 |
 | 32 位 hex → `<invocation>` | node invocation identifier |
 | 各自的 `--out` 目錄與 run directory → `<bundle>`／`<run>` | 兩次 run 依定義寫在不同目錄 |
 
