@@ -7,6 +7,13 @@ import os
 import subprocess
 import sys
 import tarfile
+from pathlib import Path
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from tests.fixture_product import node_manifest_artifact
 
 
 arguments = sys.argv[1:]
@@ -69,7 +76,9 @@ if mode in (
             entry = {
                 "host": "monitor01",
                 "collector": "collect-node",
-                "artifact": "/tmp/owned/out/system/hostname.txt",
+                "artifact": node_manifest_artifact(
+                    "system/hostname.txt", workspace="/tmp/owned"
+                ),
                 "command": "hostname",
                 "exit_code": 0,
                 "started": "2026-07-29T00:00:00Z",
