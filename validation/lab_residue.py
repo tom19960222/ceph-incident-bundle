@@ -1,12 +1,12 @@
-"""Remote residue: proof that neither collect left anything behind on a node.
+"""Remote residue: proof that the live Python collect left nothing on a node.
 
-Both implementations do their node work inside a temporary workspace under the
-node's `TMPDIR` and are expected to remove it, so anything of that shape still
-present after the two runs is a leak of collector state onto a machine we only
-had permission to read.
+The collector does node work inside a temporary workspace under the node's
+`TMPDIR` and must remove it, so anything of that shape newly present after the
+live run is a leak of collector state onto a machine we only had permission to
+read.
 
 Ownership is established by *comparison*, not by deletion.  One listing is taken
-before the first collect and one after the second; only what appeared in between
+before the live collect and one after it; only what appeared in between
 is attributed to this run, and a workspace whose name carries one of the run's
 invocation identifiers is named as such.  Nothing here removes a workspace or
 signals a process: a residue check that can clean up is a residue check that can
@@ -73,7 +73,7 @@ def compare_residue(
 ) -> tuple[str, str]:
     """Decide one node's residue verdict and describe it in one line.
 
-    Anything already present before the first collect is reported as pre-existing
+    Anything already present before the live collect is reported as pre-existing
     rather than silently ignored: it is not this run's leak, but an operator
     reading the report should still know the node was not clean to begin with.
     """

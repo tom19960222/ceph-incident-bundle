@@ -364,11 +364,10 @@ class _Qualification:
         )
 
     def _run_records(self) -> tuple[RunRecord, ...]:
-        """Both implementations, always — the one that never ran stays `not-run`.
+        """Preserved shell baseline and live Python run, including stopped stages.
 
-        A report that simply omits the candidate would read as though only the
-        reference was ever in scope; the schema's job is to say which of the two
-        got how far.
+        The schema must show both sides of the comparison even when the live run
+        never starts or stops early.
         """
 
         recorded = {run.implementation: run for run in self.runs}
@@ -593,11 +592,10 @@ class _Qualification:
             return self._finish(
                 self._failed(
                     "stable-state-post",
-                    f"{len(differences)} stable field(s) changed across the two collects",
+                    f"{len(differences)} stable field(s) changed during the live Python collect",
                     FAILURE_STABLE_STATE,
-                    f"Review the changed stable fields in {self.run_directory} against "
-                    "the two command ledgers before any cutover — collection must not "
-                    "change persistent state",
+                    f"Review the changed stable fields and Python command ledger in "
+                    f"{self.run_directory} — collection must not change persistent state",
                 ),
                 prober,
                 known_hosts,
@@ -764,7 +762,7 @@ class _Qualification:
             ),
         )
 
-    # -- gates over the two runs -------------------------------------------
+    # -- gates over the preserved baseline and live run --------------------
 
     def _check_coverage(self, run: RunRecord) -> QualifyResult | None:
         gaps = run.coverage.gaps()
@@ -807,10 +805,10 @@ class _Qualification:
         return None
 
     def _compare(self, collected: Sequence[_Collected]) -> QualifyResult | None:
-        reference, candidate = collected[0], collected[1]
+        baseline, current = collected[0], collected[1]
         differences = describe_differences(
-            contract_of(reference.contents, self._own_path_rules(reference.record)),
-            contract_of(candidate.contents, self._own_path_rules(candidate.record)),
+            contract_of(baseline.contents, self._own_path_rules(baseline.record)),
+            contract_of(current.contents, self._own_path_rules(current.record)),
         )
         self.comparison = ComparisonRecord(
             result="equivalent" if not differences else "different",
@@ -833,12 +831,11 @@ class _Qualification:
         return None
 
     def _own_path_rules(self, record: RunRecord) -> list[tuple[re.Pattern[str], str]]:
-        """Erase each run's *own* output location before the two are compared.
+        """Erase each bundle's *own* output location before comparison.
 
-        The two collects are given different `--out` directories by definition —
-        that is how they avoid overwriting each other — so a shared placeholder
-        would still leave `shell` against `python` in every recorded path.  Each
-        side is normalised against its own directory instead.
+        The preserved shell bundle and live Python collect have different `--out`
+        directories by definition. Each side is normalised against its own
+        directory so the paths do not become false contract differences.
         """
 
         return [
@@ -928,7 +925,7 @@ class _Qualification:
 def _node_invocation_ids(contents: BundleContents) -> tuple[str, ...]:
     """Read the node invocation identifiers a bundle recorded, if it records any.
 
-    Only the candidate writes them (`node_invocation_id_<alias>`), so this is
+    Only the live Python bundle writes them (`node_invocation_id_<alias>`), so this is
     attribution help for the residue report, never a requirement: ownership is
     established by the pre/post listing comparison.
     """

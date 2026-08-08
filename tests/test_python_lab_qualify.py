@@ -1,8 +1,8 @@
 """The post-cutover qualification harness, driven end to end against the fake lab.
 
-Every test here runs the real orchestration — preflight, shared inventory,
-snapshot, two collects, verification, coverage, comparison, residue — and changes
-exactly one thing to prove the corresponding gate is load-bearing.
+Every test here runs the real orchestration — pinned baseline, preflight, shared
+inventory, snapshot, one live collect, verification, coverage, comparison and
+residue — and changes exactly one thing to prove its gate is load-bearing.
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ class QualifyTestCase(unittest.TestCase):
 
 
 class PassingGateTests(QualifyTestCase):
-    def test_a_clean_lab_and_two_equivalent_collects_pass(self) -> None:
+    def test_a_clean_lab_and_equivalent_baseline_and_live_bundle_pass(self) -> None:
         result = self.run_gate()
         self.assertEqual(result.status, STATUS_PASS, result.blocked_reason)
         self.assertTrue(result.ok)
@@ -112,7 +112,7 @@ class PassingGateTests(QualifyTestCase):
         )
         self.assertTrue(all(check.ok for check in result.checks))
 
-    def test_records_both_runs_with_coverage_verify_and_a_bundle_hash(self) -> None:
+    def test_records_baseline_and_live_bundle_with_coverage_verify_and_hash(self) -> None:
         result = self.run_gate()
         self.assertEqual([run.implementation for run in result.runs], ["shell", "python"])
         for run in result.runs:
@@ -139,7 +139,7 @@ class PassingGateTests(QualifyTestCase):
         self.assertIn("#22", result.next_action)
         self.assertIn(str(result.run_directory), result.next_action)
 
-    def test_keeps_each_invocations_command_ledger_beside_its_bundle(self) -> None:
+    def test_keeps_the_live_invocations_command_ledgers_beside_its_bundle(self) -> None:
         result = self.run_gate()
         collect_log = result.run_directory / "python" / "collect.log"
         verify_log = result.run_directory / "python" / "verify.log"
@@ -231,7 +231,7 @@ class SharedInputTests(QualifyTestCase):
                 repository_root=self.lab.checkout(),
             )
 
-    def test_both_implementations_receive_the_same_derived_inventory(self) -> None:
+    def test_baseline_and_live_bundle_record_the_same_derived_inventory(self) -> None:
         # The fixture rejects anything outside the qualification vector, so a run
         # reaching the comparison already proves both got the same shape; this
         # pins the inventory content the two bundles were built from.
@@ -247,10 +247,9 @@ class SharedInputTests(QualifyTestCase):
         self.assertIn("--no-trust-ssh-host-key", QUALIFICATION_ARGUMENTS)
 
     def test_an_exported_opt_in_cannot_reach_the_collectors(self) -> None:
-        # The shell reference initialises `--allow-cephadm-shell` *from* this
-        # variable, so an operator who happens to have it exported would get a
-        # qualification run that may start a container.  The fake collect refuses
-        # the run outright if the variable survives.
+        # Python uses other `CEPH_INCIDENT_*` variables for test-only safety
+        # limits and source overrides. The fake collect refuses the run outright
+        # if any variable in that namespace survives the scrubbed environment.
         result = self.run_gate(
             CEPH_INCIDENT_ALLOW_CEPHADM_SHELL="1",
             CEPH_INCIDENT_ALLOW_KUBECTL_EXEC="1",
@@ -302,7 +301,7 @@ class IdentityGateTests(QualifyTestCase):
 
 
 class CollectGateTests(QualifyTestCase):
-    def test_a_candidate_that_produces_no_bundle_fails(self) -> None:
+    def test_a_live_collect_that_produces_no_bundle_fails(self) -> None:
         result = self.run_gate(FAKE_COLLECT_NO_BUNDLE_python="1")
         self.assertEqual(result.status, "collect-failed")
         self.assertIn("0 bundle(s)", result.blocked_reason or "")
@@ -401,21 +400,22 @@ class CoverageGateTests(QualifyTestCase):
 
 
 class ComparisonGateTests(QualifyTestCase):
-    def test_live_cluster_drift_between_the_two_runs_is_not_a_difference(self) -> None:
+    def test_live_cluster_drift_between_baseline_and_current_is_not_a_difference(self) -> None:
         # The fixture stamps a different clock and a different counter into every
-        # bundle, exactly as a live cluster would between two collects.
+        # bundle, exactly as a live cluster would between the preserved baseline
+        # and the current collect.
         result = self.run_gate()
         self.assertEqual(result.comparison.result, "equivalent")
 
     def test_each_runs_own_output_directory_is_not_a_difference(self) -> None:
-        # The two collects must write somewhere different or they would overwrite
-        # each other, and both record artifacts by absolute path — so the paths
-        # differ by construction and must normalise to the same thing.
+        # The preserved bundle and current collect live in different output
+        # directories, and both record absolute artifact paths. Those paths must
+        # normalise to the same thing.
         result = self.run_gate()
         self.assertNotEqual(result.runs[0].bundle_path, result.runs[1].bundle_path)
         self.assertEqual(result.comparison.result, "equivalent")
 
-    def test_an_extra_candidate_artifact_fails_the_gate(self) -> None:
+    def test_an_extra_live_artifact_fails_the_gate(self) -> None:
         result = self.run_gate(FAKE_COLLECT_DIVERGE_python="extra-artifact")
         self.assertEqual(result.status, "bundle-comparison-failed")
         self.assertTrue(
