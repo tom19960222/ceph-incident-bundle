@@ -276,11 +276,38 @@ class QualifyCommandTests(CliTestCase):
     def test_requires_the_lab_confirmation(self) -> None:
         profile = self.lab.write_profile()
         completed = self.run_cli(
-            "qualify", "--profile", str(profile), "--runs-dir", str(self.runs)
+            "qualify",
+            "--profile",
+            str(profile),
+            "--baseline-report",
+            "/labs/report.json",
+            "--runs-dir",
+            str(self.runs),
         )
         self.assertEqual(completed.returncode, 1)
         self.assertIn("CEPH_INCIDENT_LAB_CONFIRM=1", completed.stderr)
         self.assertFalse(self.runs.exists())
+
+    def test_requires_an_absolute_preserved_baseline_report(self) -> None:
+        profile = self.lab.write_profile()
+        missing = self.run_cli(
+            "qualify",
+            "--profile",
+            str(profile),
+            CEPH_INCIDENT_LAB_CONFIRM="1",
+        )
+        relative = self.run_cli(
+            "qualify",
+            "--profile",
+            str(profile),
+            "--baseline-report",
+            "report.json",
+            CEPH_INCIDENT_LAB_CONFIRM="1",
+        )
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("--baseline-report is required", missing.stderr)
+        self.assertEqual(relative.returncode, 1)
+        self.assertIn("must be an absolute path", relative.stderr)
 
     def test_an_unusable_profile_still_leaves_a_report_in_the_run_directory(self) -> None:
         broken = self.lab.profiles / "broken.toml"
@@ -289,6 +316,8 @@ class QualifyCommandTests(CliTestCase):
             "qualify",
             "--profile",
             str(broken),
+            "--baseline-report",
+            "/labs/report.json",
             "--runs-dir",
             str(self.runs),
             CEPH_INCIDENT_LAB_CONFIRM="1",

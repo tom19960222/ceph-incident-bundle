@@ -172,10 +172,10 @@ class NodeCollectionResult:
     exit_code: int
     remote_exit_code: int
     # The code this node collection reports to the run, which is what the
-    # reference records in `errors.log`.  It is neither of the two above: the
-    # reference passes the remote or transport code straight through, except
-    # that a timeout and an unusable archive from a successful remote both
-    # become 2 (`run/collect.sh`, `collect_remote_node`).
+    # preserved baseline records in `errors.log`. It is neither of the two
+    # above: the established contract passes the remote or transport code
+    # straight through, except that a timeout and an unusable archive from a
+    # successful remote both become 2.
     reported_exit_code: int
     accepted: bool
     reason: str | None

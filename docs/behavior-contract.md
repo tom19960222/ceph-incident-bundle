@@ -1,4 +1,9 @@
-# 行為契約：ceph-incident-bundle 現有 shell 實作
+# 行為契約：pre-cutover shell reference（歷史基準）
+
+> Issue #22 已在 offline gate 與 real-lab run `20260805T155047Z` 通過後移除
+> shell implementation。這份文件保留 cutover 時凍結的 observable contract 與來源
+> 行號，供稽核 Python coverage；目前唯一公開介面與操作方式以 `README.md`、
+> `ceph_incident_bundle.py` 與 Python tests 為準。
 
 > 本文件是 GitHub issue #6（wayfinder map #3）的產出。目的：作為 Python 3.11 重寫時「功能等價」的唯一依據。讀者應能只靠這份文件（不讀 shell code）寫出行為等價的實作。每個事實都附上來源檔案與行號（以本文件撰寫當下的 commit 為準，`git_commit` 見 bundle `environment.txt`）。
 >

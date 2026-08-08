@@ -42,7 +42,7 @@ FAILURE_PROMETHEUS = "prometheus-not-ready"
 
 def pass_next_action(profile_path: Path) -> str:
     """A passing preflight proves identity; the gate that proves qualification
-    is the dual-run harness, so that is the one thing to do next."""
+    is the post-cutover harness, so that is the one thing to do next."""
 
     return (
         f"Run {qualify_command(profile_path)} — this preflight proves lab "

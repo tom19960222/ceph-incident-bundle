@@ -6,20 +6,32 @@
 
 這裡的 **operationally read-only** 意指收集行為不得改變受測環境的持久或期望狀態。它不宣稱執行觀測時遠端儲存裝置的每一個 metadata bit、服務 counter 或 audit log 都完全不變。
 
-## Current Shell Reference Status
+## Preserved Shell Baseline Status
 
-現有 shell implementation 是 observable behaviour 的 reference，不是安全性已被完整證明的 oracle。Issue #23 已關閉 Node Evidence Archive 的工作機接收缺口；其餘限制仍必須個別證明，Python cutover 也不得照搬未解缺口：
+Shell implementation 已由 issue #22 移除，不再是可執行的 production path。它最後
+一次 qualification evidence 是 run `20260805T155047Z`（commit `155e057`）：report
+status PASS、shell/Python 四路 bundle 各自 verify、normalized contract equivalent、
+stable state unchanged、7 台 node remote residue clean。Shell bundle 與 report/hash
+保留在 local-only validation artifacts，供 post-cutover gate 比較；不能從歷史文件重建
+或臨時拼一套 shell command 冒充 baseline。
+
+以下是 cutover 前曾必須關閉、現在仍由 Python tests 與 preserved baseline 守住的邊界：
 
 - Shell 工作機現在先把 SSH stdout 寫入本次 owned workspace 的候選檔，再複製到無 pathname 的 private snapshot，讓驗證與 extraction 使用同一份不可替換 bytes。完整驗證 gzip、tar member table／EOF blocks、payload cap、manifest schema／artifact mapping、member type／名稱／碰撞與所有 file payload 後，才以不信任 archive mode／ownership 的方式建立新 extraction root。Traversal、absolute path、link、special member、collision、oversize、gzip 或 tar truncation 與缺少／無效 manifest 都會在 extraction write 前 fail closed。Python node transport（#11）與 #17 的 structural verification 必須保留同一安全邊界。
 - Shell remote cleanup 依賴 trap，對一般 success/failure/timeout/interrupt 是 best effort，但無法在 process/host 被強制終止時保證執行。#11 必須測試可恢復的所有終止路徑，#20/#21 必須以 invocation identifier 和 residue check 提供實機證據。
 - 現行 `/var/log` 測試會啟用測試用的普通讀取 escape hatch，source immutability assertion 尚未涵蓋 atime、nofollow 與安全讀取失敗時 fail closed。#12 必須補齊 production read path，#18 必須把這些 invariants 納入 offline gate。
 - Shell 保留 `cephadm shell` 與 `kubectl exec` 的明確 opt-in compatibility paths。它們是 default-off，而且不得出現在 #20/#21 的 operationally read-only qualification。
 
-不得因 #23 單一邊界完成，就宣稱現有 shell 已滿足本文件的完整 proof obligations。#19／#20 定義的 strict identity、full coverage、stable-state 與 residue gates 現在都由 `make validate-lab` 實作，但 gate 存在不等於 gate 已通過：shell reference 只有在真實 lab 執行該 gate 並取得 `status: pass` 後，才能成為 real-lab qualification evidence；非 qualification 的受控診斷執行仍必須確認 nodes 身份可信、關閉兩個 opt-ins、限制 workstation output boundary，並在執行後檢查 remote residue。
+Post-cutover `make validate-lab` 必須先驗證該 PASS report、bundle hash、profile hash 與
+完整 lab identity，再跑一次 Python full collect；任何 baseline 或 identity mismatch 都在
+collect 前 fail closed。
 
-## Current Python Candidate Status
+## Current Python Production Status
 
-目前 Python candidate 的能力、限制與 #17／#23 ownership 以 `docs/python-rewrite-plan.md` 的 **Current Python Candidate Boundary** 為唯一狀態來源；該 boundary 未解除前不得作為 real-lab qualification evidence。
+Python 3.11+ 現在是唯一 production implementation；公開入口只有
+`ceph_incident_bundle.py collect` 與 `verify`。Content safety 與 structural verification
+在 cutover 中維持原行為。一般 `make validate` 仍完全離線；真 lab 的 current proof 只
+能由帶 active Lab Profile、preserved baseline 與明確確認的 `make validate-lab` 產生。
 
 ## Safety Boundary
 

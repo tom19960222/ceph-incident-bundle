@@ -12,7 +12,7 @@ if a diagnostic ever carries a key, header or token, the write fails closed
 instead of persisting the leak.
 
 An identity preflight fills only the identity, preflight and status fields; the
-dual-run gate (`validation/lab_qualify.py`) fills the rest.  Whatever a run did
+post-cutover gate (`validation/lab_qualify.py`) fills the rest.  Whatever a run did
 not reach stays `not-run`, so a report says where the gate stopped rather than
 only that it did.
 """
@@ -34,7 +34,7 @@ if TYPE_CHECKING:  # a report describes a qualification; it must not import one
     from validation.lab_qualify import QualifyResult
 
 
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 REPORT_JSON_NAME = "report.json"
 REPORT_MARKDOWN_NAME = "report.md"
 LATEST_NAME = "LATEST"
@@ -72,7 +72,7 @@ def code_identity(root: Path) -> CodeIdentity:
 def tracked_modifications(root: Path) -> tuple[str, ...]:
     """The tracked files that differ from HEAD, ignoring untracked ones.
 
-    The dual-run gate needs this stricter reading than `CodeIdentity.dirty`: a
+    The qualification gate needs this stricter reading than `CodeIdentity.dirty`: a
     modified tracked file means the recorded commit does not describe the code
     that ran, while an untracked file — a local-only Lab Profile beside the
     repository, say — changes nothing about it.
@@ -158,6 +158,30 @@ class RunRecord:
 
 
 @dataclass(frozen=True)
+class BaselineRecord:
+    """The immutable #21 evidence selected for a post-cutover proof."""
+
+    status: str = NOT_RUN
+    report_path: str | None = None
+    report_hash: str | None = None
+    code_commit: str | None = None
+    profile_hash: str | None = None
+    shell_bundle_path: str | None = None
+    shell_bundle_hash: str | None = None
+
+    def document(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "report_path": self.report_path,
+            "report_hash": self.report_hash,
+            "code_commit": self.code_commit,
+            "profile_hash": self.profile_hash,
+            "shell_bundle_path": self.shell_bundle_path,
+            "shell_bundle_hash": self.shell_bundle_hash,
+        }
+
+
+@dataclass(frozen=True)
 class ComparisonRecord:
     """The normalized observable-contract comparison of the two bundles."""
 
@@ -212,6 +236,7 @@ class LabValidationReport:
     next_action: str
     lab_identity: dict[str, object] = field(default_factory=dict)
     preflight: tuple[dict[str, object], ...] = ()
+    baseline: BaselineRecord = field(default_factory=BaselineRecord)
     runs: tuple[RunRecord, ...] = ()
     comparison: ComparisonRecord = field(default_factory=ComparisonRecord)
     stable_state: StableStateRecord = field(default_factory=StableStateRecord)
@@ -237,6 +262,7 @@ class LabValidationReport:
             },
             "lab_identity": self.lab_identity,
             "preflight": [dict(check) for check in self.preflight],
+            "baseline": self.baseline.document(),
             "runs": [run.document() for run in self.runs],
             "comparison": self.comparison.document(),
             "stable_state": self.stable_state.document(),
@@ -278,6 +304,18 @@ class LabValidationReport:
                 for check in self.preflight
             ],
         )
+        lines += [
+            "",
+            "## Preserved baseline",
+            "",
+            f"- status: {self.baseline.status}",
+            f"- report: {self.baseline.report_path or '-'}",
+            f"- report hash: {self.baseline.report_hash or '-'}",
+            f"- code: {self.baseline.code_commit or '-'}",
+            f"- profile hash: {self.baseline.profile_hash or '-'}",
+            f"- shell bundle: {self.baseline.shell_bundle_path or '-'}",
+            f"- shell bundle hash: {self.baseline.shell_bundle_hash or '-'}",
+        ]
         lines += ["", "## Full collect runs", ""]
         lines += _table(
             ("implementation", "exit", "verify", "coverage", "bundle"),
@@ -338,7 +376,7 @@ def write_report(
 ) -> ReportLocation:
     """Persist one report and point `LATEST` at it, or refuse to write at all.
 
-    `directory` names a run directory the caller already reserved.  The dual-run
+    `directory` names a run directory the caller already reserved.  The qualification
     gate needs one before it starts — its bundles and command ledgers live there
     — and the report has to land in that same directory rather than a second one
     created at write time.
@@ -386,7 +424,7 @@ def report_from_preflight(
             {"name": check.name, "ok": check.ok, "detail": check.detail}
             for check in result.checks
         ),
-        runs=(RunRecord("shell"), RunRecord("python")),
+        runs=(RunRecord("python"),),
         residue=tuple(ResidueRecord(host) for host in hosts),
         status=result.status,
         next_action=result.next_action,
@@ -394,7 +432,7 @@ def report_from_preflight(
 
 
 def report_from_qualification(result: "QualifyResult", *, code: CodeIdentity) -> LabValidationReport:
-    """Build a report for one dual-run qualification attempt, pass or fail.
+    """Build a report for one post-cutover qualification attempt, pass or fail.
 
     Unlike the preflight report, every section is filled from what the attempt
     actually reached: a run that stopped at the coverage gate still records the
@@ -414,6 +452,7 @@ def report_from_qualification(result: "QualifyResult", *, code: CodeIdentity) ->
             {"name": check.name, "ok": check.ok, "detail": check.detail}
             for check in result.checks
         ),
+        baseline=result.baseline,
         runs=result.runs,
         comparison=result.comparison,
         stable_state=result.stable_state,
@@ -445,7 +484,7 @@ def report_from_unusable_profile(
         profile_state=None,
         profile_name=None,
         preflight=({"name": "profile-load", "ok": False, "detail": error},),
-        runs=(RunRecord("shell"), RunRecord("python")),
+        runs=(RunRecord("python"),),
         status=status,
         next_action=next_action,
     )

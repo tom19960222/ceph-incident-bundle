@@ -19,7 +19,6 @@ if str(ROOT) not in sys.path:
 from ceph_incident_collectors import REMOTE_BOOTSTRAP, _ssh_command  # noqa: E402
 
 ENTRYPOINT = ROOT / "ceph_incident_bundle.py"
-SHELL_VERIFIER = ROOT / "lib" / "verify-bundle.sh"
 FIXTURE_BIN = ROOT / "tests" / "fixtures" / "python-ceph" / "bin"
 SEED = "ceph@10.0.0.1"
 
@@ -191,17 +190,6 @@ class DirectCephFixture:
         self.assertEqual(python_verify.returncode, 0, python_verify.stderr)
         self.assertIn("VERIFY PASS", python_verify.stdout)
 
-        shell_verify = subprocess.run(
-            ["bash", str(SHELL_VERIFIER), str(bundle)],
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(shell_verify.returncode, 0, shell_verify.stderr)
-        self.assertIn("VERIFY PASS", shell_verify.stdout)
-
-
 class CollectDirectCephCliTests(DirectCephFixture, unittest.TestCase):
     def test_direct_ceph_seed_collects_json_and_text_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -305,7 +293,7 @@ class CollectDirectCephCliTests(DirectCephFixture, unittest.TestCase):
                 self.assertRegex(entry["ended"], r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
             self.assertEqual(contents["errors.log"], "")
 
-    def test_direct_ceph_bundle_passes_both_verifiers(self) -> None:
+    def test_direct_ceph_bundle_passes_the_public_verifier(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             environment, ledger = self.make_fake_environment(root)

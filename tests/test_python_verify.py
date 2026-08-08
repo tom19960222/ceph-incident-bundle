@@ -132,28 +132,6 @@ class VerifyCliTests(unittest.TestCase):
                     self.assertEqual(result.stdout, "")
                     self.assertIn(expected_error, result.stderr)
 
-    def test_shell_public_collect_workdir_and_archive_pass(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            fixture_root = Path(temporary_directory) / "shell-fixture"
-            collect = subprocess.run(
-                [
-                    str(ROOT / "tests" / "export-shell-collect-fixture.sh"),
-                    str(fixture_root),
-                ],
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(collect.returncode, 0, collect.stderr)
-
-            for target in (fixture_root / "workdir", fixture_root / "bundle.tar.gz"):
-                with self.subTest(target=target.name):
-                    result = self.run_cli("verify", str(target))
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout, f"VERIFY PASS: {target}\n")
-                    self.assertEqual(result.stderr, "")
-
     def test_valid_minimal_directory_passes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             bundle = Path(temporary_directory) / "incident"

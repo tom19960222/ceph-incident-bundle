@@ -1,10 +1,10 @@
-"""`validate-lab`: the dual-run real-lab qualification gate.
+"""`validate-lab`: the post-cutover real-lab qualification gate.
 
 This is the harness the runbook's Qualification Workflow describes.  From one
 explicitly activated Lab Profile it derives a single shared inventory, proves the
-lab's identity, snapshots the lab's stable state, runs the shell reference and
-then the Python candidate through one *full* collect each, and only then compares
-what they produced.
+lab's identity, validates the preserved #21 shell baseline, snapshots the lab's
+stable state, runs one Python *full* collect, and compares its normalized contract
+with the preserved bundle.
 
 Three properties are structural rather than advisory:
 
@@ -16,7 +16,7 @@ Three properties are structural rather than advisory:
   path that reruns a stage until it passes.  Partial coverage, a failed verify, a
   contract difference, a stable-state change and remote residue are each a
   failure with one next action.
-- **Read-only stays read-only.** Both invocations' argv comes from one builder
+- **Read-only stays read-only.** The live invocation's argv comes from one builder
   and is checked for `--allow-cephadm-shell` and `--allow-kubectl-exec` before
   anything runs; every `CEPH_INCIDENT_*` variable is stripped from the
   environment they inherit, because the collectors read some of those as *flag
@@ -46,6 +46,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from validation.lab_baseline import BaselineRejected, CutoverBaseline, load_cutover_baseline
 from validation.lab_bundle import (
     BundleContents,
     BundleUnreadable,
@@ -66,6 +67,7 @@ from validation.lab_probe import (
 )
 from validation.lab_profile import LabProfile, load_profile, safe_display_path
 from validation.lab_report import (
+    BaselineRecord,
     ComparisonRecord,
     ResidueRecord,
     RunRecord,
@@ -104,6 +106,8 @@ FAILURE_COVERAGE = "coverage-incomplete"
 FAILURE_COMPARISON = "bundle-comparison-failed"
 FAILURE_STABLE_STATE = "stable-state-changed"
 FAILURE_RESIDUE = "remote-residue"
+FAILURE_BASELINE = "baseline-invalid"
+FAILURE_WORKSTATION_RESIDUE = "workstation-residue"
 
 # The qualification collect vector.  It is a constant, not an operator input:
 # the gate's claim is about *this* invocation shape, and the two side-effecting
@@ -145,14 +149,9 @@ class CollectEntrypoint:
 
 
 def default_entrypoints() -> tuple[CollectEntrypoint, ...]:
-    """The reference first, then the candidate — the order the runbook fixes."""
+    """The only production implementation after the cutover."""
 
     return (
-        CollectEntrypoint(
-            "shell",
-            ("bash", str(REPOSITORY_ROOT / "run" / "collect.sh")),
-            ("bash", str(REPOSITORY_ROOT / "lib" / "verify-bundle.sh")),
-        ),
         CollectEntrypoint(
             "python",
             (sys.executable, str(REPOSITORY_ROOT / "ceph_incident_bundle.py"), "collect"),
@@ -194,6 +193,7 @@ class QualifyResult:
     run_directory: Path
     checks: tuple[PreflightCheck, ...] = ()
     identity: dict[str, object] = field(default_factory=dict)
+    baseline: BaselineRecord = field(default_factory=BaselineRecord)
     runs: tuple[RunRecord, ...] = ()
     comparison: ComparisonRecord = field(default_factory=ComparisonRecord)
     stable_state: StableStateRecord = field(default_factory=StableStateRecord)
@@ -215,6 +215,7 @@ class QualifyResult:
                 for check in self.checks
             ],
             "verified_identity": self.identity,
+            "baseline": self.baseline.document(),
             "runs": [run.document() for run in self.runs],
             "comparison": self.comparison.document(),
             "stable_state": self.stable_state.document(),
@@ -257,6 +258,7 @@ def qualify(
     profile_path: Path,
     *,
     run_directory: Path,
+    baseline_report: Path | None = None,
     entrypoints: Sequence[CollectEntrypoint] | None = None,
     collect_timeout: int = DEFAULT_COLLECT_TIMEOUT_SECONDS,
     repository_root: Path = REPOSITORY_ROOT,
@@ -274,7 +276,12 @@ def qualify(
         profile_path,
         profile,
         run_directory=run_directory,
-        entrypoints=tuple(entrypoints if entrypoints is not None else default_entrypoints()),
+        baseline_report=baseline_report,
+        entrypoints=tuple(
+            entrypoints
+            if entrypoints is not None
+            else default_entrypoints()
+        ),
         collect_timeout=collect_timeout,
         repository_root=repository_root,
     )
@@ -298,6 +305,7 @@ class _Qualification:
         profile: LabProfile,
         *,
         run_directory: Path,
+        baseline_report: Path | None,
         entrypoints: tuple[CollectEntrypoint, ...],
         collect_timeout: int,
         repository_root: Path,
@@ -305,6 +313,7 @@ class _Qualification:
         self.profile_path = profile_path
         self.profile = profile
         self.run_directory = run_directory
+        self.baseline_report = baseline_report
         self.entrypoints = entrypoints
         self.collect_timeout = collect_timeout
         self.repository_root = repository_root
@@ -319,6 +328,7 @@ class _Qualification:
         self.comparison = ComparisonRecord()
         self.stable_state = StableStateRecord()
         self.node_invocation_ids: tuple[str, ...] = ()
+        self.baseline: CutoverBaseline | None = None
 
     # -- stage plumbing ----------------------------------------------------
 
@@ -342,6 +352,9 @@ class _Qualification:
             run_directory=self.run_directory,
             checks=tuple(self.checks),
             identity=self.identity,
+            baseline=(
+                self.baseline.record() if self.baseline is not None else BaselineRecord()
+            ),
             runs=self._run_records(),
             comparison=self.comparison,
             stable_state=self.stable_state,
@@ -359,9 +372,14 @@ class _Qualification:
         """
 
         recorded = {run.implementation: run for run in self.runs}
+        implementations = (
+            ("shell", *(entrypoint.implementation for entrypoint in self.entrypoints))
+            if self.baseline is not None
+            else tuple(entrypoint.implementation for entrypoint in self.entrypoints)
+        )
         return tuple(
-            recorded.get(entrypoint.implementation, RunRecord(entrypoint.implementation))
-            for entrypoint in self.entrypoints
+            recorded.get(implementation, RunRecord(implementation))
+            for implementation in implementations
         )
 
     # -- the gate ----------------------------------------------------------
@@ -373,6 +391,26 @@ class _Qualification:
         opt_ins = self._check_read_only_opt_ins()
         if opt_ins is not None:
             return opt_ins
+        if self.baseline_report is not None:
+            try:
+                self.baseline = load_cutover_baseline(
+                    self.baseline_report, profile=self.profile
+                )
+            except BaselineRejected as error:
+                return self._failed(
+                    "baseline-evidence",
+                    str(error),
+                    FAILURE_BASELINE,
+                    "Select the preserved #21 PASS report and matching shell bundle "
+                    "before re-running the post-cutover gate",
+                )
+            self.runs.append(self.baseline.shell_run)
+            self._passed(
+                "baseline-evidence",
+                f"PASS report {self.baseline.report_path} at code "
+                f"{self.baseline.code_commit} still verifies shell bundle "
+                f"{self.baseline.shell_bundle_hash}",
+            )
         # The identity preflight owns profile state, credential paths, host keys
         # and cluster identity; running its stages here too would give a report
         # two verdicts on the same question.
@@ -384,6 +422,20 @@ class _Qualification:
                 identity.status,
                 identity.next_action,
                 blocked_reason=identity.blocked_reason,
+            )
+        if self.baseline is not None and self.identity != self.baseline.identity:
+            return self._failed(
+                "baseline-identity",
+                "the currently verified lab identity differs from the preserved baseline",
+                FAILURE_BASELINE,
+                "Review or replace the Lab Profile; post-cutover proof must use the "
+                "same verified lab as the preserved shell baseline",
+            )
+        if self.baseline is not None:
+            self._passed(
+                "baseline-identity",
+                "the active profile resolves to the same Ceph, Rook, Prometheus and "
+                "host identity as the preserved baseline",
             )
         with tempfile.TemporaryDirectory(
             prefix="ceph-incident-lab-qualify."
@@ -411,7 +463,8 @@ class _Qualification:
                 f"{len(modified)} tracked file(s) differ from HEAD: {listed}",
                 FAILURE_CODE_IDENTITY,
                 "Commit or stash the modified tracked files so the report names the "
-                f"code that ran, then re-run {qualify_command(self.profile_path)}",
+                "code that ran, then re-run "
+                f"{qualify_command(self.profile_path, self.baseline_report)}",
             )
         commit = code_identity(self.repository_root).commit
         self._passed("code-identity", f"running commit {commit} with no local changes")
@@ -453,7 +506,7 @@ class _Qualification:
             )
         self._passed(
             "read-only-opt-ins",
-            "cephadm shell and kubectl exec stay disabled for both invocations, in "
+            "cephadm shell and kubectl exec stay disabled for the live invocation, in "
             "the argv and in the inherited environment",
         )
         return None
@@ -467,7 +520,7 @@ class _Qualification:
         write_known_hosts_home(home, trusted_host_keys)
         self._passed(
             "shared-inventory",
-            f"one inventory for both invocations: {len(self.profile.hosts)} host(s), "
+            f"one inventory for the post-cutover invocation: {len(self.profile.hosts)} host(s), "
             f"seed {self.profile.ceph_seed}, host keys pinned from the active profile",
         )
 
@@ -495,14 +548,18 @@ class _Qualification:
                 str(error),
                 FAILURE_RESIDUE_UNREADABLE,
                 f"Restore read-only SSH access to every inventory node ({error}) and "
-                f"re-run {qualify_command(self.profile_path)}",
+                f"re-run {qualify_command(self.profile_path, self.baseline_report)}",
             )
         self._passed(
             "residue-baseline",
             f"pre-collection workspace listing taken on {len(baseline)} node(s)",
         )
 
-        collected: list[_Collected] = []
+        collected: list[_Collected] = (
+            [_Collected(self.baseline.shell_run, self.baseline.shell_contents)]
+            if self.baseline is not None
+            else []
+        )
         for entrypoint in self.entrypoints:
             outcome = self._collect(entrypoint, inventory, home)
             if isinstance(outcome, QualifyResult):
@@ -516,6 +573,9 @@ class _Qualification:
             coverage_failure = self._check_coverage(outcome.record)
             if coverage_failure is not None:
                 return self._finish(coverage_failure, prober, known_hosts, baseline)
+            cleanup_failure = self._check_workstation_cleanup(outcome.record)
+            if cleanup_failure is not None:
+                return self._finish(cleanup_failure, prober, known_hosts, baseline)
 
         comparison_failure = self._compare(collected)
         if comparison_failure is not None:
@@ -650,7 +710,7 @@ class _Qualification:
         return _Collected(record, contents)
 
     def _environment(self, home: Path) -> dict[str, str]:
-        """The environment both invocations run in — the same one, twice.
+        """The scrubbed environment used by the post-cutover Python invocation.
 
         Every `CEPH_INCIDENT_*` variable is dropped from what this process
         inherited.  The collectors read some of them as *defaults*: the shell
@@ -732,6 +792,28 @@ class _Qualification:
         )
         return None
 
+    def _check_workstation_cleanup(self, run: RunRecord) -> QualifyResult | None:
+        output_root = self.run_directory / run.implementation
+        expected = {
+            Path(run.bundle_path or "").name,
+            "collect.log",
+            "verify.log",
+        }
+        leftovers = sorted(item.name for item in output_root.iterdir() if item.name not in expected)
+        if leftovers:
+            return self._failed(
+                f"workstation-cleanup-{run.implementation}",
+                f"collector-owned output still contains: {', '.join(leftovers)}",
+                FAILURE_WORKSTATION_RESIDUE,
+                f"Review {output_root}; a successful collect must remove its owned "
+                "workdir before post-cutover proof can pass",
+            )
+        self._passed(
+            f"workstation-cleanup-{run.implementation}",
+            "successful collect left only the bundle and owner-only command ledgers",
+        )
+        return None
+
     def _compare(self, collected: Sequence[_Collected]) -> QualifyResult | None:
         reference, candidate = collected[0], collected[1]
         differences = describe_differences(
@@ -746,14 +828,15 @@ class _Qualification:
             return self._failed(
                 "bundle-comparison",
                 f"{len(differences)} observable-contract difference(s) between the "
-                "shell and Python bundles",
+                "preserved shell baseline and post-cutover Python bundle",
                 FAILURE_COMPARISON,
-                f"Investigate the recorded contract differences in {self.run_directory} "
-                "— the shell reference stays in place until they are resolved",
+                f"Investigate the recorded contract differences in {self.run_directory}; "
+                "the preserved baseline must not be replaced to make them disappear",
             )
         self._passed(
             "bundle-comparison",
-            "the two bundles' normalized observable contracts are equivalent",
+            "the preserved shell baseline and post-cutover Python bundle have "
+            "equivalent normalized observable contracts",
         )
         return None
 
@@ -768,7 +851,7 @@ class _Qualification:
 
         return [
             (_path_pattern(record.bundle_path), "<bundle>"),
-            (_path_pattern(str(self.run_directory / record.implementation)), "<out>"),
+            (_path_pattern(str(Path(record.bundle_path).parent) if record.bundle_path else None), "<out>"),
             (_path_pattern(str(self.run_directory)), "<run>"),
         ]
 
@@ -778,7 +861,8 @@ class _Qualification:
             str(error),
             FAILURE_STABLE_STATE_UNREADABLE,
             f"Restore direct read-only Ceph CLI and local kubectl access ({error}) "
-            f"and re-run {qualify_command(self.profile_path)}",
+            "and re-run "
+            f"{qualify_command(self.profile_path, self.baseline_report)}",
         )
 
     def _finish(

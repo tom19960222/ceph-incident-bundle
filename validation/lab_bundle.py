@@ -1,14 +1,14 @@
-"""Reducing one real-lab bundle to the contract the two implementations must share.
+"""Reduce real-lab bundles to the preserved cross-implementation contract.
 
 What this compares, and why it is not a byte comparison
 -------------------------------------------------------
-The offline equivalence gate (`make test-differential`, issue #18) already proves
-that the shell reference and the Python candidate turn *the same inputs* into the
-same bytes; it can do that because its world is fake and frozen.  A real lab is
-neither.  The two qualification collects run minutes apart against a live
-cluster, so `ceph -s` genuinely reports different numbers and a journal genuinely
-has more lines in the second run.  Demanding identical evidence bytes there would
-not be strictness — it would be a gate that can only pass by accident.
+The retired offline equivalence gate (issue #18) proved that the shell reference
+and Python candidate turned *the same inputs* into the same bytes because its
+world was fake and frozen. A real lab is neither. The preserved shell baseline
+and the post-cutover Python collect were taken at different times, so `ceph -s`
+genuinely reports different numbers and a journal genuinely has more lines in the
+later run. Demanding identical evidence bytes there would not be strictness — it
+would be a gate that can only pass by accident.
 
 So this module compares the part of a bundle that must not depend on when it was
 taken:

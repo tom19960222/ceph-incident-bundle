@@ -1992,10 +1992,9 @@ def _collect_journal(
     if config.var_log_max_bytes is not None and not payload_path.is_file():
         if var_log_exit_code == 0:
             # No accounting because there was no `/var/log` to account for: the
-            # reference spends no journal budget here, collects no journal and
-            # stays complete (`lib/collect-node.sh`, the final `elif`).  Failing
-            # closed instead would report a partial node the reference calls
-            # complete.
+            # preserved shell baseline spends no journal budget here, collects
+            # no journal and stays complete. Failing closed instead would report
+            # a partial node where the established contract says complete.
             return JournalResult(0, 0, None, None, None)
         _write_log_skip(journal, "/var/log payload accounting was unavailable")
         return JournalResult(2, INCOMPLETE_ARTIFACT_EXIT_CODE, None, None, None)

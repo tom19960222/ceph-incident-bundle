@@ -43,7 +43,7 @@ STATE_CREDENTIAL_PATH_INVALID = "credential-path-invalid"
 STATE_CANDIDATE_PENDING_REVIEW = "candidate-pending-review"
 STATE_READY_FOR_PREFLIGHT = "ready-for-preflight"
 STATE_PREFLIGHT_PASSED = "preflight-passed"
-# Reachable only once the dual-run gate (issue #20) can record a full pass;
+# Reachable only once the post-cutover gate records a full pass;
 # calling that state "preflight-passed" would understate what was proven.
 STATE_GATE_PASSED = "gate-passed"
 STATE_LAST_ATTEMPT_FAILED = "last-attempt-failed"

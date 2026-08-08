@@ -1,13 +1,15 @@
 # Real-Lab Bundle Contract 與 Stable-State Schema
 
-> 對應 issue #20（同 lab 的 shell／Python 四路 full collect gate）。
+> #20 先用同 lab 的 shell／Python 四路 full collect 建立此 contract；#22
+> post-cutover gate 以保存的 #21 shell baseline bundle 對新的一次 Python full collect
+> 套用同一份 normalizer。
 > 實作：`validation/lab_bundle.py`、`validation/lab_snapshot.py`、
 > `validation/lab_contract.py`；執行入口：`make validate-lab`。
 
-`make validate-lab` 在同一個 real lab 先後跑一次 shell reference full collect 與
-一次 Python candidate full collect，然後比較兩份 bundle，並比較兩次 collect 前後
-的 stable state。這份文件是那兩個比較「比什麼、刻意不比什麼」的唯一依據；擴大或
-縮小任一份清單，需要與改變 collector 行為相同等級的 review。
+`make validate-lab` 先驗證保存的 #21 PASS report、shell bundle hash 與 lab identity，
+再於同一個已驗證 lab 跑一次 Python full collect，然後比較兩份 bundle，並比較本次
+collect 前後的 stable state。這份文件是比較「比什麼、刻意不比什麼」的唯一依據；
+擴大或縮小任一份清單，需要與改變 collector 行為相同等級的 review。
 
 ## 為什麼 real-lab 比較不是 byte comparison
 

@@ -47,11 +47,13 @@ def host_fingerprint(address: str) -> str:
     return fingerprint_of_seed(f"fake-host-key-{address}")
 
 
-def fake_entrypoints() -> tuple[CollectEntrypoint, ...]:
-    """The stand-in reference and candidate the harness tests drive.
+def fake_entrypoints(
+    implementations: tuple[str, ...] = ("python",),
+) -> tuple[CollectEntrypoint, ...]:
+    """The stand-in live entrypoint the harness tests drive.
 
-    Both are the same script told which implementation it is playing, so a test
-    that makes one bundle diverge is changing exactly one thing.
+    Tests may still ask it to synthesize a historical shell baseline explicitly,
+    but production-style callers get only the Python implementation by default.
     """
 
     collect = str(LAB_BIN / "fake-collect")
@@ -62,7 +64,7 @@ def fake_entrypoints() -> tuple[CollectEntrypoint, ...]:
             (sys.executable, collect, "--implementation", implementation),
             (sys.executable, verify, "--implementation", implementation),
         )
-        for implementation in ("shell", "python")
+        for implementation in implementations
     )
 
 

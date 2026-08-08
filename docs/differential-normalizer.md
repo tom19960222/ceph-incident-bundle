@@ -1,5 +1,10 @@
 # Differential Normalizer 合約
 
+> **Cutover archive:** #18 的 gate 已通過並在 #22 contract step 隨 shell reference
+> 一起移除 executable/fakes。本文件保留當時允許的 normalizations，現在的
+> `make validate` 不再執行 differential；post-cutover real-lab comparison 讀保存的
+> shell baseline bundle，使用 `docs/lab-bundle-contract.md` 的 live-cluster contract。
+
 > 對應 issue #18（offline observable-contract equivalence gate）。
 > 實作：`tests/differential/normalize.py`；情境：`tests/differential/scenarios.py`；
 > 執行入口：`make test-differential`（已含在 `make validate`）。
