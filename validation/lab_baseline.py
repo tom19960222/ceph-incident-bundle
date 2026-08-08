@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,6 +61,23 @@ class CutoverBaseline:
             shell_bundle_path=str(self.shell_bundle_path),
             shell_bundle_hash=self.shell_bundle_hash,
         )
+
+
+def canonical_lab_identity(identity: dict[str, object]) -> dict[str, object]:
+    """Canonicalize set-like identity fields without weakening their contents."""
+
+    normalized = deepcopy(identity)
+    hosts = normalized.get("hosts")
+    if isinstance(hosts, list):
+        for host in hosts:
+            if not isinstance(host, dict):
+                continue
+            fingerprints = host.get("ssh_fingerprints_verified")
+            if isinstance(fingerprints, list) and all(
+                isinstance(item, str) for item in fingerprints
+            ):
+                host["ssh_fingerprints_verified"] = sorted(fingerprints)
+    return normalized
 
 
 def load_cutover_baseline(
@@ -160,7 +178,7 @@ def load_cutover_baseline(
         report_hash=report_hash,
         code_commit=commit,
         profile_hash=profile_hash,
-        identity=identity,
+        identity=canonical_lab_identity(identity),
         shell_bundle_path=bundle_path,
         shell_bundle_hash=bundle_hash,
         shell_contents=contents,

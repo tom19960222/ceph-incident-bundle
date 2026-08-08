@@ -46,7 +46,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from validation.lab_baseline import BaselineRejected, CutoverBaseline, load_cutover_baseline
+from validation.lab_baseline import (
+    BaselineRejected,
+    CutoverBaseline,
+    canonical_lab_identity,
+    load_cutover_baseline,
+)
 from validation.lab_bundle import (
     BundleContents,
     BundleUnreadable,
@@ -420,7 +425,7 @@ class _Qualification:
                 identity.next_action,
                 blocked_reason=identity.blocked_reason,
             )
-        if self.identity != self.baseline.identity:
+        if canonical_lab_identity(self.identity) != self.baseline.identity:
             return self._failed(
                 "baseline-identity",
                 "the currently verified lab identity differs from the preserved baseline",

@@ -13,6 +13,7 @@ from tests.lab_fixture import DEFAULT_HOSTS, LAB_BIN, FakeLab, host_fingerprint
 from validation.lab_baseline import (
     BaselineAuthority,
     BaselineRejected,
+    canonical_lab_identity,
     load_cutover_baseline,
 )
 from validation.lab_profile import load_profile
@@ -90,6 +91,28 @@ class CutoverBaselineTests(unittest.TestCase):
 
         with self.assertRaisesRegex(BaselineRejected, "reviewed #21 evidence"):
             load_cutover_baseline(report_path, profile=self.profile)
+
+    def test_lab_identity_treats_verified_fingerprint_order_as_irrelevant(self) -> None:
+        baseline = {
+            "hosts": [
+                {
+                    "name": "node-1",
+                    "ssh_fingerprints_verified": ["SHA256:b", "SHA256:a"],
+                }
+            ]
+        }
+        current = {
+            "hosts": [
+                {
+                    "name": "node-1",
+                    "ssh_fingerprints_verified": ["SHA256:a", "SHA256:b"],
+                }
+            ]
+        }
+
+        self.assertEqual(
+            canonical_lab_identity(baseline), canonical_lab_identity(current)
+        )
 
 def write_baseline(root: Path, lab: FakeLab, profile_path: Path) -> tuple[Path, Path]:
     profile = load_profile(profile_path)

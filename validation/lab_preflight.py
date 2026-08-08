@@ -251,7 +251,7 @@ class _Preflight:
                 "name": host.name,
                 "address": host.address,
                 "hostname": None,
-                "ssh_fingerprints_verified": list(scan.fingerprints),
+                "ssh_fingerprints_verified": sorted(scan.fingerprints),
             }
             for host, scan in zip(self.profile.hosts, scans)
         ]
