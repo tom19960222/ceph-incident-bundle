@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import validation.lab_qualify as lab_qualify
 from tests.lab_fixture import FakeLab, fake_entrypoints
 from tests.test_python_lab_baseline import authority_for, write_baseline
 from validation.lab_artifacts import purge_artifacts, scan_artifacts
@@ -102,12 +103,14 @@ class PassingGateTests(QualifyTestCase):
                 "shared-inventory",
                 "stable-state-pre",
                 "residue-baseline",
+                "code-identity-pre-collect",
                 "collect-python",
                 "collector-coverage-python",
                 "workstation-cleanup-python",
                 "bundle-comparison",
                 "stable-state-post",
                 "remote-residue",
+                "code-identity-final",
             ],
         )
         self.assertTrue(all(check.ok for check in result.checks))
@@ -212,6 +215,63 @@ class PostCutoverGateTests(QualifyTestCase):
 
 
 class SharedInputTests(QualifyTestCase):
+    def test_checkout_change_after_pre_snapshot_stops_before_collect(self) -> None:
+        checkout = self.lab.checkout()
+        real_capture = lab_qualify.capture_stable_state
+        captures = 0
+
+        def capture_then_edit(*args, **kwargs):
+            nonlocal captures
+            snapshot = real_capture(*args, **kwargs)
+            captures += 1
+            if captures == 1:
+                (checkout / "collector.py").write_text(
+                    "# changed after preflight\n", encoding="utf-8"
+                )
+            return snapshot
+
+        with mock.patch(
+            "validation.lab_qualify.capture_stable_state",
+            side_effect=capture_then_edit,
+        ):
+            result = self.run_gate(checkout=checkout)
+
+        self.assertEqual(result.status, "code-identity-unclear")
+        self.assertFalse((result.run_directory / "python").exists())
+
+    def test_checkout_change_after_residue_check_cannot_return_pass(self) -> None:
+        checkout = self.lab.checkout()
+        real_check = lab_qualify._Qualification._check_residue
+
+        def check_then_edit(qualification, *args, **kwargs):
+            result = real_check(qualification, *args, **kwargs)
+            if result is None:
+                (checkout / "collector.py").write_text(
+                    "# changed before PASS\n", encoding="utf-8"
+                )
+            return result
+
+        with mock.patch.object(
+            lab_qualify._Qualification,
+            "_check_residue",
+            new=check_then_edit,
+        ):
+            result = self.run_gate(checkout=checkout)
+
+        self.assertEqual(result.status, "code-identity-unclear")
+        self.assertTrue(all(entry.result == "clean" for entry in result.residue))
+
+    def test_report_guard_rejects_a_commit_change_after_gate_return(self) -> None:
+        result = self.run_gate()
+
+        guarded = result.enforce_report_code_identity(
+            CodeIdentity("f" * 40, dirty=False)
+        )
+
+        self.assertEqual(guarded.status, "code-identity-unclear")
+        self.assertFalse(guarded.checks[-1].ok)
+        self.assertEqual(guarded.checks[-1].name, "code-identity-report")
+
     def test_the_api_requires_a_baseline_before_any_lab_probe(self) -> None:
         profile = self.lab.write_profile()
         run_directory = self.runs / "missing-baseline"

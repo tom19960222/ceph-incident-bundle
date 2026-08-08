@@ -165,6 +165,13 @@ def default_entrypoints() -> tuple[CollectEntrypoint, ...]:
     )
 
 
+def qualification_code_identity(root: Path) -> CodeIdentity:
+    """The report-time identity, where only tracked changes make code dirty."""
+
+    observed = code_identity(root)
+    return replace(observed, dirty=bool(tracked_modifications(root)))
+
+
 def collect_arguments(
     profile: LabProfile, *, inventory: Path, output_root: Path
 ) -> list[str]:
@@ -196,6 +203,7 @@ class QualifyResult:
     status: str
     next_action: str
     run_directory: Path
+    code_commit: str | None = None
     checks: tuple[PreflightCheck, ...] = ()
     identity: dict[str, object] = field(default_factory=dict)
     baseline: BaselineRecord = field(default_factory=BaselineRecord)
@@ -208,6 +216,39 @@ class QualifyResult:
     @property
     def ok(self) -> bool:
         return self.status == STATUS_PASS
+
+    def enforce_report_code_identity(self, observed: CodeIdentity) -> "QualifyResult":
+        """Refuse a PASS if code drifted after the gate's final internal check."""
+
+        if not self.ok:
+            return self
+        if not observed.dirty and observed.commit == self.code_commit:
+            return replace(
+                self,
+                checks=self.checks
+                + (
+                    PreflightCheck(
+                        "code-identity-report",
+                        True,
+                        f"reporting the same clean commit {observed.commit}",
+                    ),
+                ),
+            )
+        detail = (
+            f"checkout changed before report: expected clean {self.code_commit}, "
+            f"observed {observed.display}"
+        )
+        return replace(
+            self,
+            status=FAILURE_CODE_IDENTITY,
+            next_action=(
+                "Restore the reviewed clean checkout and re-run "
+                f"{qualify_command(self.profile_path, Path(self.baseline.report_path or ''))}"
+            ),
+            checks=self.checks
+            + (PreflightCheck("code-identity-report", False, detail),),
+            blocked_reason=detail,
+        )
 
     def summary(self) -> dict[str, object]:
         return {
@@ -334,6 +375,7 @@ class _Qualification:
         self.stable_state = StableStateRecord()
         self.node_invocation_ids: tuple[str, ...] = ()
         self.baseline: CutoverBaseline | None = None
+        self.expected_commit: str | None = None
 
     # -- stage plumbing ----------------------------------------------------
 
@@ -355,6 +397,7 @@ class _Qualification:
             status=status,
             next_action=next_action,
             run_directory=self.run_directory,
+            code_commit=self.expected_commit,
             checks=tuple(self.checks),
             identity=self.identity,
             baseline=(
@@ -443,7 +486,7 @@ class _Qualification:
         ) as workspace:
             return self._collect_and_compare(Path(workspace), identity.trusted_host_keys)
 
-    def _check_code_identity(self) -> QualifyResult | None:
+    def _check_code_identity(self, stage: str = "code-identity") -> QualifyResult | None:
         """Require the qualification to name the code it actually ran.
 
         A report says "these two implementations agreed" and points at a commit.
@@ -460,7 +503,7 @@ class _Qualification:
                 f" and {len(modified) - 5} more" if len(modified) > 5 else ""
             )
             return self._failed(
-                "code-identity",
+                stage,
                 f"{len(modified)} tracked file(s) differ from HEAD: {listed}",
                 FAILURE_CODE_IDENTITY,
                 "Commit or stash the modified tracked files so the report names the "
@@ -468,7 +511,24 @@ class _Qualification:
                 f"{qualify_command(self.profile_path, self.baseline_report)}",
             )
         commit = code_identity(self.repository_root).commit
-        self._passed("code-identity", f"running commit {commit} with no local changes")
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            return self._failed(
+                stage,
+                f"could not resolve one full commit (observed {commit})",
+                FAILURE_CODE_IDENTITY,
+                "Restore the reviewed git checkout, then re-run "
+                f"{qualify_command(self.profile_path, self.baseline_report)}",
+            )
+        if self.expected_commit is not None and commit != self.expected_commit:
+            return self._failed(
+                stage,
+                f"checkout HEAD changed from {self.expected_commit} to {commit}",
+                FAILURE_CODE_IDENTITY,
+                "Restore the reviewed clean checkout, then re-run "
+                f"{qualify_command(self.profile_path, self.baseline_report)}",
+            )
+        self.expected_commit = commit
+        self._passed(stage, f"running commit {commit} with no tracked changes")
         return None
 
     def _check_read_only_opt_ins(self) -> QualifyResult | None:
@@ -555,6 +615,9 @@ class _Qualification:
             "residue-baseline",
             f"pre-collection workspace listing taken on {len(baseline)} node(s)",
         )
+        code = self._check_code_identity("code-identity-pre-collect")
+        if code is not None:
+            return code
 
         collected: list[_Collected] = [
             _Collected(self.baseline.shell_run, self.baseline.shell_contents)
@@ -611,6 +674,9 @@ class _Qualification:
         residue = self._check_residue(prober, known_hosts, baseline)
         if residue is not None:
             return residue
+        code = self._check_code_identity("code-identity-final")
+        if code is not None:
+            return code
         return self._result(
             STATUS_PASS,
             f"Hand off {self.run_directory} to {CUTOVER_TICKET}",

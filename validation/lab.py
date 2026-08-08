@@ -47,7 +47,11 @@ from validation.lab_commands import (
 from validation.lab_discovery import discover
 from validation.lab_preflight import preflight
 from validation.lab_profile import LabProfileError
-from validation.lab_qualify import DEFAULT_COLLECT_TIMEOUT_SECONDS, qualify
+from validation.lab_qualify import (
+    DEFAULT_COLLECT_TIMEOUT_SECONDS,
+    qualification_code_identity,
+    qualify,
+)
 from validation.lab_report import (
     ReportRejected,
     code_identity,
@@ -254,7 +258,9 @@ def _qualify(options: dict[str, object]) -> int:
         return _report_unusable_profile(
             profile_path, error, runs_directory, directory=run_directory
         )
-    report = report_from_qualification(result, code=code_identity(REPOSITORY_ROOT))
+    final_code = qualification_code_identity(REPOSITORY_ROOT)
+    result = result.enforce_report_code_identity(final_code)
+    report = report_from_qualification(result, code=final_code)
     location = write_report(runs_directory, report, directory=run_directory)
     summary = result.summary()
     summary["report_directory"] = str(location.directory)
