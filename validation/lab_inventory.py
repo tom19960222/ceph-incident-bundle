@@ -45,7 +45,7 @@ def render_inventory(profile: LabProfile) -> str:
 
 
 def write_inventory(profile: LabProfile, directory: Path) -> Path:
-    """Write the shared inventory into one run's workspace and return its path."""
+    """Write the live collect's inventory into its workspace and return its path."""
 
     path = directory / INVENTORY_NAME
     write_owner_only(path, render_inventory(profile))
@@ -55,8 +55,8 @@ def write_inventory(profile: LabProfile, directory: Path) -> Path:
 def write_known_hosts_home(directory: Path, host_key_lines: tuple[str, ...]) -> Path:
     """Build the collector-owned HOME whose `.ssh/known_hosts` pins the lab.
 
-    Both entrypoints fall back to `$HOME/.ssh/known_hosts` when host-key trust is
-    *not* delegated to them, so handing them a HOME that contains only the keys
+    The Python entrypoint falls back to `$HOME/.ssh/known_hosts` when host-key trust is
+    *not* delegated to it, so handing it a HOME that contains only the keys
     the active profile already trusts is how qualification gets strict host key
     checking without `accept-new` and without reading or writing the operator's
     own known_hosts.  A rotated key then fails the connection outright instead of

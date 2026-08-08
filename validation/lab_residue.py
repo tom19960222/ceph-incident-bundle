@@ -86,7 +86,7 @@ def compare_residue(
     ]
     pre_existing = len(baseline.workspaces) + len(baseline.processes)
     if not new_workspaces and not new_processes:
-        detail = "no collector workspace or helper process left by either invocation"
+        detail = "no collector workspace or helper process left by the live Python invocation"
         if pre_existing:
             detail += f"; {pre_existing} pre-existing entry(s) predate this run"
         return RESULT_CLEAN, detail
