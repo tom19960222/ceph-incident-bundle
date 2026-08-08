@@ -19,8 +19,8 @@ Three properties are structural rather than advisory:
 - **Read-only stays read-only.** The live invocation's argv comes from one builder
   and is checked for `--allow-cephadm-shell` and `--allow-kubectl-exec` before
   anything runs; every `CEPH_INCIDENT_*` variable is stripped from the
-  environment they inherit, because the collectors read some of those as *flag
-  defaults*; and host key trust is pinned to the keys the active profile already
+  environment it inherits, because Python uses some of those for test-only
+  safety limits and source overrides; and host key trust is pinned to the keys the active profile already
   records rather than delegated to the collector's accept-new mode.
 
 The exception to "stop at the first failure" is the residue check: once a collect
@@ -258,7 +258,7 @@ def qualify(
     profile_path: Path,
     *,
     run_directory: Path,
-    baseline_report: Path | None = None,
+    baseline_report: Path,
     entrypoints: Sequence[CollectEntrypoint] | None = None,
     collect_timeout: int = DEFAULT_COLLECT_TIMEOUT_SECONDS,
     repository_root: Path = REPOSITORY_ROOT,
@@ -305,7 +305,7 @@ class _Qualification:
         profile: LabProfile,
         *,
         run_directory: Path,
-        baseline_report: Path | None,
+        baseline_report: Path,
         entrypoints: tuple[CollectEntrypoint, ...],
         collect_timeout: int,
         repository_root: Path,
@@ -373,9 +373,8 @@ class _Qualification:
 
         recorded = {run.implementation: run for run in self.runs}
         implementations = (
-            ("shell", *(entrypoint.implementation for entrypoint in self.entrypoints))
-            if self.baseline is not None
-            else tuple(entrypoint.implementation for entrypoint in self.entrypoints)
+            "shell",
+            *(entrypoint.implementation for entrypoint in self.entrypoints),
         )
         return tuple(
             recorded.get(implementation, RunRecord(implementation))
@@ -391,26 +390,25 @@ class _Qualification:
         opt_ins = self._check_read_only_opt_ins()
         if opt_ins is not None:
             return opt_ins
-        if self.baseline_report is not None:
-            try:
-                self.baseline = load_cutover_baseline(
-                    self.baseline_report, profile=self.profile
-                )
-            except BaselineRejected as error:
-                return self._failed(
-                    "baseline-evidence",
-                    str(error),
-                    FAILURE_BASELINE,
-                    "Select the preserved #21 PASS report and matching shell bundle "
-                    "before re-running the post-cutover gate",
-                )
-            self.runs.append(self.baseline.shell_run)
-            self._passed(
-                "baseline-evidence",
-                f"PASS report {self.baseline.report_path} at code "
-                f"{self.baseline.code_commit} still verifies shell bundle "
-                f"{self.baseline.shell_bundle_hash}",
+        try:
+            self.baseline = load_cutover_baseline(
+                self.baseline_report, profile=self.profile
             )
+        except BaselineRejected as error:
+            return self._failed(
+                "baseline-evidence",
+                str(error),
+                FAILURE_BASELINE,
+                "Select the preserved #21 PASS report and matching shell bundle "
+                "before re-running the post-cutover gate",
+            )
+        self.runs.append(self.baseline.shell_run)
+        self._passed(
+            "baseline-evidence",
+            f"reviewed PASS report {self.baseline.report_path} at code "
+            f"{self.baseline.code_commit} still verifies shell bundle "
+            f"{self.baseline.shell_bundle_hash}",
+        )
         # The identity preflight owns profile state, credential paths, host keys
         # and cluster identity; running its stages here too would give a report
         # two verdicts on the same question.
@@ -423,7 +421,7 @@ class _Qualification:
                 identity.next_action,
                 blocked_reason=identity.blocked_reason,
             )
-        if self.baseline is not None and self.identity != self.baseline.identity:
+        if self.identity != self.baseline.identity:
             return self._failed(
                 "baseline-identity",
                 "the currently verified lab identity differs from the preserved baseline",
@@ -431,12 +429,11 @@ class _Qualification:
                 "Review or replace the Lab Profile; post-cutover proof must use the "
                 "same verified lab as the preserved shell baseline",
             )
-        if self.baseline is not None:
-            self._passed(
-                "baseline-identity",
-                "the active profile resolves to the same Ceph, Rook, Prometheus and "
-                "host identity as the preserved baseline",
-            )
+        self._passed(
+            "baseline-identity",
+            "the active profile resolves to the same Ceph, Rook, Prometheus and "
+            "host identity as the preserved baseline",
+        )
         with tempfile.TemporaryDirectory(
             prefix="ceph-incident-lab-qualify."
         ) as workspace:
@@ -473,10 +470,10 @@ class _Qualification:
     def _check_read_only_opt_ins(self) -> QualifyResult | None:
         """Prove this run cannot ask for a side-effecting collector path.
 
-        There are two ways in, so both are checked.  The argv the collects will
-        actually be given — the fixed vector *and* the profile-derived words, not
-        the constant alone — and the environment they will inherit, because the
-        collectors read some opt-ins as defaults from `CEPH_INCIDENT_*`.
+        Both the live argv and inherited environment are checked. The argv uses
+        the fixed vector plus profile-derived words; the environment is scrubbed
+        because Python exposes test-only safety-limit and source-path overrides
+        through `CEPH_INCIDENT_*`.
         """
 
         words = collect_arguments(
@@ -555,11 +552,9 @@ class _Qualification:
             f"pre-collection workspace listing taken on {len(baseline)} node(s)",
         )
 
-        collected: list[_Collected] = (
-            [_Collected(self.baseline.shell_run, self.baseline.shell_contents)]
-            if self.baseline is not None
-            else []
-        )
+        collected: list[_Collected] = [
+            _Collected(self.baseline.shell_run, self.baseline.shell_contents)
+        ]
         for entrypoint in self.entrypoints:
             outcome = self._collect(entrypoint, inventory, home)
             if isinstance(outcome, QualifyResult):
@@ -713,14 +708,11 @@ class _Qualification:
         """The scrubbed environment used by the post-cutover Python invocation.
 
         Every `CEPH_INCIDENT_*` variable is dropped from what this process
-        inherited.  The collectors read some of them as *defaults*: the shell
-        reference initialises its `--allow-cephadm-shell` flag from
-        `CEPH_INCIDENT_ALLOW_CEPHADM_SHELL`, so an operator who happens to have
-        that exported would get a qualification run that may start a container
-        while the gate still reported the opt-ins disabled.  The `..._TEST_...`
-        caps are the same hazard aimed at the safety limits.  Checking the argv
-        is therefore not enough; the environment is a second way in, and the gate
-        closes it rather than trusting the shell it was launched from.
+        inherited. Python uses some of them for test-only safety caps, forced
+        dependency states and source-path overrides. An operator's exported test
+        variable must not weaken a real-lab limit or redirect a source while the
+        report still claims the reviewed invocation. Checking argv is therefore
+        not enough; the environment is a second way in, and the gate closes it.
 
         `HOME` is the collector-owned directory whose `.ssh/known_hosts` holds
         only the keys the active profile trusts, so `--no-trust-ssh-host-key`

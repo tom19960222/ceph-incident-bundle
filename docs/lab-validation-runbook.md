@@ -8,6 +8,10 @@ their normalized contracts were equivalent, stable state was unchanged, and all 
 were residue-clean. Issue #22 removes the shell runtime and changes `make validate-lab` into the
 post-cutover proof:
 
+- report SHA-256: `e681f7fe662c1e08ab55f6812d9b444dc0fdb5b36580706372fc264dc124c11d`;
+- full commit: `155e057956974ae6b72ab53d76f71d96ab5f0e06`;
+- shell bundle SHA-256: `00b51641829b4fc535ad0a0f41ca4be519b22ea69688725e9e1d97a972abc64f`.
+
 1. validate the preserved #21 `report.json` and shell bundle/hash locally;
 2. prove the active Lab Profile still resolves to the exact saved lab identity;
 3. run one Python four-path full collect;

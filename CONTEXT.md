@@ -85,7 +85,7 @@ _Avoid_: Connection document, inventory, lab credentials
 _Avoid_: Active profile, trusted profile
 
 **Lab Validation Report**:
-一次 real-lab gate 的持久化結果，包含 code/profile identity、collector coverage、shell/Python full collect、bundle comparison、stable-state diff 與下一步；同時提供人讀與 machine-readable 格式。
+一次 real-lab gate 的持久化結果，包含 code/profile identity、保存的 shell baseline provenance、本次 Python full collect coverage、bundle comparison、stable-state diff、residue 與下一步；同時提供人讀與 machine-readable 格式。
 _Avoid_: Test log, bundle report, chat summary
 
 **Operationally Read-Only Collect**:

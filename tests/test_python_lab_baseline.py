@@ -10,7 +10,11 @@ import unittest
 from pathlib import Path
 
 from tests.lab_fixture import DEFAULT_HOSTS, LAB_BIN, FakeLab, host_fingerprint
-from validation.lab_baseline import BaselineRejected, load_cutover_baseline
+from validation.lab_baseline import (
+    BaselineAuthority,
+    BaselineRejected,
+    load_cutover_baseline,
+)
 from validation.lab_profile import load_profile
 
 
@@ -28,7 +32,11 @@ class CutoverBaselineTests(unittest.TestCase):
             self.root, self.lab, self.profile_path
         )
 
-        baseline = load_cutover_baseline(report_path, profile=self.profile)
+        baseline = load_cutover_baseline(
+            report_path,
+            profile=self.profile,
+            authority=authority_for(report_path, bundle_path),
+        )
 
         self.assertEqual(baseline.code_commit, "1" * 40)
         self.assertEqual(baseline.report_path, report_path)
@@ -37,21 +45,31 @@ class CutoverBaselineTests(unittest.TestCase):
         self.assertEqual(baseline.identity["ceph_fsid"], self.profile.ceph_fsid)
 
     def test_rejects_a_report_that_did_not_pass(self) -> None:
-        report_path, _ = write_baseline(self.root, self.lab, self.profile_path)
+        report_path, bundle_path = write_baseline(
+            self.root, self.lab, self.profile_path
+        )
         document = json.loads(report_path.read_text(encoding="utf-8"))
         document["status"] = "bundle-comparison-failed"
         report_path.write_text(json.dumps(document), encoding="utf-8")
 
         with self.assertRaisesRegex(BaselineRejected, "status is not pass"):
-            load_cutover_baseline(report_path, profile=self.profile)
+            load_cutover_baseline(
+                report_path,
+                profile=self.profile,
+                authority=authority_for(report_path, bundle_path),
+            )
 
     def test_rejects_a_baseline_for_a_different_active_profile(self) -> None:
-        report_path, _ = write_baseline(self.root, self.lab, self.profile_path)
+        report_path, bundle_path = write_baseline(
+            self.root, self.lab, self.profile_path
+        )
         other_profile_path = self.lab.write_profile(name="other-lab")
 
         with self.assertRaisesRegex(BaselineRejected, "profile hash does not match"):
             load_cutover_baseline(
-                report_path, profile=load_profile(other_profile_path)
+                report_path,
+                profile=load_profile(other_profile_path),
+                authority=authority_for(report_path, bundle_path),
             )
 
     def test_rejects_a_shell_bundle_whose_bytes_changed(self) -> None:
@@ -61,6 +79,16 @@ class CutoverBaselineTests(unittest.TestCase):
         bundle_path.write_bytes(bundle_path.read_bytes() + b"changed")
 
         with self.assertRaisesRegex(BaselineRejected, "hash no longer matches"):
+            load_cutover_baseline(
+                report_path,
+                profile=self.profile,
+                authority=authority_for(report_path, bundle_path, original_bundle=True),
+            )
+
+    def test_rejects_a_self_consistent_but_unreviewed_substitute(self) -> None:
+        report_path, _ = write_baseline(self.root, self.lab, self.profile_path)
+
+        with self.assertRaisesRegex(BaselineRejected, "reviewed #21 evidence"):
             load_cutover_baseline(report_path, profile=self.profile)
 
 def write_baseline(root: Path, lab: FakeLab, profile_path: Path) -> tuple[Path, Path]:
@@ -185,6 +213,25 @@ def write_baseline(root: Path, lab: FakeLab, profile_path: Path) -> tuple[Path, 
 
 def sha256(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def authority_for(
+    report_path: Path,
+    bundle_path: Path,
+    *,
+    original_bundle: bool = False,
+) -> BaselineAuthority:
+    document = json.loads(report_path.read_text(encoding="utf-8"))
+    bundle_hash = (
+        document["runs"][0]["bundle_hash"]
+        if original_bundle
+        else sha256(bundle_path)
+    )
+    return BaselineAuthority(
+        report_hash=sha256(report_path),
+        code_commit=document["code"]["commit"],
+        shell_bundle_hash=bundle_hash,
+    )
 
 
 if __name__ == "__main__":

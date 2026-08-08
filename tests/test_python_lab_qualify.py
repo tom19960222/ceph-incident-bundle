@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from tests.lab_fixture import FakeLab, fake_entrypoints
-from tests.test_python_lab_baseline import write_baseline
+from tests.test_python_lab_baseline import authority_for, write_baseline
 from validation.lab_artifacts import purge_artifacts, scan_artifacts
 from validation.lab_report import CodeIdentity, report_from_qualification, write_report
 from validation.lab_qualify import (
@@ -47,7 +47,10 @@ class QualifyTestCase(unittest.TestCase):
         **knobs: str,
     ):
         profile = profile or self.lab.write_profile()
-        baseline_report, _ = write_baseline(self.root, self.lab, profile)
+        baseline_report, baseline_bundle = write_baseline(
+            self.root, self.lab, profile
+        )
+        authority = authority_for(baseline_report, baseline_bundle)
         run_directory = self.runs / run_id
         run_directory.mkdir(mode=0o700, exist_ok=True)
         environment = self.lab.environment(
@@ -55,7 +58,12 @@ class QualifyTestCase(unittest.TestCase):
             FAKE_LAB_KUBECTL_LOG=str(self.kubectl_log),
             **knobs,
         )
-        with mock.patch.dict(os.environ, environment):
+        with (
+            mock.patch.dict(os.environ, environment),
+            mock.patch(
+                "validation.lab_baseline.ISSUE_21_BASELINE", authority
+            ),
+        ):
             return qualify(
                 profile,
                 baseline_report=baseline_report,
@@ -147,6 +155,7 @@ class PostCutoverGateTests(QualifyTestCase):
         baseline_report, baseline_bundle = write_baseline(
             self.root, self.lab, profile
         )
+        authority = authority_for(baseline_report, baseline_bundle)
         run_directory = self.runs / "post-cutover"
         run_directory.mkdir(mode=0o700)
         environment = self.lab.environment(
@@ -154,7 +163,12 @@ class PostCutoverGateTests(QualifyTestCase):
             FAKE_LAB_KUBECTL_LOG=str(self.kubectl_log),
             **knobs,
         )
-        with mock.patch.dict(os.environ, environment):
+        with (
+            mock.patch.dict(os.environ, environment),
+            mock.patch(
+                "validation.lab_baseline.ISSUE_21_BASELINE", authority
+            ),
+        ):
             result = qualify(
                 profile,
                 baseline_report=baseline_report,
@@ -198,6 +212,25 @@ class PostCutoverGateTests(QualifyTestCase):
 
 
 class SharedInputTests(QualifyTestCase):
+    def test_the_api_requires_a_baseline_before_any_lab_probe(self) -> None:
+        profile = self.lab.write_profile()
+        run_directory = self.runs / "missing-baseline"
+        run_directory.mkdir(mode=0o700)
+
+        with (
+            mock.patch(
+                "validation.lab_qualify.preflight",
+                side_effect=AssertionError("must not touch the lab"),
+            ),
+            self.assertRaisesRegex(TypeError, "baseline_report"),
+        ):
+            qualify(
+                profile,
+                run_directory=run_directory,
+                entrypoints=fake_entrypoints(),
+                repository_root=self.lab.checkout(),
+            )
+
     def test_both_implementations_receive_the_same_derived_inventory(self) -> None:
         # The fixture rejects anything outside the qualification vector, so a run
         # reaching the comparison already proves both got the same shape; this

@@ -23,6 +23,22 @@ class BaselineRejected(Exception):
 
 
 @dataclass(frozen=True)
+class BaselineAuthority:
+    """Immutable identity of the reviewed #21 qualification evidence."""
+
+    report_hash: str
+    code_commit: str
+    shell_bundle_hash: str
+
+
+ISSUE_21_BASELINE = BaselineAuthority(
+    report_hash="sha256:e681f7fe662c1e08ab55f6812d9b444dc0fdb5b36580706372fc264dc124c11d",
+    code_commit="155e057956974ae6b72ab53d76f71d96ab5f0e06",
+    shell_bundle_hash="sha256:00b51641829b4fc535ad0a0f41ca4be519b22ea69688725e9e1d97a972abc64f",
+)
+
+
+@dataclass(frozen=True)
 class CutoverBaseline:
     report_path: Path
     report_hash: str
@@ -46,15 +62,29 @@ class CutoverBaseline:
         )
 
 
-def load_cutover_baseline(report: Path, *, profile: LabProfile) -> CutoverBaseline:
+def load_cutover_baseline(
+    report: Path,
+    *,
+    profile: LabProfile,
+    authority: BaselineAuthority | None = None,
+) -> CutoverBaseline:
     """Load one #21 PASS report and prove its shell bundle is still the same bytes."""
 
+    authority = authority or ISSUE_21_BASELINE
     report_path = report / REPORT_JSON_NAME if report.is_dir() else report
     try:
         raw = report_path.read_bytes()
-        document = json.loads(raw)
-    except (OSError, ValueError) as error:
+    except OSError as error:
         raise BaselineRejected(f"cannot read baseline report {report_path}: {error}") from error
+    report_hash = "sha256:" + hashlib.sha256(raw).hexdigest()
+    if report_hash != authority.report_hash:
+        raise BaselineRejected(
+            "baseline report hash does not match the reviewed #21 evidence"
+        )
+    try:
+        document = json.loads(raw)
+    except ValueError as error:
+        raise BaselineRejected(f"cannot parse baseline report {report_path}: {error}") from error
     if not isinstance(document, dict):
         raise BaselineRejected("baseline report must be a JSON object")
     if document.get("schema_version") != 1:
@@ -64,8 +94,10 @@ def load_cutover_baseline(report: Path, *, profile: LabProfile) -> CutoverBaseli
 
     code = _mapping(document, "code")
     commit = code.get("commit")
-    if not isinstance(commit, str) or len(commit) != 40 or code.get("dirty") is not False:
-        raise BaselineRejected("baseline report does not name one clean commit")
+    if commit != authority.code_commit or code.get("dirty") is not False:
+        raise BaselineRejected(
+            "baseline report does not name the reviewed clean #21 commit"
+        )
 
     recorded_profile = _mapping(document, "profile")
     profile_hash = recorded_profile.get("hash")
@@ -107,6 +139,10 @@ def load_cutover_baseline(report: Path, *, profile: LabProfile) -> CutoverBaseli
     bundle_hash = shell.get("bundle_hash")
     if not isinstance(bundle_name, str) or not isinstance(bundle_hash, str):
         raise BaselineRejected("baseline shell run does not identify its bundle")
+    if bundle_hash != authority.shell_bundle_hash:
+        raise BaselineRejected(
+            "baseline report does not name the reviewed #21 shell bundle hash"
+        )
     bundle_path = Path(bundle_name)
     actual_hash = _sha256(bundle_path)
     if actual_hash != bundle_hash:
@@ -121,7 +157,7 @@ def load_cutover_baseline(report: Path, *, profile: LabProfile) -> CutoverBaseli
         raise BaselineRejected("baseline report has no verified lab identity")
     return CutoverBaseline(
         report_path=report_path,
-        report_hash="sha256:" + hashlib.sha256(raw).hexdigest(),
+        report_hash=report_hash,
         code_commit=commit,
         profile_hash=profile_hash,
         identity=identity,

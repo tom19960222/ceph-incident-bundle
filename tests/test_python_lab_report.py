@@ -14,7 +14,7 @@ from tests.lab_fixture import (
     fake_entrypoints,
     host_fingerprint,
 )
-from tests.test_python_lab_baseline import write_baseline
+from tests.test_python_lab_baseline import authority_for, write_baseline
 from validation.lab_preflight import preflight
 from validation.lab_qualify import qualify
 from validation.lab_report import (
@@ -338,8 +338,16 @@ class QualificationReportTests(unittest.TestCase):
         run_directory = self.runs / "20260731T000000Z"
         run_directory.mkdir(mode=0o700)
         profile = self.lab.write_profile()
-        baseline_report, _ = write_baseline(self.root, self.lab, profile)
-        with mock.patch.dict(os.environ, self.lab.environment(**knobs)):
+        baseline_report, baseline_bundle = write_baseline(
+            self.root, self.lab, profile
+        )
+        authority = authority_for(baseline_report, baseline_bundle)
+        with (
+            mock.patch.dict(os.environ, self.lab.environment(**knobs)),
+            mock.patch(
+                "validation.lab_baseline.ISSUE_21_BASELINE", authority
+            ),
+        ):
             return qualify(
                 profile,
                 baseline_report=baseline_report,

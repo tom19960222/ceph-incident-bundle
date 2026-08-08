@@ -13,12 +13,13 @@ collect 前後的 stable state。這份文件是比較「比什麼、刻意不�
 
 ## 為什麼 real-lab 比較不是 byte comparison
 
-Offline equivalence gate（`make test-differential`，issue #18，見
-[`differential-normalizer.md`](differential-normalizer.md)）已經證明：**同樣的
-輸入**進去，兩個實作吐出同樣的 bytes。它做得到，是因為它的世界是假的而且是凍結
-的。
+Cutover 前的 offline equivalence gate（當時的 `make test-differential`，issue #18，見
+[`differential-normalizer.md`](differential-normalizer.md)）曾證明：**同樣的輸入**
+進去，兩個實作吐出同樣的 bytes。該 target 隨 shell implementation 一起退役；這份
+reviewed normalizer 與保存的 PASS evidence 是它留下的 contract，不代表現行
+`make validate` 還會執行 shell。
 
-Real lab 兩者都不是。兩次 qualification collect 相隔數分鐘打在活的 cluster 上，
+Real lab 兩者都不是。保存的 shell collect 與本次 Python collect 打在活的 cluster 上，
 `ceph -s` 的數字本來就會不同，journal 本來就會多幾行。在那裡要求 evidence bytes
 完全相同不是嚴格，而是一道只能靠運氣通過的 gate。
 
@@ -174,7 +175,7 @@ source／runner 選擇也都不受影響。
 | `.../tmp.<random>[.<pid>]` → `<workdir>` | 工作機暫存目錄。兩邊命名法不同——reference 是 `tmp.<stamp>.$$`，candidate 是 `mkdtemp` 的後綴（字母表含 `_`）——這條規則必須兩種都吃完整，只吃掉一半會留下 `<workdir>.61493` 這種尾巴（#52） |
 | `start=<epoch>`／`end=<epoch>` → `start=<epoch-Ns>`／`end=<epoch>`，**僅限 artifact 落在 `cluster/prometheus/` 的 entry** | Prometheus query window 的兩端是採集起始時刻算出來的 epoch，兩次 run 必然不同。**窗口寬度 `N` 保留**：`dump-info.txt` 的 selected `since` 記錄 collector 宣告的 Evidence Window；manifest argv 的 `end - start` 則獨立證明它實際套用的秒數。兩者都要保留，才看得見「宣告 24h 卻查 12h」。已知代價是窗口的絕對錨點不再可觀測：寬度對、但把 `end` 算在錯誤時間基準上的 candidate 會靜默通過 |
 | 32 位 hex → `<invocation>` | node invocation identifier |
-| 各自的 `--out` 目錄與 run directory → `<bundle>`／`<run>` | 兩次 run 依定義寫在不同目錄 |
+| 各自的 `--out` 目錄與 run directory → `<bundle>`／`<run>` | 保存的 shell bundle 與本次 Python run 依定義位於不同目錄 |
 
 另外，`environment.txt` 只比對上表列出的選擇欄位。`created_utc` 是時鐘；
 `node_target_*`、`node_invocation_id_*`、`rook_namespace`、
@@ -191,7 +192,7 @@ Bundle 是本次 collect 產生的，但「我們做的」不是信任理由。`
 
 ## Stable-State Snapshot Schema（version 1）
 
-兩次 collect 之前取一次、之後取一次，兩者必須完全相同。Snapshot 只能包含
+本次 live Python collect 之前取一次、之後取一次，兩者必須完全相同。Snapshot 只能包含
 **stable identity 與 desired configuration**；whitelist 就是重點——列舉保留欄位，
 新版本新增的易變欄位不會突然讓 gate 失敗，而真正的 desired-state 變動也無法躲在
 沒人列舉的欄位裡。
@@ -218,7 +219,7 @@ Bundle 是本次 collect 產生的，但「我們做的」不是信任理由。`
 
 ## Remote Residue
 
-第一次 collect 前、第二次 collect 後，各對每個 inventory node 取一次
+本次 live Python collect 前、後，各對每個 inventory node 取一次
 `${TMPDIR:-/tmp}/ceph-incident-node.*`、`ceph-incident-node-*` 的列表與 helper
 process 列表。**只有期間新出現的**才算本次 run 的殘留；run 之前就存在的會被如實
 報告為 pre-existing，但不歸咎於本次 run。
