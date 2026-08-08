@@ -32,7 +32,7 @@ Real lab 兩者都不是。保存的 shell collect 與本次 Python collect 打�
 | 每個 node 的 `manifest.jsonl` | 同上，但只比對「兩邊都宣稱的那一面」，見下節 |
 | 每個 captured artifact 的 `# key: value` header | host、collector、timeout 與 truncation 標記——`# timeout` 逐字比對，qualification 工作機因此必須提供 timeout binary（[ADR 0011](adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md)） |
 | artifact body 是否解析得出 JSON | 「是不是 JSON」是實作決定的：把 evidence 包裝、截斷或重新序列化的 candidate 會在這裡現形 |
-| `environment.txt` 的選擇欄位 | `mode`、`seed`、`since`、`timeout`、`git_commit`、`ceph_source`、`ceph_runner`、`rook_source`、`prom_url`、`prom_jobs` |
+| `environment.txt` 的選擇欄位 | `mode`、`seed`、`since`、`timeout`、`ceph_source`、`ceph_runner`、`rook_source`、`prom_url`、`prom_jobs` |
 | `cluster/prometheus/dump-info.txt` 的決策欄位 | `since`、`step_seconds`、`job_regex`、`jobs_matched`、`truncated`；清單中的欄位缺失會明確記成 `None`，不會因文件變短而縮小比較範圍 |
 | `summary.txt` | `cluster_status`、`node_ok`、`node_failed`、`final_status` — partial collection 在這裡變成可觀測 |
 | SKIPPED／partial artifact 的分類 | 兩邊必須以同一個原因略過同一件事 |
@@ -46,6 +46,7 @@ covered。
 
 刻意**不**比較的：
 
+- `environment.txt` 的 `git_commit`。Post-cutover bundle 必然來自比保存 baseline 更新的 commit；要求字串相同會讓 cutover proof 永遠失敗。這不是丟掉 code provenance：固定的 #21 authority 同時驗證 baseline report SHA-256、完整 commit 與 shell bundle SHA-256，schema-v2 report 的 `code.commit` 另外記錄且要求本次 checkout clean，兩端都各自被鎖住。
 - Captured artifact 的 body 本身，**包含它的 JSON key path**。兩個實作都不「轉換」
   evidence：它們執行一條指令並逐字記錄輸出。Manifest 已經釘住是哪條指令、exit code
   是多少；兩份 manifest 一致，就代表兩個 body 是同一個 cluster 對同一個問題在兩個

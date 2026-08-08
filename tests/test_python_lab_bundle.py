@@ -453,6 +453,16 @@ class ContractTests(BundleTestCase):
             any("ceph_runner" in line for line in describe_differences(reference, candidate))
         )
 
+    def test_git_commit_is_report_provenance_not_a_cross_commit_difference(self) -> None:
+        reference = self.contract()
+        other = bundle_members()
+        other["environment.txt"] = other["environment.txt"].replace(
+            b"git_commit=abc", b"git_commit=def"
+        )
+        candidate = contract_of(read_bundle(self.write(other, "commit.tar.gz")))
+
+        self.assertEqual(describe_differences(reference, candidate), ())
+
     def test_a_different_prometheus_since_decision_is_a_difference(self) -> None:
         reference = self.contract()
         candidate = self.contract_with_prometheus_dump_changes(
