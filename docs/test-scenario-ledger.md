@@ -25,11 +25,14 @@
 | not-ported | 11 | inventory 分類為 shell 實作細節，移植後失去意義 |
 | **合計** | **145** | inventory 全部情境 |
 
-> Inventory 撰寫時的總數是 137／127／10；之後 #15 補入 `P6a`（Prometheus
-> 憑證邊界）而未更新總覽，因此實際列數為 138／128／10。本 ledger 以實際列數為準。
+> #22 原始 acceptance criteria 寫的是 137／127／10；在 cutover 前，`P6a` 與
+> Evidence Window 的 V15–V20 等情境已追加，現在機械計數是 145／134／11。本
+> ledger 以實際 rows 為準，不能為了符合舊票面而少算後來新增的契約。
 
-`differential` 欄位標出該情境同時被哪個 offline differential scenario
-（`tests/differential/scenarios.py`）在 shell／Python 雙跑中端到端比較。
+`differential` 欄位保存 cutover 前由哪個 offline scenario 做過 shell／Python
+雙跑的歷史證據；#22 移除 reference 與 differential executable 後，這欄不再指向
+可執行檔。現在的離線 gate 由上列 134 個 Python behavior mappings 與 clause-level
+audit 守住，real-lab 則由保存的 shell baseline bundle 做 post-cutover comparison。
 
 
 ## 1. `tests/run-tests.sh`（總入口）
@@ -168,7 +171,7 @@
 
 | ID | 情境 | 狀態 | Python 覆蓋 / 理由 | differential |
 |---|---|---|---|---|
-| B1 | 合法 bundle（目錄與 tar.gz 兩形態）→ exit 0，stdout 恰為 `… | ported | `test_python_verify.VerifyCliTests.test_valid_minimal_directory_passes`<br>`test_python_verify.VerifyCliTests.test_valid_minimal_archive_passes`<br>`test_python_verify.VerifyCliTests.test_shell_public_collect_workdir_and_archive_pass` | — |
+| B1 | 合法 bundle（目錄與 tar.gz 兩形態）→ exit 0，stdout 恰為 `… | ported | `test_python_verify.VerifyCliTests.test_valid_minimal_directory_passes`<br>`test_python_verify.VerifyCliTests.test_valid_minimal_archive_passes` | — |
 | B2 | bundle 內含 symlink → 驗證失敗且訊息提及 symlink | ported | `test_python_verify.VerifyCliTests.test_directory_symlink_is_rejected`<br>`test_python_verify.VerifyCliTests.test_unsafe_archive_members_are_rejected_without_writes` | — |
 | B3 | 缺 manifest.jsonl（dir 與 archive）→ 失敗且點名 manife… | ported | `test_python_verify.VerifyCliTests.test_missing_required_content_is_rejected_for_directory_and_archive` | — |
 | B4 | 檔名為 `keyring`（dir/archive）→ 失敗且點名 | ported | `test_python_verify.VerifyCliTests.test_secret_paths_are_rejected_for_directory_and_archive` | — |

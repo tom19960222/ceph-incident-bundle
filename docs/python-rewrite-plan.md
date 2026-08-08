@@ -2,21 +2,26 @@
 
 ## Objective
 
-以 Python 3.11 標準庫完整取代現有 shell implementation，同時維持 observable contract equivalence。Production runtime 只包含三個 Python 模組；shell reference 保留到 automated、differential 與 real-lab gates 全部通過。
+以 Python 3.11 標準庫完整取代 shell implementation，同時維持 observable contract
+equivalence。#18 offline gate 與 #21 real-lab qualification 已通過；#22 完成最後的
+contract step。Production runtime 現在只包含三個 Python 模組，沒有 shell wrapper。
 
 ## Contract Sources
 
 - `docs/behavior-contract.md` 是現有 shell observable behaviour 的逐項基準。
-- `docs/test-scenario-inventory.md` 是 shell scenario 盤點：共 138 個 shell scenarios（原始盤點 137 個，#15 之後補入 `P6a`），其中 128 個 behaviour-bearing scenarios 必須有 Python coverage；10 個 shell implementation details（R1、R2、R7、C1、C2、C20、C22、C23、P4、P8）不照搬。
+- `docs/test-scenario-inventory.md` 是凍結的 shell scenario 盤點；追加情境後目前共有
+  145 列，134 個 behavior-bearing scenarios 由 Python tests 覆蓋，11 個是已移除的
+  shell implementation details。#22 票面的 137／127／10 是較早快照。
 - `docs/test-scenario-ledger.md` 是逐項覆蓋對照：每個情境指向覆蓋它的 Python test，或指向未移植／blocked 的理由；由 `tests/test_python_scenario_ledger.py` 機械檢查。
-- `docs/differential-normalizer.md` 是 offline differential gate 的 normalizer 合約：明列共享 fake world 的組成、被比較的 observable contract 與被批准忽略的非語意差異。
+- `docs/differential-normalizer.md` 保存已通過、已退役的 offline differential gate
+  normalizer 合約；post-cutover executable 不再存在。
 - `CONTEXT.md` 與 `docs/adr/` 定義 domain language 與已鎖定的設計決策。
 - `docs/read-only-safety.md` 定義 operationally read-only contract 與 proof obligations。
 - `docs/lab-validation-runbook.md` 定義 agent-friendly、fail-closed 的 lab workflow。
 
 任何實作與測試若和這些來源衝突，必須先回到 parent spec #8 澄清，不能自行放寬安全或等價條件。
 
-## Current Python Candidate Boundary
+## Current Python Production Boundary
 
 PR #24／#10 建立 validation foundation 的第一條 vertical slice：公開 `verify` 能從 shell-produced workdir/archive 驗證必要 metadata、cluster/node evidence、archive integrity 與已納入的 traversal/link/special-member containment。Issue #11 再加入單一 inventory node 的公開 `collect` slice：工作機以一次 SSH process 將自足 `ceph_incident_node.py` 經 stdin 傳送，固定 bootstrap 在同一連線檢查 Python 3.11、以穩定 source name compile／exec，node 以 stdout 回傳 Node Evidence Archive 並只以 stderr 輸出 diagnostics。
 
@@ -50,15 +55,15 @@ Gate 的覆蓋邊界要誠實記錄：fake `ssh` 站在 SSH 邊界，因此 diff
 
 #36 移植 node evidence surface 的其餘部分，ledger 因此不再有 blocked 情境。Python node collector 現在依 shell 的順序收集 `lsblk`（privileged）、`dmesg -T`（privileged，加重 timeout）、`sudo -n journalctl -u 'ceph*'`（optional on sudo，加重 timeout）、optional 的 `iostat`／`chronyc` 兩條／`ntpq`／`timedatectl` 三條／`systemctl status systemd-timesyncd`、privileged 的 `systemd-timesyncd` journal、timesyncd 設定檔與 `conf.d` 逐檔複製、optional 的 `pvs`／`vgs`／`lvs`／`podman ps`／`docker ps`、`cephadm ls`、`/etc/os-release`／`hosts`／`resolv.conf` 複製，以及 `/var/lib/ceph` 的 listing 與 config 複製。三種 disposition 的語意逐條保留：optional 工具不存在寫 `SKIPPED: command not found: <tool>` 且不使 node partial、privileged 讀取沒有 sudo 寫 `SKIPPED: sudo command not found for privileged read: <tool>` 也不使 node partial（絕不退回無權限讀取）、required capture 與複製失敗才使 node partial（2）。複製一律走 `dd iflag=noatime,nofollow` 的 safe read（`/etc/resolv.conf` 這類 symlink 先解析再以 no-follow 讀取），`/var/lib/ceph` 的 keyring／`private_key`／`.ssh` 在 `find` 走進去之前就被 prune，listing 與 configs 都看不到。依 ADR 0010，每一份複製類 evidence 與每一個 SKIPPED marker 都補上 manifest entry，`command` 分別記 `collect-node copy <來源>`、`collect-node list <目錄>` 或本來要執行的 argv。離線測試把整個 node PATH 換成 fake world（fake `ssh` 的 `FAKE_REMOTE_PATH`），因此工作機上剛好裝了 `docker` 或 `iostat` 既不會被執行，也不會讓「工具不存在」的斷言誤過；`/etc` 路徑另由 `CEPH_INCIDENT_ETC_DIR` 重定向，和既有的 `CEPH_INCIDENT_VAR_LOG_DIR` 一樣只在 `CEPH_INCIDENT_TEST_ALLOW_ATIME_READ=1` 時生效。
 
-這仍是有明確限制的 Python candidate，不是 feature-complete Collect／Verify 契約，也不是 real-lab qualification evidence。
+Python `collect`／`verify` 現在是唯一公開 production entrypoints。Content Safety 與完整
+Structural Verification 在 #22 保持不變；若要移除 Content Safety，必須另立變更。
+#47 的 `run/hosts-to-inventory.sh` 是不在 observable contract 內的 shell-only convenience
+surface，#22 明確選擇移除而不新增第三個 production CLI，inventory language 不變。
 
-- #17 已完成 Content Safety 與完整 Structural Verification 的 Python candidate；Content Safety 尚未移除，任何移除仍須在 Python cutover 完成後另立變更。
-- #23 已修正 shell Node Evidence Archive 的 pre-extraction acceptance boundary；shell reference 仍須通過 #19／#20 的其餘 qualification gates。
-- #17 的 malicious final Incident Bundle 黑箱案例已收斂 Python Verify 對 link、special member、member collision、hierarchy、truncation 與 tar end markers 的接受邊界；#23 只處理 shell 收到 Node Evidence Archive 後、解壓前的窄幅安全邊界。
-- #47 的 `run/hosts-to-inventory.sh` 是工作機端的輔助工具，不是 collect observable contract 的一部分：它離線把 `/etc/hosts` 轉成 inventory 文法，不連任何 lab，也不在 differential 或 real-lab gate 的比較面內（後者的 inventory 由 `validation/lab_inventory.py` 每次從 Lab Profile 自行產生）。它產生的檔案必須同時通過兩個 parser，因此兩邊規則不同時取較嚴的一邊。**這是 shell-only 的 surface**：cutover 前必須另外裁定要移植到 Python 還是隨 shell reference 一起移除，否則它會在 cutover 時無聲消失。
-- **#18 的 offline observable-contract equivalence gate 已宣告通過（2026-07-30）。** 138 個 inventory 情境全部有狀態（128 ported、10 shell 實作細節）、13 個 differential scenarios 在同一個 fake world 雙跑、normalizer 的每條忽略規則都在 `docs/differential-normalizer.md` 有據可查，`make validate` 離線可重複全綠。宣告的範圍就是它證明的範圍：**工作機端**的 observable contract；node collector 自身的 evidence surface 由 ledger 的 N 系列黑箱測試（斷言，不是雙跑比對）擔保。ledger 的機械檢查證明「指向的測試存在且通過」，逐列的斷言深度稽核另見 #42；`--skip-logs` marker 的 `exit_code` 是唯一未結裁定，不在被比較的差異面內。#36 已移植 node evidence surface，ledger 不再有 blocked 情境。#19 已建立 Lab Profile、status/discovery/activation workflow 與 strict identity preflight；#20 已建立 dual-run full-collect gate（`make validate-lab`）。Harness 存在不等於 qualification 已完成——它尚未在真實 lab 執行過，因此 real-lab qualification 仍未通過，仍不可宣稱整體 qualification-ready。
-
-本階段的 Python 3.11 baseline 由 Makefile 的 offline gate 在任何測試前 fail fast；#11 已完成 node runtime negotiation 與 graceful-skip seam，#12 已完成 `/var/log` forensic evidence，#13、#14 與 #15 已分別完成 direct Ceph、Rook 與 Prometheus cluster evidence，#16 已完成多 node、source/runner selection 與 multi-source orchestration，#17 已完成 Content Safety 與完整 Structural Verification，#18 已完成 offline differential gate 與逐項 ledger，#36 已完成 node evidence surface，#20 已完成 real-lab dual-run gate 的 harness。下一個 blocker 是 #21：在真實 lab 執行 `make validate-lab` 並取得 `status: pass`；在那之前，本 candidate 仍不可宣稱 qualification-ready。
+#18 的 historical differential executable 已與 shell reference 一起移除，但其通過宣告、
+normalizer 文件、scenario ledger 與 clause audit 保留。#21 PASS run `20260805T155047Z`
+保存 shell baseline。Post-cutover `make validate-lab` 驗證該 report/bundle/hash與同一 lab
+identity後，只跑 Python，並把 final report 升為 schema 2。
 
 ## Locked Design
 
@@ -150,22 +155,21 @@ shell 的 `node_copy_file` 複製 evidence 時不寫 manifest entry，`lib/colle
 
 ### Offline gate
 
-`make validate` 必須保持離線且可重複，包含：
-
-- 既有 shell tests（cutover 前）：`make test`。
-- Python tests（含 scenario ledger 檢查）：`make test-python`；覆蓋狀態逐項見 `docs/test-scenario-ledger.md`。
-- 代表性黑箱 differential scenarios：`make test-differential`，目前 13 個（8–12 的指示範圍加一個，把 runner fallback 與 partial-capture 語意分開診斷）。
-- Python 3.11 compatibility（`make check-python`）與靜態檢查（`make shellcheck`）。
+`make validate` 必須保持離線且可重複；它 fail-fast 檢查 Python 3.11 floor，然後執行
+完整 Python suite（含 134 個 behavior mappings、scenario ledger/audit、collector、verify、
+lab harness 與 Python-only repo layout）。Closeout 必須明記實際使用 Python 3.11。
 
 ### Real-lab gate
 
-`make validate-lab LAB_PROFILE=/absolute/path/to/lab.toml CEPH_INCIDENT_LAB_CONFIRM=1`：
+`make validate-lab LAB_PROFILE=/absolute/path/to/lab.toml LAB_BASELINE_REPORT=/absolute/path/to/report.json CEPH_INCIDENT_LAB_CONFIRM=1`：
 
 - Identity preflight 必須 fail closed。
-- Shell 與 Python 各執行一次 full collect。
+- 保存的 #21 PASS report、shell bundle/hash與目前 profile/identity 必須先通過。
+- Python 執行一次 full collect。
 - 四條 collector paths 必須完整，不能以 partial coverage 通過。
-- 兩份 bundle 必須獨立通過 structural verification 與 cutover 階段仍存在的 content-safety checks。
-- Lab Validation Report 必須記錄 code/profile identity、coverage、comparison、stable-state diff、cleanup proof、status 與 next action。
+- Python bundle 必須通過 structural/content-safety verify，且成功 output 不得殘留 owned workdir。
+- Report 必須記錄 baseline/current code identity、coverage、comparison、stable-state diff、
+  workstation/remote cleanup proof、status 與 next action。
 
 ## Replaceable Lab Workflow
 
@@ -174,7 +178,8 @@ shell 的 `node_copy_file` 複製 evidence 時不寫 manifest entry，`lib/colle
 - Agent 或操作人員檢查 candidate 後明確啟用，再執行 strict preflight 與 full validation。
 - Repository 不硬編碼 endpoints、credentials 或即時 cluster identity。
 
-> Current status: #19 已實作 `lab-status`、`lab-profile-discover`、`lab-profile-activate` 與 `lab-preflight`，並固定 Lab Validation Report schema；#20 已實作 `validate-lab` 的 dual-run harness。程式都在 `validation/` package，不屬於三個 production modules。`lab-preflight` 通過只證明 lab identity；只有 `validate-lab` 寫出 `status: pass` 的 report 才是 qualification evidence，而那尚未發生（#21）。
+> Current status: profile workflow 保持不變；`validate-lab` 已是 #22 post-cutover gate。
+> `lab-preflight` 仍只證明 identity，只有 schema-v2 `status: pass` 是 current proof。
 
 ## Out of Scope
 

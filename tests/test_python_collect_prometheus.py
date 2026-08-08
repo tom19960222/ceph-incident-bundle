@@ -23,7 +23,6 @@ from ceph_incident_collectors import (  # noqa: E402
 )
 
 ENTRYPOINT = ROOT / "ceph_incident_bundle.py"
-SHELL_VERIFIER = ROOT / "lib" / "verify-bundle.sh"
 # The Prometheus HTTP boundary is faked by the very same whitelist curl the
 # shell reference is tested with, so an argv assertion here is an assertion of
 # shell equivalence rather than of a Python-only convention.
@@ -170,17 +169,6 @@ class PrometheusFixture:
         )
         self.assertEqual(python_verify.returncode, 0, python_verify.stderr)
         self.assertIn("VERIFY PASS", python_verify.stdout)
-
-        shell_verify = subprocess.run(
-            ["bash", str(SHELL_VERIFIER), str(bundle)],
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(shell_verify.returncode, 0, shell_verify.stderr)
-        self.assertIn("VERIFY PASS", shell_verify.stdout)
-
 
 class PrometheusGrammarTests(unittest.TestCase):
     """P1, P2, P3 at the seam the shell reference tests them: pure functions.

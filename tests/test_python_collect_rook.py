@@ -19,7 +19,6 @@ if str(ROOT) not in sys.path:
 from ceph_incident_collectors import REMOTE_BOOTSTRAP, _ssh_command  # noqa: E402
 
 ENTRYPOINT = ROOT / "ceph_incident_bundle.py"
-SHELL_VERIFIER = ROOT / "lib" / "verify-bundle.sh"
 FIXTURE_BIN = ROOT / "tests" / "fixtures" / "python-rook" / "bin"
 NODE_TARGET = "ceph@10.0.0.1"
 
@@ -150,17 +149,6 @@ class RookFixture:
         )
         self.assertEqual(python_verify.returncode, 0, python_verify.stderr)
         self.assertIn("VERIFY PASS", python_verify.stdout)
-
-        shell_verify = subprocess.run(
-            ["bash", str(SHELL_VERIFIER), str(bundle)],
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(shell_verify.returncode, 0, shell_verify.stderr)
-        self.assertIn("VERIFY PASS", shell_verify.stdout)
-
 
 class LocalKubectlRunnerTests(RookFixture, unittest.TestCase):
     def test_local_kube_mode_collects_rook_evidence(self) -> None:

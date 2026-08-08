@@ -1,4 +1,4 @@
-"""The shared inventory both qualification collects receive."""
+"""The retained inventory language generated for the live Python collect."""
 
 from __future__ import annotations
 
@@ -51,9 +51,9 @@ class RenderTests(InventoryTestCase):
 
 
 class ParserAgreementTests(InventoryTestCase):
-    """The whole point of one inventory is that both implementations read it."""
+    """Issue #22 keeps the public inventory grammar while removing shell runtime."""
 
-    def test_the_python_candidates_parser_accepts_it(self) -> None:
+    def test_the_public_python_parser_accepts_it(self) -> None:
         path = write_inventory(self.profile, self.root)
         completed = subprocess.run(
             [
@@ -79,7 +79,7 @@ class ParserAgreementTests(InventoryTestCase):
         self.assertEqual(aliases, "monitor01 mon02 osd01")
         self.assertEqual(namespace, "rook-ceph")
 
-    def test_the_shell_reference_can_source_it(self) -> None:
+    def test_the_retained_inventory_grammar_remains_shell_sourceable(self) -> None:
         path = write_inventory(self.profile, self.root)
         completed = subprocess.run(
             [

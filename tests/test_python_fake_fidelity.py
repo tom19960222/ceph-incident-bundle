@@ -17,7 +17,6 @@ FAKE_SSH_ENTRYPOINTS = (
     ROOT / "tests/fixtures/python-ceph/bin/ssh",
     ROOT / "tests/fixtures/python-prometheus/bin/ssh",
     ROOT / "tests/fixtures/python-rook/bin/ssh",
-    ROOT / "tests/differential/fakes/ssh",
     ROOT / "tests/fixtures/lab/bin/ssh",
 )
 REJECT_EXIT_CODES = {
@@ -26,7 +25,6 @@ REJECT_EXIT_CODES = {
     ROOT / "tests/fixtures/python-ceph/bin/ssh": 99,
     ROOT / "tests/fixtures/python-prometheus/bin/ssh": 99,
     ROOT / "tests/fixtures/python-rook/bin/ssh": 99,
-    ROOT / "tests/differential/fakes/ssh": 99,
     ROOT / "tests/fixtures/lab/bin/ssh": 99,
 }
 

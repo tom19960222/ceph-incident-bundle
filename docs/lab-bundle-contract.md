@@ -1,22 +1,25 @@
 # Real-Lab Bundle Contract 與 Stable-State Schema
 
-> 對應 issue #20（同 lab 的 shell／Python 四路 full collect gate）。
+> #20 先用同 lab 的 shell／Python 四路 full collect 建立此 contract；#22
+> post-cutover gate 以保存的 #21 shell baseline bundle 對新的一次 Python full collect
+> 套用同一份 normalizer。
 > 實作：`validation/lab_bundle.py`、`validation/lab_snapshot.py`、
 > `validation/lab_contract.py`；執行入口：`make validate-lab`。
 
-`make validate-lab` 在同一個 real lab 先後跑一次 shell reference full collect 與
-一次 Python candidate full collect，然後比較兩份 bundle，並比較兩次 collect 前後
-的 stable state。這份文件是那兩個比較「比什麼、刻意不比什麼」的唯一依據；擴大或
-縮小任一份清單，需要與改變 collector 行為相同等級的 review。
+`make validate-lab` 先驗證保存的 #21 PASS report、shell bundle hash 與 lab identity，
+再於同一個已驗證 lab 跑一次 Python full collect，然後比較兩份 bundle，並比較本次
+collect 前後的 stable state。這份文件是比較「比什麼、刻意不比什麼」的唯一依據；
+擴大或縮小任一份清單，需要與改變 collector 行為相同等級的 review。
 
 ## 為什麼 real-lab 比較不是 byte comparison
 
-Offline equivalence gate（`make test-differential`，issue #18，見
-[`differential-normalizer.md`](differential-normalizer.md)）已經證明：**同樣的
-輸入**進去，兩個實作吐出同樣的 bytes。它做得到，是因為它的世界是假的而且是凍結
-的。
+Cutover 前的 offline equivalence gate（當時的 `make test-differential`，issue #18，見
+[`differential-normalizer.md`](differential-normalizer.md)）曾證明：**同樣的輸入**
+進去，兩個實作吐出同樣的 bytes。該 target 隨 shell implementation 一起退役；這份
+reviewed normalizer 與保存的 PASS evidence 是它留下的 contract，不代表現行
+`make validate` 還會執行 shell。
 
-Real lab 兩者都不是。兩次 qualification collect 相隔數分鐘打在活的 cluster 上，
+Real lab 兩者都不是。保存的 shell collect 與本次 Python collect 打在活的 cluster 上，
 `ceph -s` 的數字本來就會不同，journal 本來就會多幾行。在那裡要求 evidence bytes
 完全相同不是嚴格，而是一道只能靠運氣通過的 gate。
 
@@ -29,7 +32,7 @@ Real lab 兩者都不是。兩次 qualification collect 相隔數分鐘打在活
 | 每個 node 的 `manifest.jsonl` | 同上，但只比對「兩邊都宣稱的那一面」，見下節 |
 | 每個 captured artifact 的 `# key: value` header | host、collector、timeout 與 truncation 標記——`# timeout` 逐字比對，qualification 工作機因此必須提供 timeout binary（[ADR 0011](adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md)） |
 | artifact body 是否解析得出 JSON | 「是不是 JSON」是實作決定的：把 evidence 包裝、截斷或重新序列化的 candidate 會在這裡現形 |
-| `environment.txt` 的選擇欄位 | `mode`、`seed`、`since`、`timeout`、`git_commit`、`ceph_source`、`ceph_runner`、`rook_source`、`prom_url`、`prom_jobs` |
+| `environment.txt` 的選擇欄位 | `mode`、`seed`、`since`、`timeout`、`ceph_source`、`ceph_runner`、`rook_source`、`prom_url`、`prom_jobs` |
 | `cluster/prometheus/dump-info.txt` 的決策欄位 | `since`、`step_seconds`、`job_regex`、`jobs_matched`、`truncated`；清單中的欄位缺失會明確記成 `None`，不會因文件變短而縮小比較範圍 |
 | `summary.txt` | `cluster_status`、`node_ok`、`node_failed`、`final_status` — partial collection 在這裡變成可觀測 |
 | SKIPPED／partial artifact 的分類 | 兩邊必須以同一個原因略過同一件事 |
@@ -43,6 +46,7 @@ covered。
 
 刻意**不**比較的：
 
+- `environment.txt` 的 `git_commit`。Post-cutover bundle 必然來自比保存 baseline 更新的 commit；要求字串相同會讓 cutover proof 永遠失敗。這不是丟掉 code provenance：固定的 #21 authority 同時驗證 baseline report SHA-256、完整 commit 與 shell bundle SHA-256，schema-v2 report 的 `code.commit` 另外記錄且要求本次 checkout clean，兩端都各自被鎖住。
 - Captured artifact 的 body 本身，**包含它的 JSON key path**。兩個實作都不「轉換」
   evidence：它們執行一條指令並逐字記錄輸出。Manifest 已經釘住是哪條指令、exit code
   是多少；兩份 manifest 一致，就代表兩個 body 是同一個 cluster 對同一個問題在兩個
@@ -172,7 +176,7 @@ source／runner 選擇也都不受影響。
 | `.../tmp.<random>[.<pid>]` → `<workdir>` | 工作機暫存目錄。兩邊命名法不同——reference 是 `tmp.<stamp>.$$`，candidate 是 `mkdtemp` 的後綴（字母表含 `_`）——這條規則必須兩種都吃完整，只吃掉一半會留下 `<workdir>.61493` 這種尾巴（#52） |
 | `start=<epoch>`／`end=<epoch>` → `start=<epoch-Ns>`／`end=<epoch>`，**僅限 artifact 落在 `cluster/prometheus/` 的 entry** | Prometheus query window 的兩端是採集起始時刻算出來的 epoch，兩次 run 必然不同。**窗口寬度 `N` 保留**：`dump-info.txt` 的 selected `since` 記錄 collector 宣告的 Evidence Window；manifest argv 的 `end - start` 則獨立證明它實際套用的秒數。兩者都要保留，才看得見「宣告 24h 卻查 12h」。已知代價是窗口的絕對錨點不再可觀測：寬度對、但把 `end` 算在錯誤時間基準上的 candidate 會靜默通過 |
 | 32 位 hex → `<invocation>` | node invocation identifier |
-| 各自的 `--out` 目錄與 run directory → `<bundle>`／`<run>` | 兩次 run 依定義寫在不同目錄 |
+| 各自的 `--out` 目錄與 run directory → `<bundle>`／`<run>` | 保存的 shell bundle 與本次 Python run 依定義位於不同目錄 |
 
 另外，`environment.txt` 只比對上表列出的選擇欄位。`created_utc` 是時鐘；
 `node_target_*`、`node_invocation_id_*`、`rook_namespace`、
@@ -189,7 +193,7 @@ Bundle 是本次 collect 產生的，但「我們做的」不是信任理由。`
 
 ## Stable-State Snapshot Schema（version 1）
 
-兩次 collect 之前取一次、之後取一次，兩者必須完全相同。Snapshot 只能包含
+本次 live Python collect 之前取一次、之後取一次，兩者必須完全相同。Snapshot 只能包含
 **stable identity 與 desired configuration**；whitelist 就是重點——列舉保留欄位，
 新版本新增的易變欄位不會突然讓 gate 失敗，而真正的 desired-state 變動也無法躲在
 沒人列舉的欄位裡。
@@ -216,7 +220,7 @@ Bundle 是本次 collect 產生的，但「我們做的」不是信任理由。`
 
 ## Remote Residue
 
-第一次 collect 前、第二次 collect 後，各對每個 inventory node 取一次
+本次 live Python collect 前、後，各對每個 inventory node 取一次
 `${TMPDIR:-/tmp}/ceph-incident-node.*`、`ceph-incident-node-*` 的列表與 helper
 process 列表。**只有期間新出現的**才算本次 run 的殘留；run 之前就存在的會被如實
 報告為 pre-existing，但不歸咎於本次 run。

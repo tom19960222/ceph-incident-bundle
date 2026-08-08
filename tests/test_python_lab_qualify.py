@@ -1,8 +1,8 @@
-"""The dual-run qualification harness, driven end to end against the fake lab.
+"""The post-cutover qualification harness, driven end to end against the fake lab.
 
-Every test here runs the real orchestration — preflight, shared inventory,
-snapshot, two collects, verification, coverage, comparison, residue — and changes
-exactly one thing to prove the corresponding gate is load-bearing.
+Every test here runs the real orchestration — pinned baseline, preflight, shared
+inventory, snapshot, one live collect, verification, coverage, comparison and
+residue — and changes exactly one thing to prove its gate is load-bearing.
 """
 
 from __future__ import annotations
@@ -15,7 +15,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import validation.lab_qualify as lab_qualify
 from tests.lab_fixture import FakeLab, fake_entrypoints
+from tests.test_python_lab_baseline import authority_for, write_baseline
 from validation.lab_artifacts import purge_artifacts, scan_artifacts
 from validation.lab_report import CodeIdentity, report_from_qualification, write_report
 from validation.lab_qualify import (
@@ -46,6 +48,10 @@ class QualifyTestCase(unittest.TestCase):
         **knobs: str,
     ):
         profile = profile or self.lab.write_profile()
+        baseline_report, baseline_bundle = write_baseline(
+            self.root, self.lab, profile
+        )
+        authority = authority_for(baseline_report, baseline_bundle)
         run_directory = self.runs / run_id
         run_directory.mkdir(mode=0o700, exist_ok=True)
         environment = self.lab.environment(
@@ -53,11 +59,17 @@ class QualifyTestCase(unittest.TestCase):
             FAKE_LAB_KUBECTL_LOG=str(self.kubectl_log),
             **knobs,
         )
-        with mock.patch.dict(os.environ, environment):
+        with (
+            mock.patch.dict(os.environ, environment),
+            mock.patch(
+                "validation.lab_baseline.ISSUE_21_BASELINE", authority
+            ),
+        ):
             return qualify(
                 profile,
+                baseline_report=baseline_report,
                 run_directory=run_directory,
-                entrypoints=fake_entrypoints(),
+                entrypoints=fake_entrypoints(("python",)),
                 collect_timeout=120,
                 repository_root=checkout or self.lab.checkout(),
             )
@@ -67,7 +79,7 @@ class QualifyTestCase(unittest.TestCase):
 
 
 class PassingGateTests(QualifyTestCase):
-    def test_a_clean_lab_and_two_equivalent_collects_pass(self) -> None:
+    def test_a_clean_lab_and_equivalent_baseline_and_live_bundle_pass(self) -> None:
         result = self.run_gate()
         self.assertEqual(result.status, STATUS_PASS, result.blocked_reason)
         self.assertTrue(result.ok)
@@ -79,6 +91,7 @@ class PassingGateTests(QualifyTestCase):
             [
                 "code-identity",
                 "read-only-opt-ins",
+                "baseline-evidence",
                 "profile-state",
                 "credential-paths",
                 "ssh-fingerprints",
@@ -86,21 +99,23 @@ class PassingGateTests(QualifyTestCase):
                 "ceph-identity",
                 "rook-identity",
                 "prometheus-readiness",
+                "baseline-identity",
                 "shared-inventory",
                 "stable-state-pre",
                 "residue-baseline",
-                "collect-shell",
-                "collector-coverage-shell",
+                "code-identity-pre-collect",
                 "collect-python",
                 "collector-coverage-python",
+                "workstation-cleanup-python",
                 "bundle-comparison",
                 "stable-state-post",
                 "remote-residue",
+                "code-identity-final",
             ],
         )
         self.assertTrue(all(check.ok for check in result.checks))
 
-    def test_records_both_runs_with_coverage_verify_and_a_bundle_hash(self) -> None:
+    def test_records_baseline_and_live_bundle_with_coverage_verify_and_hash(self) -> None:
         result = self.run_gate()
         self.assertEqual([run.implementation for run in result.runs], ["shell", "python"])
         for run in result.runs:
@@ -124,22 +139,159 @@ class PassingGateTests(QualifyTestCase):
     def test_a_pass_still_names_exactly_one_next_action(self) -> None:
         result = self.run_gate()
         self.assertNotIn("\n", result.next_action)
-        self.assertIn("#21", result.next_action)
+        self.assertIn("#22", result.next_action)
         self.assertIn(str(result.run_directory), result.next_action)
 
-    def test_keeps_each_invocations_command_ledger_beside_its_bundle(self) -> None:
+    def test_keeps_the_live_invocations_command_ledgers_beside_its_bundle(self) -> None:
         result = self.run_gate()
-        for implementation in ("shell", "python"):
-            collect_log = result.run_directory / implementation / "collect.log"
-            verify_log = result.run_directory / implementation / "verify.log"
-            self.assertTrue(collect_log.is_file())
-            self.assertIn("# exit: 0", collect_log.read_text(encoding="utf-8"))
-            self.assertIn("VERIFY PASS", verify_log.read_text(encoding="utf-8"))
-            self.assertEqual(stat.S_IMODE(collect_log.stat().st_mode), 0o600)
+        collect_log = result.run_directory / "python" / "collect.log"
+        verify_log = result.run_directory / "python" / "verify.log"
+        self.assertTrue(collect_log.is_file())
+        self.assertIn("# exit: 0", collect_log.read_text(encoding="utf-8"))
+        self.assertIn("VERIFY PASS", verify_log.read_text(encoding="utf-8"))
+        self.assertEqual(stat.S_IMODE(collect_log.stat().st_mode), 0o600)
+
+
+class PostCutoverGateTests(QualifyTestCase):
+    def run_post_cutover(self, **knobs: str):
+        profile = self.lab.write_profile()
+        baseline_report, baseline_bundle = write_baseline(
+            self.root, self.lab, profile
+        )
+        authority = authority_for(baseline_report, baseline_bundle)
+        run_directory = self.runs / "post-cutover"
+        run_directory.mkdir(mode=0o700)
+        environment = self.lab.environment(
+            FAKE_LAB_SSH_LOG=str(self.ssh_log),
+            FAKE_LAB_KUBECTL_LOG=str(self.kubectl_log),
+            **knobs,
+        )
+        with (
+            mock.patch.dict(os.environ, environment),
+            mock.patch(
+                "validation.lab_baseline.ISSUE_21_BASELINE", authority
+            ),
+        ):
+            result = qualify(
+                profile,
+                baseline_report=baseline_report,
+                run_directory=run_directory,
+                entrypoints=fake_entrypoints(("python",)),
+                collect_timeout=120,
+                repository_root=self.lab.checkout(),
+            )
+        return result, baseline_bundle
+
+    def test_one_python_collect_is_compared_with_the_preserved_shell_baseline(self) -> None:
+        result, baseline_bundle = self.run_post_cutover()
+        run_directory = result.run_directory
+
+        self.assertEqual(result.status, STATUS_PASS, result.blocked_reason)
+        self.assertEqual(
+            [run.implementation for run in result.runs], ["shell", "python"]
+        )
+        self.assertEqual(Path(result.runs[0].bundle_path or ""), baseline_bundle)
+        self.assertTrue((run_directory / "python" / "collect.log").is_file())
+        self.assertFalse((run_directory / "shell").exists())
+        self.assertEqual(result.comparison.result, "equivalent")
+        checks = [check.name for check in result.checks]
+        self.assertLess(checks.index("baseline-evidence"), checks.index("profile-state"))
+        self.assertIn("workstation-cleanup-python", checks)
+        document = report_from_qualification(
+            result, code=CodeIdentity("2" * 40, dirty=False)
+        ).document()
+        self.assertEqual(document["baseline"]["status"], "pass")
+        self.assertEqual(document["baseline"]["code_commit"], "1" * 40)
+        self.assertEqual(
+            document["baseline"]["shell_bundle_path"], str(baseline_bundle)
+        )
+
+    def test_a_successful_collect_with_a_local_owned_workdir_cannot_pass(self) -> None:
+        result, _ = self.run_post_cutover(FAKE_COLLECT_LOCAL_RESIDUE_python="1")
+
+        self.assertEqual(result.status, "workstation-residue")
+        self.assertIn("tmp.python01", result.blocked_reason or "")
+        self.assertEqual(result.comparison.result, "not-run")
 
 
 class SharedInputTests(QualifyTestCase):
-    def test_both_implementations_receive_the_same_derived_inventory(self) -> None:
+    def test_checkout_change_after_pre_snapshot_stops_before_collect(self) -> None:
+        checkout = self.lab.checkout()
+        real_capture = lab_qualify.capture_stable_state
+        captures = 0
+
+        def capture_then_edit(*args, **kwargs):
+            nonlocal captures
+            snapshot = real_capture(*args, **kwargs)
+            captures += 1
+            if captures == 1:
+                (checkout / "collector.py").write_text(
+                    "# changed after preflight\n", encoding="utf-8"
+                )
+            return snapshot
+
+        with mock.patch(
+            "validation.lab_qualify.capture_stable_state",
+            side_effect=capture_then_edit,
+        ):
+            result = self.run_gate(checkout=checkout)
+
+        self.assertEqual(result.status, "code-identity-unclear")
+        self.assertFalse((result.run_directory / "python").exists())
+
+    def test_checkout_change_after_residue_check_cannot_return_pass(self) -> None:
+        checkout = self.lab.checkout()
+        real_check = lab_qualify._Qualification._check_residue
+
+        def check_then_edit(qualification, *args, **kwargs):
+            result = real_check(qualification, *args, **kwargs)
+            if result is None:
+                (checkout / "collector.py").write_text(
+                    "# changed before PASS\n", encoding="utf-8"
+                )
+            return result
+
+        with mock.patch.object(
+            lab_qualify._Qualification,
+            "_check_residue",
+            new=check_then_edit,
+        ):
+            result = self.run_gate(checkout=checkout)
+
+        self.assertEqual(result.status, "code-identity-unclear")
+        self.assertTrue(all(entry.result == "clean" for entry in result.residue))
+
+    def test_report_guard_rejects_a_commit_change_after_gate_return(self) -> None:
+        result = self.run_gate()
+
+        guarded = result.enforce_report_code_identity(
+            CodeIdentity("f" * 40, dirty=False)
+        )
+
+        self.assertEqual(guarded.status, "code-identity-unclear")
+        self.assertFalse(guarded.checks[-1].ok)
+        self.assertEqual(guarded.checks[-1].name, "code-identity-report")
+
+    def test_the_api_requires_a_baseline_before_any_lab_probe(self) -> None:
+        profile = self.lab.write_profile()
+        run_directory = self.runs / "missing-baseline"
+        run_directory.mkdir(mode=0o700)
+
+        with (
+            mock.patch(
+                "validation.lab_qualify.preflight",
+                side_effect=AssertionError("must not touch the lab"),
+            ),
+            self.assertRaisesRegex(TypeError, "baseline_report"),
+        ):
+            qualify(
+                profile,
+                run_directory=run_directory,
+                entrypoints=fake_entrypoints(),
+                repository_root=self.lab.checkout(),
+            )
+
+    def test_baseline_and_live_bundle_record_the_same_derived_inventory(self) -> None:
         # The fixture rejects anything outside the qualification vector, so a run
         # reaching the comparison already proves both got the same shape; this
         # pins the inventory content the two bundles were built from.
@@ -155,21 +307,19 @@ class SharedInputTests(QualifyTestCase):
         self.assertIn("--no-trust-ssh-host-key", QUALIFICATION_ARGUMENTS)
 
     def test_an_exported_opt_in_cannot_reach_the_collectors(self) -> None:
-        # The shell reference initialises `--allow-cephadm-shell` *from* this
-        # variable, so an operator who happens to have it exported would get a
-        # qualification run that may start a container.  The fake collect refuses
-        # the run outright if the variable survives.
+        # Python uses other `CEPH_INCIDENT_*` variables for test-only safety
+        # limits and source overrides. The fake collect refuses the run outright
+        # if any variable in that namespace survives the scrubbed environment.
         result = self.run_gate(
             CEPH_INCIDENT_ALLOW_CEPHADM_SHELL="1",
             CEPH_INCIDENT_ALLOW_KUBECTL_EXEC="1",
             CEPH_INCIDENT_TEST_BUNDLE_SAFETY_CAP_BYTES="1",
         )
         self.assertEqual(result.status, STATUS_PASS, result.blocked_reason)
-        for implementation in ("shell", "python"):
-            log = (result.run_directory / implementation / "collect.log").read_text(
-                encoding="utf-8"
-            )
-            self.assertIn("# exit: 0", log)
+        log = (result.run_directory / "python" / "collect.log").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("# exit: 0", log)
 
     def test_a_modified_checkout_never_reaches_a_collect(self) -> None:
         # A report says "these two implementations agreed" and names a commit; a
@@ -179,11 +329,8 @@ class SharedInputTests(QualifyTestCase):
         self.assertIn("collector.py", result.blocked_reason or "")
         self.assertFalse((result.run_directory / "shell").exists())
 
-    def test_the_production_entrypoints_are_the_real_two_implementations(self) -> None:
-        shell, python = default_entrypoints()
-        self.assertEqual(shell.implementation, "shell")
-        self.assertTrue(shell.collect[-1].endswith("run/collect.sh"))
-        self.assertTrue(shell.verify[-1].endswith("lib/verify-bundle.sh"))
+    def test_the_production_entrypoint_is_the_python_implementation(self) -> None:
+        (python,) = default_entrypoints()
         self.assertEqual(python.implementation, "python")
         self.assertEqual(python.collect[-1], "collect")
         self.assertEqual(python.verify[-1], "verify")
@@ -214,20 +361,13 @@ class IdentityGateTests(QualifyTestCase):
 
 
 class CollectGateTests(QualifyTestCase):
-    def test_a_failing_reference_collect_stops_before_the_candidate_runs(self) -> None:
-        result = self.run_gate(FAKE_COLLECT_EXIT_shell="2")
-        self.assertEqual(result.status, "collect-failed")
-        self.assertFalse(self.checks(result)["collect-shell"])
-        self.assertNotIn("collect-python", self.checks(result))
-        self.assertFalse((result.run_directory / "python").exists())
-
-    def test_a_candidate_that_produces_no_bundle_fails(self) -> None:
+    def test_a_live_collect_that_produces_no_bundle_fails(self) -> None:
         result = self.run_gate(FAKE_COLLECT_NO_BUNDLE_python="1")
         self.assertEqual(result.status, "collect-failed")
         self.assertIn("0 bundle(s)", result.blocked_reason or "")
 
     def test_a_stopped_gate_still_reports_both_implementations(self) -> None:
-        result = self.run_gate(FAKE_COLLECT_EXIT_shell="2")
+        result = self.run_gate(FAKE_COLLECT_EXIT_python="2")
         self.assertEqual([run.implementation for run in result.runs], ["shell", "python"])
         self.assertIsNone(result.runs[1].exit_code)
         self.assertEqual(result.runs[1].verify_result, "not-run")
@@ -250,9 +390,9 @@ class RetainedWorkdirTests(QualifyTestCase):
     """
 
     def test_a_failed_collect_keeps_everything_it_produced(self) -> None:
-        result = self.run_gate(FAKE_COLLECT_EXIT_shell="2")
+        result = self.run_gate(FAKE_COLLECT_EXIT_python="2")
         self.assertEqual(result.status, "collect-failed")
-        output = result.run_directory / "shell"
+        output = result.run_directory / "python"
         self.assertTrue(output.is_dir())
         self.assertTrue((output / "collect.log").is_file())
         self.assertEqual(len(sorted(output.glob("ceph-incident-*.tar.gz"))), 1)
@@ -271,13 +411,13 @@ class RetainedWorkdirTests(QualifyTestCase):
             "validation.lab_artifacts.purge_artifacts",
             side_effect=AssertionError("the gate must never purge its own workdir"),
         ):
-            self.assertEqual(self.run_gate(FAKE_COLLECT_EXIT_shell="2").status,
+            self.assertEqual(self.run_gate(FAKE_COLLECT_EXIT_python="2").status,
                              "collect-failed")
 
     def test_reclaiming_a_failed_run_keeps_its_report_and_ledgers(self) -> None:
         # Under the run id `reserve_run_directory` really gives a run: the
         # cleanup only ever looks inside directories of that exact shape.
-        result = self.run_gate(run_id="20260801T230957Z", FAKE_COLLECT_EXIT_shell="2")
+        result = self.run_gate(run_id="20260801T230957Z", FAKE_COLLECT_EXIT_python="2")
         write_report(
             self.runs,
             report_from_qualification(result, code=CodeIdentity("0" * 40, dirty=False)),
@@ -294,9 +434,9 @@ class RetainedWorkdirTests(QualifyTestCase):
         purged = purge_artifacts(self.runs, confirmed=True, keep=0)
         self.assertTrue(purged.ok)
         self.assertEqual(sorted(item.name for item in result.run_directory.iterdir()),
-                         ["report.json", "report.md", "shell"])
+                         ["python", "report.json", "report.md"])
         self.assertEqual(
-            sorted(item.name for item in (result.run_directory / "shell").iterdir()),
+            sorted(item.name for item in (result.run_directory / "python").iterdir()),
             ["collect.log"],
         )
 
@@ -308,41 +448,34 @@ class CoverageGateTests(QualifyTestCase):
         self.assertIn("prometheus=missing", result.blocked_reason or "")
         self.assertEqual(result.comparison.result, "not-run")
 
-    def test_the_reference_missing_a_path_stops_before_the_candidate_runs(self) -> None:
-        # A second full collect would touch every node in the lab again to prove
-        # something the report can already say.
-        result = self.run_gate(FAKE_COLLECT_DROP_shell="prometheus")
-        self.assertEqual(result.status, "coverage-incomplete")
-        self.assertNotIn("collect-python", self.checks(result))
-        self.assertFalse((result.run_directory / "python").exists())
-
     def test_a_documented_skip_is_still_incomplete_coverage(self) -> None:
-        result = self.run_gate(FAKE_COLLECT_SKIP_shell="rook")
+        result = self.run_gate(FAKE_COLLECT_SKIP_python="rook")
         self.assertEqual(result.status, "coverage-incomplete")
         self.assertIn("rook=skipped", result.blocked_reason or "")
 
     def test_a_node_without_var_log_fails_the_gate(self) -> None:
-        result = self.run_gate(FAKE_COLLECT_DROP_shell="varlog")
+        result = self.run_gate(FAKE_COLLECT_DROP_python="varlog")
         self.assertEqual(result.status, "coverage-incomplete")
         self.assertIn("var_log=mon02=missing, monitor01=missing, osd01=missing", result.blocked_reason or "")
 
 
 class ComparisonGateTests(QualifyTestCase):
-    def test_live_cluster_drift_between_the_two_runs_is_not_a_difference(self) -> None:
+    def test_live_cluster_drift_between_baseline_and_current_is_not_a_difference(self) -> None:
         # The fixture stamps a different clock and a different counter into every
-        # bundle, exactly as a live cluster would between two collects.
+        # bundle, exactly as a live cluster would between the preserved baseline
+        # and the current collect.
         result = self.run_gate()
         self.assertEqual(result.comparison.result, "equivalent")
 
     def test_each_runs_own_output_directory_is_not_a_difference(self) -> None:
-        # The two collects must write somewhere different or they would overwrite
-        # each other, and both record artifacts by absolute path — so the paths
-        # differ by construction and must normalise to the same thing.
+        # The preserved bundle and current collect live in different output
+        # directories, and both record absolute artifact paths. Those paths must
+        # normalise to the same thing.
         result = self.run_gate()
         self.assertNotEqual(result.runs[0].bundle_path, result.runs[1].bundle_path)
         self.assertEqual(result.comparison.result, "equivalent")
 
-    def test_an_extra_candidate_artifact_fails_the_gate(self) -> None:
+    def test_an_extra_live_artifact_fails_the_gate(self) -> None:
         result = self.run_gate(FAKE_COLLECT_DIVERGE_python="extra-artifact")
         self.assertEqual(result.status, "bundle-comparison-failed")
         self.assertTrue(
@@ -406,7 +539,7 @@ class ResidueGateTests(QualifyTestCase):
 
     def test_a_collect_that_failed_part_way_still_owes_the_nodes_a_check(self) -> None:
         # This run produced no usable record at all, but it reached the nodes.
-        result = self.run_gate(FAKE_COLLECT_EXIT_shell="2")
+        result = self.run_gate(FAKE_COLLECT_EXIT_python="2")
         self.assertEqual(result.status, "collect-failed")
         self.assertEqual(len(result.residue), 3)
         self.assertTrue(all(entry.result == "clean" for entry in result.residue))

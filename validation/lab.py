@@ -6,16 +6,17 @@
     python3 -m validation.lab activate  --profile PATH --candidate PATH
                                         [--replace-active] [--json]
     python3 -m validation.lab preflight --profile PATH [--runs-dir PATH] [--json]
-    python3 -m validation.lab qualify   --profile PATH [--runs-dir PATH]
+    python3 -m validation.lab qualify   --profile PATH --baseline-report PATH
+                                        [--runs-dir PATH]
                                         [--collect-timeout SECONDS] [--json]
     python3 -m validation.lab clean     [--runs-dir PATH] [--keep N] [--json]
 
 `status` is local-only.  `discover` and `preflight` reach the lab with read-only
 queries, and `preflight` additionally requires `CEPH_INCIDENT_LAB_CONFIRM=1`
 because it is part of the qualification path.  `activate` writes the trusted
-profile and requires `CEPH_INCIDENT_LAB_ACTIVATE=1`.  `qualify` is the full
-dual-run gate behind `make validate-lab`; it runs two real collects and therefore
-requires the same explicit confirmation as the preflight.  `clean` is local-only
+profile and requires `CEPH_INCIDENT_LAB_ACTIVATE=1`. `qualify` validates the
+preserved shell baseline and runs one real Python collect, so it requires the
+same explicit confirmation as the preflight. `clean` is local-only
 too, and is the one command that deletes: it reclaims what earlier runs left
 behind, needs `CEPH_INCIDENT_LAB_CLEAN=1` to remove anything, and takes no
 profile at all — an artifact root is the only thing that can name what it
@@ -46,7 +47,11 @@ from validation.lab_commands import (
 from validation.lab_discovery import discover
 from validation.lab_preflight import preflight
 from validation.lab_profile import LabProfileError
-from validation.lab_qualify import DEFAULT_COLLECT_TIMEOUT_SECONDS, qualify
+from validation.lab_qualify import (
+    DEFAULT_COLLECT_TIMEOUT_SECONDS,
+    qualification_code_identity,
+    qualify,
+)
 from validation.lab_report import (
     ReportRejected,
     code_identity,
@@ -72,7 +77,8 @@ USAGE = """Usage:
   python3 -m validation.lab activate --profile PATH --candidate PATH
       [--replace-active] [--json]
   python3 -m validation.lab preflight --profile PATH [--runs-dir PATH] [--json]
-  python3 -m validation.lab qualify --profile PATH [--runs-dir PATH]
+  python3 -m validation.lab qualify --profile PATH --baseline-report PATH
+      [--runs-dir PATH]
       [--collect-timeout SECONDS] [--json]
   python3 -m validation.lab clean [--runs-dir PATH] [--keep N] [--json]"""
 
@@ -227,7 +233,7 @@ def _preflight(options: dict[str, object]) -> int:
 def _qualify(options: dict[str, object]) -> int:
     if os.environ.get(PREFLIGHT_CONFIRMATION_VARIABLE) != "1":
         sys.stderr.write(
-            "error: the real-lab gate runs two full collects against the lab and "
+            "error: the real-lab gate runs one Python full collect against the lab and "
             f"must be confirmed explicitly\nnext action: re-run with "
             f"{PREFLIGHT_CONFIRMATION_VARIABLE}=1\n"
         )
@@ -235,8 +241,8 @@ def _qualify(options: dict[str, object]) -> int:
     profile_path: Path = options["profile"]  # type: ignore[assignment]
     runs_directory: Path = options["runs_directory"]  # type: ignore[assignment]
     try:
-        # The run directory is reserved before anything runs: the two bundles and
-        # both command ledgers live beside the report they are evidence for.
+        # The run directory is reserved before anything runs: the Python bundle
+        # and command ledgers live beside the report they are evidence for.
         run_directory = reserve_run_directory(runs_directory)
     except OSError as error:
         sys.stderr.write(f"error: cannot create a run directory: {error}\n")
@@ -245,13 +251,16 @@ def _qualify(options: dict[str, object]) -> int:
         result = qualify(
             profile_path,
             run_directory=run_directory,
+            baseline_report=options["baseline_report"],  # type: ignore[arg-type]
             collect_timeout=int(options["collect_timeout"]),  # type: ignore[arg-type]
         )
     except LabProfileError as error:
         return _report_unusable_profile(
             profile_path, error, runs_directory, directory=run_directory
         )
-    report = report_from_qualification(result, code=code_identity(REPOSITORY_ROOT))
+    final_code = qualification_code_identity(REPOSITORY_ROOT)
+    result = result.enforce_report_code_identity(final_code)
+    report = report_from_qualification(result, code=final_code)
     location = write_report(runs_directory, report, directory=run_directory)
     summary = result.summary()
     summary["report_directory"] = str(location.directory)
@@ -326,6 +335,7 @@ def _parse(argv: list[str]) -> dict[str, object]:
         "command": command,
         "profile": None,
         "candidate": None,
+        "baseline_report": None,
         "runs_directory": DEFAULT_RUNS_DIRECTORY,
         "replace_candidate": False,
         "replace_active": False,
@@ -375,7 +385,13 @@ def _parse(argv: list[str]) -> dict[str, object]:
             values["keep"] = int(value)
             index += 2
             continue
-        if option in ("--profile", "--candidate", "--candidate-out", "--runs-dir"):
+        if option in (
+            "--profile",
+            "--candidate",
+            "--candidate-out",
+            "--baseline-report",
+            "--runs-dir",
+        ):
             if index + 1 >= len(rest):
                 raise UsageError(f"{option} requires a value")
             value = rest[index + 1]
@@ -387,6 +403,10 @@ def _parse(argv: list[str]) -> dict[str, object]:
                         "the artifact root given by --runs-dir"
                     )
                 values["profile"] = _absolute(option, value)
+            elif option == "--baseline-report":
+                if command != "qualify":
+                    raise UsageError(f"{option} is not valid for {command}")
+                values["baseline_report"] = _absolute(option, value)
             elif option == "--runs-dir":
                 # `clean` is the one command that deletes, so it names its root
                 # outright rather than inheriting whatever the caller's cwd made
@@ -408,6 +428,8 @@ def _parse(argv: list[str]) -> dict[str, object]:
         raise UsageError("--profile is required")
     if command == "activate" and values["candidate"] is None:
         raise UsageError("--candidate is required for activate")
+    if command == "qualify" and values["baseline_report"] is None:
+        raise UsageError("--baseline-report is required for qualify")
     return values
 
 

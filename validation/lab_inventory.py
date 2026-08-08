@@ -1,11 +1,9 @@
-"""The inputs both Collect implementations are handed: one inventory, one trust store.
+"""Derive the live Python collect's inventory and trust store from its Lab Profile.
 
-Qualification compares two collects of the same lab, so both have to be told
-about that lab in the same words.  Both inputs are therefore *derived* from the
-active Lab Profile once per run and thrown away with the run: a second,
-hand-maintained host list — or a second idea of which host keys to trust — is
-exactly what drifts, and a drifted input turns "the two implementations
-disagree" into "the two runs were asked different questions".
+Both inputs are *derived* from the active Lab Profile once per run and thrown
+away with the run. A second, hand-maintained host list — or a second idea of
+which host keys to trust — would let the live collect target a lab other than the
+one whose identity was compared with the preserved baseline.
 
 Only values the profile loader already validated are rendered, so nothing here
 can widen what the collect entrypoints accept.  Both files are local-only and
@@ -24,11 +22,11 @@ INVENTORY_NAME = "inventory.env"
 
 
 def render_inventory(profile: LabProfile) -> str:
-    """Render the shell inventory that describes exactly this profile's lab.
+    """Render the retained inventory grammar for exactly this profile's lab.
 
-    The shell reference sources this file and the Python candidate parses it, so
-    it stays inside the documented inventory grammar: quoted scalar assignments,
-    one `HOSTS=( "alias=address" )` block, and comments.
+    The Python collector parses this file. Its quoted scalar assignments, one
+    `HOSTS=( "alias=address" )` block and comments remain unchanged because issue
+    #22 does not change the public inventory language.
     """
 
     lines = [
@@ -47,7 +45,7 @@ def render_inventory(profile: LabProfile) -> str:
 
 
 def write_inventory(profile: LabProfile, directory: Path) -> Path:
-    """Write the shared inventory into one run's workspace and return its path."""
+    """Write the live collect's inventory into its workspace and return its path."""
 
     path = directory / INVENTORY_NAME
     write_owner_only(path, render_inventory(profile))
@@ -57,8 +55,8 @@ def write_inventory(profile: LabProfile, directory: Path) -> Path:
 def write_known_hosts_home(directory: Path, host_key_lines: tuple[str, ...]) -> Path:
     """Build the collector-owned HOME whose `.ssh/known_hosts` pins the lab.
 
-    Both entrypoints fall back to `$HOME/.ssh/known_hosts` when host-key trust is
-    *not* delegated to them, so handing them a HOME that contains only the keys
+    The Python entrypoint falls back to `$HOME/.ssh/known_hosts` when host-key trust is
+    *not* delegated to it, so handing it a HOME that contains only the keys
     the active profile already trusts is how qualification gets strict host key
     checking without `accept-new` and without reading or writing the operator's
     own known_hosts.  A rotated key then fails the connection outright instead of

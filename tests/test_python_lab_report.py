@@ -14,6 +14,7 @@ from tests.lab_fixture import (
     fake_entrypoints,
     host_fingerprint,
 )
+from tests.test_python_lab_baseline import authority_for, write_baseline
 from validation.lab_preflight import preflight
 from validation.lab_qualify import qualify
 from validation.lab_report import (
@@ -64,6 +65,7 @@ class SchemaTests(unittest.TestCase):
             "profile",
             "lab_identity",
             "preflight",
+            "baseline",
             "runs",
             "comparison",
             "stable_state",
@@ -142,6 +144,7 @@ class MarkdownTests(unittest.TestCase):
             "## Status",
             "## Lab identity",
             "## Preflight",
+            "## Preserved baseline",
             "## Full collect runs",
             "## Bundle comparison",
             "## Stable state",
@@ -271,7 +274,7 @@ class PreflightReportTests(unittest.TestCase):
             parsed["lab_identity"]["hosts"][0]["ssh_fingerprints_verified"],
             [host_fingerprint("10.0.0.11")],
         )
-        self.assertEqual([run["implementation"] for run in parsed["runs"]], ["shell", "python"])
+        self.assertEqual([run["implementation"] for run in parsed["runs"]], ["python"])
         self.assertEqual(parsed["comparison"]["result"], "not-run")
         self.assertEqual(len(parsed["residue"]), 3)
         self.assertIn("make validate-lab", parsed["next_action"])
@@ -321,7 +324,7 @@ class PreflightReportTests(unittest.TestCase):
 
 
 class QualificationReportTests(unittest.TestCase):
-    """One dual-run attempt's report, written from the harness's own result."""
+    """One post-cutover attempt's report, written from the harness result."""
 
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
@@ -334,11 +337,22 @@ class QualificationReportTests(unittest.TestCase):
     def run_gate(self, **knobs: str):
         run_directory = self.runs / "20260731T000000Z"
         run_directory.mkdir(mode=0o700)
-        with mock.patch.dict(os.environ, self.lab.environment(**knobs)):
+        profile = self.lab.write_profile()
+        baseline_report, baseline_bundle = write_baseline(
+            self.root, self.lab, profile
+        )
+        authority = authority_for(baseline_report, baseline_bundle)
+        with (
+            mock.patch.dict(os.environ, self.lab.environment(**knobs)),
+            mock.patch(
+                "validation.lab_baseline.ISSUE_21_BASELINE", authority
+            ),
+        ):
             return qualify(
-                self.lab.write_profile(),
+                profile,
+                baseline_report=baseline_report,
                 run_directory=run_directory,
-                entrypoints=fake_entrypoints(),
+                entrypoints=fake_entrypoints(("python",)),
                 collect_timeout=120,
                 repository_root=self.lab.checkout(),
             )
@@ -367,6 +381,7 @@ class QualificationReportTests(unittest.TestCase):
             )
             self.assertTrue(all(value == "collected" for value in run["coverage"].values()))
         self.assertEqual(document["comparison"]["result"], "equivalent")
+        self.assertEqual(document["baseline"]["status"], "pass")
         self.assertEqual(document["stable_state"]["result"], "unchanged")
         self.assertEqual(document["stable_state"]["snapshot_schema_version"], 1)
         self.assertEqual(len(document["residue"]), 3)

@@ -1,4 +1,4 @@
-.PHONY: test check-python test-python test-differential shellcheck validate \
+.PHONY: test check-python test-python validate \
 	lab-status lab-profile-discover lab-profile-activate lab-preflight \
 	validate-lab lab-clean
 
@@ -7,8 +7,7 @@ PYTHON ?= python3
 # Job count for the sharded Python test runner; see tests/run-python-tests.sh.
 TEST_JOBS ?= auto
 
-test: check-python
-	bash tests/run-tests.sh
+test: test-python
 
 check-python:
 	@$(PYTHON) -c 'import sys; sys.exit("Python 3.11 or newer is required") if sys.version_info < (3, 11) else None'
@@ -16,16 +15,7 @@ check-python:
 test-python: check-python
 	PYTHON="$(PYTHON)" bash tests/run-python-tests.sh $(TEST_JOBS)
 
-# Offline observable-contract equivalence gate: the shell reference and the
-# Python candidate run the same scenarios in the same fake world and their
-# normalized contracts are compared. See docs/differential-normalizer.md.
-test-differential: check-python
-	$(PYTHON) -m unittest discover -s tests -p 'test_differential_*.py' -v
-
-shellcheck:
-	shellcheck lib/*.sh run/*.sh tests/*.sh tests/fixtures/*.sh tests/fixtures/python-node/bin/codec-command tests/fixtures/python-node/bin/node-command tests/fixtures/python-node/bin/tar-wrapper
-
-validate: check-python test test-python test-differential shellcheck
+validate: test-python
 
 # Real-lab workflow.  `lab-status` is local-only; the others are explicit opt-ins
 # that touch a lab or the trusted profile, and none of them is reachable from
@@ -45,14 +35,14 @@ lab-profile-activate: check-python require-lab-profile
 lab-preflight: check-python require-lab-profile
 	$(PYTHON) -m validation.lab preflight --profile "$(LAB_PROFILE)" $(LAB_ARGS)
 
-# The full real-lab gate: identity preflight, a pre-collection stable-state
-# snapshot, one shell reference full collect, one Python candidate full collect,
-# structural and content-safety verification of both bundles, the normalized
-# observable-contract comparison, the post-collection snapshot and the per-node
-# residue check.  It runs two real collects, so it needs the same explicit
+# The post-cutover real-lab gate validates the preserved #21 PASS report and
+# shell bundle, proves the active lab still has the same identity, runs one
+# Python full collect, compares normalized contracts, and checks stable state
+# plus local/remote residue. It needs the same explicit
 # confirmation as `lab-preflight` and is never reachable from `make validate`.
-validate-lab: check-python require-lab-profile
-	$(PYTHON) -m validation.lab qualify --profile "$(LAB_PROFILE)" $(LAB_ARGS)
+validate-lab: check-python require-lab-profile require-lab-baseline
+	$(PYTHON) -m validation.lab qualify --profile "$(LAB_PROFILE)" \
+		--baseline-report "$(LAB_BASELINE_REPORT)" $(LAB_ARGS)
 
 # Reclaim what earlier runs left behind.  A failed `validate-lab` keeps its
 # workdir on purpose and nothing deletes it automatically, so this is where the
@@ -66,3 +56,8 @@ lab-clean: check-python
 require-lab-profile:
 	@[ -n "$(LAB_PROFILE)" ] || { \
 		echo "LAB_PROFILE=/absolute/path/to/lab.toml is required" >&2; exit 1; }
+
+.PHONY: require-lab-baseline
+require-lab-baseline:
+	@[ -n "$(LAB_BASELINE_REPORT)" ] || { \
+		echo "LAB_BASELINE_REPORT=/absolute/path/to/report.json is required" >&2; exit 1; }

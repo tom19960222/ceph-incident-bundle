@@ -100,8 +100,8 @@ done < <(find "$ROOT/tests" -maxdepth 1 -name "$PATTERN" | sort)
 [[ ${#module_files[@]} -gt 0 ]] || fail "no test modules matched $PATTERN"
 
 # The shard list above deliberately stops at the top level, while serial
-# discovery also descends into package directories (`tests/differential/` has an
-# `__init__.py`).  A matching file anywhere deeper is refused outright: either
+# discovery also descends into package directories. A matching file anywhere
+# deeper is refused outright: either
 # the two paths would run different suites, or the file sits in a non-package
 # directory where neither path would run it — both are layouts to reject
 # loudly, not to paper over.

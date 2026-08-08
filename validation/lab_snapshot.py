@@ -1,7 +1,7 @@
 """The stable-state snapshot: proof that collecting evidence changed nothing.
 
-Qualification takes one snapshot before the first collect and one after the
-second, and requires them to be identical.  That comparison is only meaningful if
+Qualification takes one snapshot before the live Python collect and one after it,
+and requires them to be identical. That comparison is only meaningful if
 the snapshot holds *stable* state, so this module never compares a whole status
 dump: each source is reduced by an explicit projection that keeps identity and
 desired configuration and drops everything a healthy idle cluster changes on its
@@ -314,7 +314,7 @@ def _sort_key(entry: object) -> str:
     """Order projected entries deterministically.
 
     Ceph and Kubernetes both return unordered collections, so the snapshot sorts
-    by the entry's own canonical form: two runs that list the same objects in a
+    by the entry's own canonical form: two captures that list the same objects in a
     different order are the same stable state, and the gate must not call that a
     change.
     """

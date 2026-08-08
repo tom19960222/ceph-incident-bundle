@@ -284,7 +284,7 @@ class LabProber:
         The probe only reads: it never removes a workspace and never signals a
         process, because "make the check pass" is not a thing a residue check may
         be able to do.  Ownership is decided on the workstation by comparing this
-        listing with the one taken before the first collect.
+        listing with the one taken before the live Python collect.
         """
 
         code, out, err = _run(

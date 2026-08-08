@@ -1,197 +1,134 @@
 # Real-Lab Validation Runbook
 
-## Current Implementation Status
+## Current Status
 
-本文件定義 Python rewrite cutover 前的 real-lab validation 操作流程與 agent handoff 契約。
+Issue #21 produced auditable PASS evidence in run `20260805T155047Z` at commit
+`155e057`: shell and Python each completed a four-path collect, both bundles verified,
+their normalized contracts were equivalent, stable state was unchanged, and all seven nodes
+were residue-clean. Issue #22 removes the shell runtime and changes `make validate-lab` into the
+post-cutover proof:
 
-Issue #19 已實作 Lab Profile、status/discovery/activation workflow、strict identity preflight 與 Lab Validation Report foundation；issue #20 已實作 dual-run qualification harness。目前可用的介面：
+- report SHA-256: `e681f7fe662c1e08ab55f6812d9b444dc0fdb5b36580706372fc264dc124c11d`;
+- full commit: `155e057956974ae6b72ab53d76f71d96ab5f0e06`;
+- shell bundle SHA-256: `00b51641829b4fc535ad0a0f41ca4be519b22ea69688725e9e1d97a972abc64f`.
 
-- `make lab-status LAB_PROFILE=...` — 純本機狀態與唯一下一步。
-- `make lab-profile-discover LAB_PROFILE=...` — 唯讀 discovery，只產生 candidate。
-- `make lab-profile-activate LAB_PROFILE=... LAB_CANDIDATE=... CEPH_INCIDENT_LAB_ACTIVATE=1` — 顯式且留下稽核紀錄的 activation。
-- `make lab-preflight LAB_PROFILE=... CEPH_INCIDENT_LAB_CONFIRM=1` — strict identity preflight，寫出一份 Lab Validation Report。
-- `make validate-lab LAB_PROFILE=... CEPH_INCIDENT_LAB_CONFIRM=1` — 完整 real-lab gate。
-- `make lab-clean [CEPH_INCIDENT_LAB_CLEAN=1]` — 顯式回收先前 run 留下的 evidence 與 bundle；不帶確認時只列出會刪什麼。
+1. validate the preserved #21 `report.json` and shell bundle/hash locally;
+2. prove the active Lab Profile still resolves to the exact saved lab identity;
+3. run one Python four-path full collect;
+4. verify it and compare it with the saved shell baseline;
+5. prove stable state unchanged plus workstation and remote residue clean;
+6. write schema-v2 `report.md` and `report.json`.
 
-`lab-preflight` 通過**只證明 lab identity，不是 qualification evidence**；它產生的 report 中 collector coverage、兩次 full collect、bundle comparison、stable-state diff 與 residue 一律是 `not-run`。只有 `validate-lab` 寫出 `status: pass` 的 report 才是 qualification evidence。
-
-Harness 存在不等於 qualification 已經完成。**在真實 lab 執行 `make validate-lab` 並取得 `status: pass` 的 report 之前，不得宣告 Python candidate 已通過 real-lab gate**，也不得用手動拼接的一組長指令冒充正式 qualification。實際執行與 cutover 判定屬於 issue #21。
-
-Shell reference 的 Node Evidence Archive receiver 已由 issue #23 完成 pre-extraction hardening；這只解除 archive receiver prerequisite，不取代本 gate 的 strict identity、full-collect、stable-state 與 residue 條件。
+`lab-preflight` proves identity only. Only a post-cutover `validate-lab` report with
+`status: pass` proves the shipped Python-only commit against the preserved baseline.
 
 ## Non-Negotiable Safety Rules
 
-執行前必須先讀 [Operational Read-Only Safety Contract](read-only-safety.md)。摘要如下：
-
-- Collect 只能讀取 lab；不得改變 persistent config、service、package、mount、Ceph desired state 或 Kubernetes workload。
-- `cephadm shell` 與 `kubectl exec` 即使在一般 CLI 中保留明確 opt-in，也不屬於 qualification 的允許路徑。不要設定相關 flag 或環境變數。
-- Lab Profile 是 automation 唯一連線來源。永遠不要解析 `CEPH-LAB-CONNECTION.md`。
-- Profile 只引用 secret 的檔案路徑；不得把 private key、keyring、password、token 或 kubeconfig credential payload 寫進 profile、report、log 或 ticket。
-- Identity mismatch、coverage 不完整、bundle verify 失敗、stable-state diff 或 remote residue 都必須 fail closed。
-- 每份狀態或 validation report 只能產生一個 `next_action`。
+- Use only an explicitly selected, active TOML Lab Profile. Never parse
+  `CEPH-LAB-CONNECTION.md`.
+- Keep `cephadm shell` and `kubectl exec` unreachable. Python exposes neither opt-in.
+- Fail closed on profile state, credential permission, SSH fingerprint, hostname, Ceph/Rook
+  FSID, Prometheus endpoint or baseline identity mismatch.
+- Profiles/reports may name credential paths but never persist credential contents.
+- Never convert a partial collect, incomplete coverage, failed verify, changed stable field or
+  residue finding into PASS by rerunning or weakening a comparison.
+- A failed collect keeps its local evidence. Cleanup is a separate explicit operation after the
+  failure has been read.
 
 ## Agent Entry Point
 
-新 agent 不應依賴先前聊天記憶。接手時依序：
+Start local-only:
 
-1. 讀取根目錄 `AGENTS.md`、本 runbook、read-only safety contract、`CONTEXT.md` 與相關 ADR。
-2. 確認工作目錄、Git commit/dirty state 與預定的 Lab Profile 絕對路徑；不要把 local-only profile 加入 Git。
-3. 先執行 `make lab-status LAB_PROFILE=/absolute/path/to/lab.toml`（加 `LAB_ARGS=--json` 可取得 machine-readable 版本）。
-4. 只執行 status/report 提供的唯一 `next_action`。若它要求人工確認 candidate 或 identity 差異，停止並交給操作人員；不要自行信任新 identity。
-
-`lab-status` 是純讀取本機狀態的入口，不連線 lab、不改寫 active profile、不執行任何外部指令。它顯示 profile state/hash、missing identity、credential path 是否可用、待審 candidate、最近一次 activation 與 report、留存 run 產物的份數／合計體積／最舊的 run，以及唯一下一步；只顯示 credential **路徑**，不顯示內容。Exit code：`0` 表示可以繼續，`2` 表示被擋住且必須先做 `next_action`。
-
-留存 run 產物是**資訊**，不會變成 `next_action`：失敗時保留 workdir 是刻意的，累積多少只是要讓人看見，不能跟工作流程的下一步搶位置。回收是 `make lab-clean` 自己的顯式操作。
-
-`lab-status` 的下一步依序判斷：credential path 不可用 → 待審 candidate → bootstrap profile → candidate profile → 最近一次 report 的結果 → 可執行 preflight。Candidate 排在 profile state 之前，避免已經產出 candidate 的流程被反覆送回 discovery。
-
-可能的 `state`：`profile-missing`、`profile-invalid`、`profile-bootstrap`、`profile-candidate`、`credential-path-invalid`、`candidate-pending-review`、`last-attempt-failed`、`ready-for-preflight`、`preflight-passed`、`gate-passed`。最後三個 exit `0`，其餘 exit `2`。`preflight-passed` 的下一步是執行 `make validate-lab`；`gate-passed` 只有在 dual-run gate 寫出 `status: pass` 之後才會出現。
-
-## Lab Replacement Workflow
-
-Lab 隨時可能被刪除重建。新環境不能沿用舊 profile 的信任：
-
-1. 準備一份只含連線入口與 credential path 的 local-only bootstrap profile（`state = "bootstrap"`）；從 `validation/lab-bootstrap.example.toml` 複製，不要把聊天、Markdown connection note 當成 machine input。
-2. 執行 `make lab-profile-discover LAB_PROFILE=/absolute/path/to/bootstrap.toml`。
-3. Discovery 輸出獨立的 **Lab Profile Candidate**（預設 `<name>.candidate.toml`），不覆寫也不啟用 active profile。它只使用讀取型操作（`ssh-keyscan`、`hostname`、`ceph fsid`、本機 `kubectl get`、Prometheus readiness GET），並記錄 SSH fingerprints、Ceph/Rook FSID、hostnames/host map 與 Prometheus readiness。任一 identity 讀不到就完全不寫 candidate，只回報缺哪一項。
-4. 操作人員或被明確委託的 agent 比較 candidate 與預期拓撲、identity 和 credential paths。Discovery 會列出與輸入 profile 的每一項差異；檢查報告不含 credential content。
-5. 只有在差異被明確接受後，才執行 `make lab-profile-activate LAB_PROFILE=/absolute/path/to/lab.toml LAB_CANDIDATE=/absolute/path/to/lab.candidate.toml CEPH_INCIDENT_LAB_ACTIVATE=1`。Activation 不會由 discovery 或 validation 自動發生；覆蓋既有 active profile 需要再加 `LAB_ARGS=--replace-active`。每次 activation 會在 active profile 旁的 `lab-activation.log.jsonl` 追加一筆只含 identity 的稽核紀錄。
-6. 重新執行 `lab-status`。未啟用 candidate、缺少 expected identity、SSH fingerprint 或 FSID 不符時，下一步只能是修正/審核 profile，不能進入 collect。
-
-禁止以 `StrictHostKeyChecking=no`、自動接受所有新 fingerprint、skip identity check 或直接修改 expected FSID 的方式讓 gate 通過。Discovery 與 preflight 的每一條 SSH 連線都用 collector-owned known_hosts 搭配 `StrictHostKeyChecking=yes`，不讀也不寫操作人員自己的 `known_hosts`。
-
-## Lab Profile
-
-Schema 與可提交的 placeholder 範例見 `validation/lab-profile.example.toml`（active）與 `validation/lab-bootstrap.example.toml`（bootstrap）。要點：
-
-- `state` 只有 `bootstrap`、`candidate`、`active` 三種。只有 `bootstrap` 可以缺 identity；`candidate` 與 `active` 必須帶齊 Ceph/Rook FSID 與每台 host 的 hostname 與 SSH fingerprints，否則 loader 直接拒收。
-- Profile 必須同時描述四條 collector path 的入口（`[ceph] seed`、`[rook] kubeconfig_path`/`namespace`/`operator_namespace`、`[prometheus] url`、`[[hosts]]` host map），因為 qualification 要求四條路徑都完整。
-- 未知的 table 或 key 一律拒收，避免打錯字的 identity 欄位靜默失效。Profile 內出現任何 credential material（PEM header、kubeconfig credential 欄位等）也直接拒收。
-- `profile hash` 是 canonical content hash：註解與排版不影響它，identity 改變才會改變它。
-- 實際 profile 一律 local-only。Repository 只提供無秘密的 example，`.gitignore` 預設忽略 TOML。
-
-## Identity Preflight
-
-```text
-make lab-preflight LAB_PROFILE=/absolute/path/to/lab.toml CEPH_INCIDENT_LAB_CONFIRM=1
+```bash
+make lab-status LAB_PROFILE=/absolute/path/to/lab.toml
 ```
 
-依序檢查 profile state（必須 `active`）、credential paths（存在、是一般檔案、只有 owner 可讀，不讀內容）、SSH fingerprints、必要 hosts、Ceph FSID、Rook FSID、Prometheus readiness；第一個失敗的 stage 就停止，並輸出唯一的 `next_action`。Fingerprint 規則是「host 提供的每一把 key 都必須已經在 profile 裡」；profile 記錄了但 host 這次沒提供的 key 不算 mismatch。
+Follow its single `next_action`. A fresh or rebuilt lab still follows
+`lab-profile-discover` → human review → `lab-profile-activate` → `lab-preflight`.
+Do not edit recorded fingerprints/FSIDs to make a mismatch pass.
 
-每次執行都會寫一份 Lab Validation Report。**通過只代表 identity 正確，不是 qualification**；report 的 `status` 是 `preflight-pass` 而不是 `pass`，唯一的 `next_action` 是執行 `make validate-lab`。
+The post-cutover full gate additionally needs the saved #21 report:
 
-## Qualification Workflow
-
-正式入口為：
-
-```text
-make validate-lab LAB_PROFILE=/absolute/path/to/lab.toml CEPH_INCIDENT_LAB_CONFIRM=1
+```bash
+make validate-lab \
+  LAB_PROFILE=/absolute/path/to/lab.toml \
+  LAB_BASELINE_REPORT=/absolute/path/to/20260805T155047Z/report.json \
+  CEPH_INCIDENT_LAB_CONFIRM=1
 ```
 
-這個 target 保持明確 opt-in：它需要絕對 Lab Profile 路徑與 `CEPH_INCIDENT_LAB_CONFIRM=1`，不會被一般 `make validate`、日常 CI 或無確認的 agent 自動觸發。`LAB_ARGS='--collect-timeout <seconds>'` 可調整單次 full collect 的上限（預設 4 小時），`LAB_ARGS=--json` 取得 machine-readable 輸出。
+Both paths must be absolute. `LAB_ARGS='--runs-dir <path> --collect-timeout <seconds>'` may
+change only the local artifact root and stuck-run ceiling; it cannot change the fixed collect
+vector.
 
-工作機前置條件：執行前必須讓 `timeout`（或 macOS coreutils 的 `gtimeout`）可被 shell reference 的 `timeout_cmd()` 找到；macOS 上 `brew install coreutils` 即可。缺少時 reference 會在沒有外層單指令 timeout 的模式下收集，cluster capture 的 `# timeout` 標頭寫成 `unavailable`，gate 會在 bundle comparison 階段以標頭差異 fail closed（#52 那一輪實測 29 項；PR #55 修復 crash-info 後同一情境為 36 項）。collect-shell 階段的輸出開頭會有 reference 自己印的 `WARNING: no 'timeout'/'gtimeout' found`，不必等到 comparison 才發現。裁定與理由見 [ADR 0011](adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md)。
+## Gate Order
 
-Harness 依序完成下列狀態流程，第一個失敗的階段就停止（唯一例外是 §7 的 residue check）；沒有 skip flag、沒有 accept-current、也沒有重跑到過為止的路徑：
+The first failing stage stops later work, except remote residue is always checked after any
+collect starts.
 
-### 1. Local preflight
+1. **Code identity:** tracked files must match HEAD so the report names code that actually ran.
+2. **Read-only command surface:** fixed argv contains no side-effecting opt-in; inherited
+   `CEPH_INCIDENT_*` variables are stripped.
+3. **Baseline evidence:** report schema 1, `status: pass`, clean 40-character commit, matching
+   profile hash, equivalent comparison, unchanged stable state, clean residue, exactly one
+   verified/complete shell run, and a shell bundle whose current SHA-256 still matches.
+4. **Strict identity preflight:** active profile, owner-only credentials, pinned SSH keys,
+   required hostnames, Ceph/Rook FSIDs and Prometheus readiness.
+5. **Baseline identity:** current Ceph, Rook, Prometheus and host identity must exactly equal the
+   saved report before collection starts.
+6. **Pre snapshot and residue baseline:** capture stable state schema 1 and each node's existing
+   collector workspace/helper listing.
+7. **Python full collect:** fixed `--mode auto --kube-mode local --since 24h
+   --no-trust-ssh-host-key --redact`, plus profile inventory/key/Prometheus inputs. One invocation
+   must cover Ceph, Rook, Prometheus, every node and `/var/log`.
+8. **Verify and workstation cleanup:** bundle must pass Python structural/content verification;
+   the successful output directory may contain only the bundle plus `collect.log` and
+   `verify.log`—no `tmp.*` owned workdir.
+9. **Normalized comparison:** compare the preserved shell bundle with the new Python bundle
+   under [`lab-bundle-contract.md`](lab-bundle-contract.md).
+10. **Post proof:** stable state must be unchanged and no node may gain an attributable
+    workspace/helper process.
 
-- 確認 explicit confirmation、乾淨可辨識的 Git commit、active profile 與 profile hash。有任何 tracked file 與 HEAD 不同就 fail closed：report 會寫上一個 commit，而那個 commit 必須真的描述跑過的程式，否則這份 evidence 無法被重現或審核。Untracked 檔案不算——放在 repository 旁邊的 local-only Lab Profile 就是正常情況。
-- 驗證 profile schema 與所有 credential paths 的存在性/權限，只記錄 path 是否有效，不讀出或記錄 secret content。
-- 由 profile host map 產生一次性的 shared inventory，供 shell reference 與 Python candidate 共用；不得另外維護第二份手工 inventory。
-- 確認 qualification 沒有啟用 cephadm-shell、kubectl-exec 或其他有額外副作用的 opt-in。**argv 與 environment 兩條路都要檢查**：collector 會把 `CEPH_INCIDENT_ALLOW_*` 當成 flag 的預設值，把 `CEPH_INCIDENT_TEST_*` 當成 safety limit 的覆寫，所以整個 `CEPH_INCIDENT_` prefix 在兩次 invocation 前都會被清掉，不是信任啟動 gate 的那個 shell。
+Once a collect has started, remote residue runs even if verify, coverage, cleanup or comparison
+failed. A residue finding becomes the primary failure class while the earlier failed check remains
+in the report. The gate never auto-deletes remote residue.
 
-### 2. Strict lab identity preflight
+## Report Contract
 
-- 連線並比對 profile 中所有 SSH host fingerprints；不能在此階段自動更新信任資料。
-- 比對 Ceph FSID、Rook/external cluster FSID、必要 hostnames/host map 與 Prometheus endpoint identity/readiness。
-- 確認所有 inventory nodes 都是 supported/expected targets，且 direct Ceph CLI、本機 kubectl read operations、Prometheus HTTP GET 與 node SSH 安全路徑可用。
-- 任一缺值或 mismatch 立即停止，不執行 collect。報告只給一個修復 identity/profile 的 `next_action`。
+Every attempt reserves `results/lab-validation/<run-id>/` before touching the lab and writes
+owner-only `report.md` plus `report.json`; `LATEST` names that directory. Schema version 2 records:
 
-### 3. Pre-collection stable state snapshot
+- post-cutover commit/dirty state and active profile identity;
+- preserved report path/hash, baseline commit/profile hash and shell bundle path/hash;
+- baseline shell run and current Python run, verify result and five coverage fields;
+- normalized comparison differences;
+- stable-state schema/differences;
+- workstation cleanup check and per-node remote residue;
+- one exact status and one single-line `next_action`.
 
-在第一次 collect 前取得受控欄位的 snapshot。它包含足以偵測 persistent/desired-state mutation 的 stable identity 與 configuration：cluster FSID 與 monitor 位置、CRUSH 拓撲與權重、pool identity/redundancy、`ceph config` 的持久設定，以及 Rook CephCluster `spec` 與 Kubernetes workload 的 desired state。
+Collector stdout/stderr stays in `<run>/python/{collect,verify}.log`, not in the report. Report
+writing scans both formats for credential markers and fails closed. Anything not reached remains
+`not-run`.
 
-Snapshot schema 以 whitelist 明確排除會自然變動的 counter、epoch、timestamp、uptime、health history、request statistics、audit/access records 與非決定性排列；不使用整份未正規化的 status dump 做相等比較。逐欄位的定義與理由見 [`lab-bundle-contract.md`](lab-bundle-contract.md)。任一來源讀不到就 fail closed——殘缺的 snapshot 會和另一份殘缺的 snapshot 比對成功。
+## Artifact Cleanup
 
-### 4. Shell reference full collect
+A failed gate deliberately keeps evidence. After reading it:
 
-- 使用 active profile 產生的 shared inventory 與 qualification 固定參數（`--mode auto --kube-mode local --since 24h --no-trust-ssh-host-key --redact`，加上 profile 的 `--prom-url`），執行一次 shell reference collect。這組參數是常數而非操作人員輸入，`--allow-cephadm-shell` 與 `--allow-kubectl-exec` 因此不可能被帶進來。
-- Host key 信任來自 active profile：harness 用一個只含 profile 已信任 key 的 collector-owned `HOME/.ssh/known_hosts`，搭配 `--no-trust-ssh-host-key`，所以 collector 的 accept-new 模式不會被使用，操作人員自己的 `known_hosts` 也不會被讀寫。
-- 單一 invocation 必須同時收齊 Ceph、Rook、Prometheus、全部 inventory nodes 與 `/var/log`。
-- 保存 exit status、stdout bundle path、stderr/command ledger、coverage 與 invocation identifier。
-- Bundle 必須獨立通過 verify。Partial、缺少任一路徑、使用 default-off execution path 或 verify failure 都立即使 qualification 失敗；coverage 就在這一次 invocation 之後立刻判定，reference 少收一條路徑時不會再去跑第二次 full collect 把整個 lab 再碰一遍。
-
-### 5. Python candidate full collect
-
-- 使用與 shell reference 相同的 active profile identity、shared inventory、collector coverage 與語意等價參數，接著執行一次 Python candidate collect。
-- 同樣要求單一 invocation 收齊四條路徑並獨立通過 verify；不得重用 shell bundle 的 artifacts 補足 Python bundle。
-- 保存與 shell run 相同種類的 evidence，以供 normalized comparison。
-
-### 6. Safe archive handling and comparison
-
-- 所有 node archive 在解壓前依 read-only safety contract 驗證 traversal、link/special member、collision、完整性、manifest 與 payload cap；harness 讀取兩份 bundle 時同樣逐一檢查 member，遇到 link、special member、absolute path 或 traversal 直接 fail closed，且從不解壓到磁碟。
-- 比較兩份 bundle 的 normalized observable contract：CLI/exit semantics、collector coverage、artifact/path 與內容語意、manifest、SKIPPED/partial、runner/source 選擇和 cleanup 結果。
-- 不要求 tar member order、gzip header、mtime、JSON whitespace/key order、隨機 temp path 或 stderr 措辭 byte-identical。兩次 collect 相隔數分鐘打在活的 cluster 上，所以 captured artifact 的 body（counter、log 內容、sample，連 JSON key path 一起）也不比對——manifest 已經釘住是哪條指令、exit 是多少，body 是 cluster 的回答而不是 collector 的產物；byte-level 等價由 offline gate（#18）負責。逐項清單與理由見 [`lab-bundle-contract.md`](lab-bundle-contract.md)。
-
-### 7. Post-collection proof
-
-- 第二次 collect 完成後再次取得相同 schema 的 stable state snapshot，並與 pre-collection snapshot 比較。
-- 對每個 inventory node 執行 remote residue check：只有在兩次 collect 期間新出現的 workspace 或 helper process 才歸咎於本次 run，run 之前就存在的會如實報告為 pre-existing。Probe 只讀，不刪除任何 ownership 無法證明的資源，也不對 process 送 signal。
-- **只要有任何一次 collect 開始過，residue check 就一定會執行**，即使更早的階段已經失敗——那些正是最可能留下殘留的 run。Residue 一旦查到，它就取代先前的 failure class 成為回報結果：lab 被留髒是最需要先送到人手上的發現，而先失敗的那個階段仍然留在 report 的 checks 裡。
-- Stable-state diff 必須為空，且兩次 invocation 均不得有 remote workspace、payload、archive 或 helper process 殘留。
-
-只有 shell bundle、Python bundle、full coverage、normalized comparison、stable-state comparison 與 residue check 全部通過，qualification 才會標記 pass。
-
-## Lab Validation Report
-
-每次嘗試，不論 pass 或 fail，都應在 local-only validation output 中留下同一 run directory 內的 `report.md` 與 `report.json`，並由 local-only `LATEST` 指向該目錄。兩種格式必須表達相同結果，至少包含：
-
-- validation timestamp、Git commit、dirty-state indicator、profile path 的安全顯示、profile hash。
-- 已驗證的 SSH fingerprints、Ceph/Rook identity 與 host map 摘要，不含 secret。
-- shell 與 Python invocation 的 exit/result、bundle path/hash、verify result 與四條 collector coverage。
-- normalized bundle comparison 結果。
-- stable-state snapshot schema/version 與 diff 結果。
-- 每個 inventory node 的 remote residue result。
-- `status`：`pass` 或具體 failure class。
-- `next_action`：**恰好一個**具體動作。Pass 時也只能有一個下一步，例如進入指定 cutover ticket；不能放空陣列或建議清單。
-
-Report 不得包含 private key、keyring、password、token、Authorization header、kubeconfig credential payload、完整環境變數 dump 或 command stdin。若錯誤輸出可能帶 secret，應在寫入 report 前遮蔽，只保留定位問題所需的 bounded diagnostics。
-
-實作狀態：schema 由 issue #19 固定，writer 會在寫入前檢查兩件事並 fail closed——`next_action` 恰好一個非空單行字串，且兩種格式都不含 credential marker。Run directory 預設在 `results/lab-validation/<run-id>/`（`LAB_ARGS='--runs-dir <path>'` 可覆寫），`LATEST` 是同層記錄 run directory 名稱的檔案。
-
-`validate-lab` 會在任何動作之前先取得 run directory，因為兩份 bundle 與兩份 command ledger（`<run>/shell/`、`<run>/python/`，各含 `collect.log` 與 `verify.log`）就放在 report 旁邊。Collector 的 stdout/stderr 只寫進那些 local-only、owner-only 的 ledger，不進 report：report 在寫入前會被掃描 credential marker，而 collector 的 stderr 正是最可能夾帶意外診斷的地方。Gate 停在哪一階段，該階段之後的欄位就保持 `not-run`，所以 report 說得出「停在哪」而不只是「停了」。
-
-`lab-preflight` 的每一次嘗試都會留下 report，包含連 profile 都讀不進來的情況；那種 report 的 `profile.hash`／`state` 為 `null`，`preflight` 只有一筆失敗的 `profile-load`，`status` 是具體的 profile failure class。`lab-status` 只會沿用 report 記錄的 `next_action`，且只在它確實是單行非空字串時沿用；否則改用本機推導的下一步。
-
-## Run Artifact Cleanup
-
-失敗的 `validate-lab` 會保留整個 workdir——這是 read-only safety 契約刻意的行為：驗證失敗時保留現場，不產生看似完整的 bundle。**collect 與 verify 失敗時都不會有任何路徑自動刪除 workdir**，這一點由測試釘住。代價是每一次失敗都在磁碟上留下數 GB 到數十 GB，而且散落在各個 agent 自己的 worktree 底下。
-
-回收是獨立、顯式的操作：
-
-```text
-make lab-clean                             # 預覽：列出會刪什麼、能回收多少，不刪任何東西
-make lab-clean CEPH_INCIDENT_LAB_CLEAN=1   # 實際刪除
+```bash
+make lab-clean
+make lab-clean CEPH_INCIDENT_LAB_CLEAN=1
 ```
 
-規則：
+The first command is preview-only. The confirmed command keeps the newest run plus every report
+and command ledger by default; `LAB_ARGS='--keep N'` changes the count. `lab-clean` accepts no Lab
+Profile, never follows a root symlink, and only acts inside the explicit run-artifact root. It is
+never called by collect or validation.
 
-- **慣例**：跑完 `validate-lab` 且已判讀完失敗原因後，負責回收自己 worktree 的 run 產物。這是操作人員／agent 的一步，不是 gate 的一步。
-- 不帶 `CEPH_INCIDENT_LAB_CLEAN=1` 時只做預覽，exit `2`，唯一的 `next_action` 就是帶確認的同一道指令——比照 `lab-profile-activate` 的 opt-in 風格。
-- 預設保留**最近一次仍有產物的 run**（不論成敗）。`LAB_ARGS='--keep N'` 改保留最近 N 次，`--keep 0` 連最新的一起刪。只留 report 的 run（例如 preflight）不佔份數，也因此不會意外把剛失敗的那一輪擠出保留範圍。
-- 永遠保留 `report.md`、`report.json` 與每次 invocation 的 command ledger（`<run>/<impl>/collect.log`、`verify.log`）；`LATEST` 與 run directory 本身也保留，所以既有的 handoff 位址不會失效。要刪的是 collect 產出的 evidence 樹與 bundle。Activation ledger 放在 Lab Profile 旁邊，根本不在 run 產物根目錄裡，不可能被掃到。
-- 寫入邊界就是呼叫者指定的 run 產物根目錄，比照 Collector-Owned Workspace 的界線：`lab-clean` **不吃 `--profile`**，只認 `--runs-dir`（必須是絕對路徑，預設 `results/lab-validation/`）。它只看該目錄自己的直接子目錄、只認 `reserve_run_directory` 產生的 run id 形狀、且只認真正的目錄——根目錄下的 symlink 既不追進去也不刪除。沒有任何來自 profile、report、`LATEST` 或其他檔案的路徑能指定刪除目標。
-- Run 內部的 symlink 只會被 unlink，不會被追到它指向的地方。刪不掉的東西會如實回報為 `purge-incomplete`，不會被算進「已回收」。
+## Failure and Handoff
 
-## Failure and Handoff Rules
-
-- Identity/profile failure：不開始 collect；唯一 `next_action` 指向 profile review/discovery/activation 中的一步。
-- Read-only command-surface failure：立即停止後續 collection；保存安全的 command ledger，唯一 `next_action` 指向修正 collector 或 allowlist，不能要求重跑並略過檢查。
-- Bundle/coverage/comparison failure：shell implementation 保留，唯一 `next_action` 指向對應 artifact 或 differential failure 的調查。
-- Stable-state diff：視為可能的 read-only regression，停止 cutover；唯一 `next_action` 是 review 被改變的 stable field 與對應 command ledger。
-- Remote residue：停止 cutover，不做廣泛自動清理；唯一 `next_action` 是依 invocation ownership 資訊進行人工審核。
-- Agent handoff 必須提供 report directory 與 `LATEST` 狀態，不要只貼聊天摘要。接手 agent 從 `lab-status` 與唯一 `next_action` 繼續。
-- 判讀完失敗原因後依上節回收自己這輪的 run 產物；若交接時現場仍要留著，明確說明哪一個 run directory 還不能刪。
-
-Shell reference 必須保留到正式 qualification 通過且最終 cutover ticket 明確允許移除；本 runbook 本身不授權刪除 shell 或放寬任何 safety gate。
+- Baseline failure: do not touch the lab; restore/select the preserved #21 PASS report and bundle.
+- Identity failure: review/discover/activate the profile; never accept-current.
+- Collect/verify/coverage/workstation-cleanup/comparison failure: inspect the named local run;
+  do not recreate the removed shell implementation.
+- Stable-state difference: treat as a possible read-only regression and inspect the command ledger.
+- Remote residue: review only the invocation-owned paths/processes; do not broad-delete by prefix.
+- Handoff always names the report directory and `LATEST` state, not only a chat summary.

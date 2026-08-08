@@ -194,16 +194,6 @@ class ScenarioLedgerTests(unittest.TestCase):
                 self.assertEqual(declared.get(status), count)
         self.assertEqual(declared.get("合計"), len(self.rows))
 
-    def test_named_differential_scenarios_exist(self) -> None:
-        from tests.differential.scenarios import SCENARIOS
-
-        names = {scenario.name for scenario in SCENARIOS}
-        for identifier, (_, _, differential) in sorted(self.rows.items()):
-            if differential in ("", "—"):
-                continue
-            with self.subTest(scenario=identifier):
-                self.assertIn(differential, names)
-
     def test_every_scenario_has_a_clause_level_audit_record(self) -> None:
         self.assertEqual(set(audit_records()), set(self.inventory))
 

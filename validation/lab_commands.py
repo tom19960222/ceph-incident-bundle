@@ -30,7 +30,7 @@ CLEAN_TARGET = "lab-clean"
 QUALIFICATION_TARGET = "validate-lab"
 # Where a passing qualification hands off.  A report carries exactly one next
 # action, so even a pass names one ticket rather than a list of possibilities.
-CUTOVER_TICKET = "issue #21 (Python cutover qualification in the real lab)"
+CUTOVER_TICKET = "issue #22 (record the post-cutover PASS proof and close the cutover)"
 
 
 def status_command(profile: Path) -> str:
@@ -63,10 +63,15 @@ def preflight_command(profile: Path) -> str:
     )
 
 
-def qualify_command(profile: Path) -> str:
+def qualify_command(profile: Path, baseline_report: Path | None = None) -> str:
+    baseline = (
+        str(baseline_report)
+        if baseline_report is not None
+        else "/absolute/path/to/report.json"
+    )
     return (
         f"make {QUALIFICATION_TARGET} LAB_PROFILE={profile} "
-        f"{PREFLIGHT_CONFIRMATION_VARIABLE}=1"
+        f"LAB_BASELINE_REPORT={baseline} {PREFLIGHT_CONFIRMATION_VARIABLE}=1"
     )
 
 

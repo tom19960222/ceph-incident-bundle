@@ -1,14 +1,14 @@
-"""Reducing one real-lab bundle to the contract the two implementations must share.
+"""Reduce real-lab bundles to the preserved cross-implementation contract.
 
 What this compares, and why it is not a byte comparison
 -------------------------------------------------------
-The offline equivalence gate (`make test-differential`, issue #18) already proves
-that the shell reference and the Python candidate turn *the same inputs* into the
-same bytes; it can do that because its world is fake and frozen.  A real lab is
-neither.  The two qualification collects run minutes apart against a live
-cluster, so `ceph -s` genuinely reports different numbers and a journal genuinely
-has more lines in the second run.  Demanding identical evidence bytes there would
-not be strictness — it would be a gate that can only pass by accident.
+The retired offline equivalence gate (issue #18) proved that the shell reference
+and Python candidate turned *the same inputs* into the same bytes because its
+world was fake and frozen. A real lab is neither. The preserved shell baseline
+and the post-cutover Python collect were taken at different times, so `ceph -s`
+genuinely reports different numbers and a journal genuinely has more lines in the
+later run. Demanding identical evidence bytes there would not be strictness — it
+would be a gate that can only pass by accident.
 
 So this module compares the part of a bundle that must not depend on when it was
 taken:
@@ -83,7 +83,9 @@ ENVIRONMENT_NAME = "environment.txt"
 SUMMARY_NAME = "summary.txt"
 PROMETHEUS_DUMP_INFO_NAME = "cluster/prometheus/dump-info.txt"
 # `environment.txt` is where the run records which source and runner it chose, so
-# these keys are the comparison's view of source and runner selection.
+# these keys are the comparison's view of source and runner selection. `git_commit`
+# remains bundle provenance but is intentionally compared by the pinned baseline
+# record and schema-v2 report: a post-cutover bundle must come from a newer commit.
 # `created_utc` is the clock, and the candidate-only keys (`node_target_*`,
 # `node_invocation_id_*`, the Rook namespaces, `kube_context`) are the rewrite's
 # declared additional observability — see `docs/differential-normalizer.md`.
@@ -92,7 +94,6 @@ ENVIRONMENT_SELECTION_KEYS = (
     "seed",
     "since",
     "timeout",
-    "git_commit",
     "ceph_source",
     "ceph_runner",
     "rook_source",
