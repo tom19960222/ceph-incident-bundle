@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import venv
 from pathlib import Path
 
 
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_MODULES = ROOT / "tests" / "production-test-modules.txt"
 TOOLING_ONLY_MODULES = ROOT / "tests" / "tooling-only-test-modules.txt"
 OFFLINE_RUNNER = ROOT / "tests" / "run-offline-validation.sh"
+BASH = Path(shutil.which("bash") or "/bin/bash").resolve()
 
 
 def make_fake_python(
@@ -30,6 +32,7 @@ def make_fake_python(
         "import json\n"
         "import os\n"
         "import shutil\n"
+        "import subprocess\n"
         "import sys\n"
         "import types\n"
         f"role = {role!r}\n"
@@ -44,7 +47,11 @@ def make_fake_python(
         "    exec(code, {'__name__': '__main__'})\n"
         "    raise SystemExit(0)\n"
         "if os.environ.get('REQUIRE_PINNED_PYTHON3') == '1':\n"
-        "    if os.path.realpath(shutil.which('python3') or '') != os.path.realpath(fake_executable):\n"
+        "    python3 = shutil.which('python3')\n"
+        "    if python3 is None or os.path.islink(python3):\n"
+        "        raise SystemExit(91)\n"
+        "    probe = subprocess.run([python3, '-c', 'import sys; print(sys.executable)'], text=True, capture_output=True)\n"
+        "    if probe.returncode != 0 or probe.stdout.strip() != fake_executable:\n"
         "        raise SystemExit(91)\n"
         "expected_gate_executable = os.environ.get(role.upper() + '_EXPECTED_GATE_EXECUTABLE')\n"
         "if expected_gate_executable is not None:\n"
@@ -79,7 +86,7 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
             }
             env["OFFLINE_VALIDATION_INVOCATIONS"] = str(invocation_log)
             env.update(extra_env or {})
-            arguments = ["bash", str(OFFLINE_RUNNER), "2"]
+            arguments = [str(BASH), str(OFFLINE_RUNNER), "2"]
             if production is not None:
                 env["PRODUCTION_PYTHON"] = str(production)
             if tooling is not None:
@@ -376,6 +383,40 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
                     "PRODUCTION_EXPECTED_GATE_EXECUTABLE": str(production),
                     "TOOLING_EXPECTED_GATE_EXECUTABLE": str(tooling),
                 },
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_python3_shim_preserves_selected_virtual_environment_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            production_environment = directory / "production-venv"
+            tooling_environment = directory / "tooling-venv"
+            venv.EnvBuilder(with_pip=False).create(production_environment)
+            venv.EnvBuilder(with_pip=False).create(tooling_environment)
+            production = production_environment / "bin" / "python"
+            tooling = tooling_environment / "bin" / "python"
+
+            fake_bin = directory / "fake-bin"
+            fake_bin.mkdir()
+            fake_bash = fake_bin / "bash"
+            fake_bash.write_text(
+                "#!/bin/sh\n"
+                "selected_prefix=\"$(\"$PYTHON\" -c 'import sys; print(sys.prefix)')\" || exit $?\n"
+                "path_prefix=\"$(python3 -c 'import sys; print(sys.prefix)')\" || exit $?\n"
+                "if [ \"$path_prefix\" != \"$selected_prefix\" ]; then\n"
+                "  echo \"python3 lost selected environment: $path_prefix != $selected_prefix\" >&2\n"
+                "  exit 93\n"
+                "fi\n"
+                "printf 'Ran 1 test in 0.000s\\n'\n",
+                encoding="utf-8",
+            )
+            fake_bash.chmod(0o755)
+
+            result, _ = self.run_validate(
+                production,
+                tooling,
+                extra_env={"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"},
             )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

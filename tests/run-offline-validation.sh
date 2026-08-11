@@ -99,8 +99,16 @@ cleanup_runtime_shims() {
 }
 trap cleanup_runtime_shims EXIT
 mkdir "$production_shim" "$tooling_shim" || exit 1
-ln -s "$PRODUCTION_PYTHON_RESOLVED" "$production_shim/python3" || exit 1
-ln -s "$TOOLING_PYTHON_RESOLVED" "$tooling_shim/python3" || exit 1
+write_runtime_wrapper() {
+  local wrapper=$1
+  printf '%s\n' '#!/bin/sh' 'exec "$PYTHON" "$@"' > "$wrapper" || return 1
+  chmod 700 "$wrapper"
+}
+# A symlink directly to a venv interpreter changes argv[0] to the shim path, so
+# CPython cannot find the selected environment's pyvenv.cfg. The wrapper keeps
+# subprocess `python3` calls on the exact PYTHON selected for the current gate.
+write_runtime_wrapper "$production_shim/python3" || exit 1
+write_runtime_wrapper "$tooling_shim/python3" || exit 1
 
 printf '\nproduction test gate:\n'
 PATH="$production_shim:$PATH" \
