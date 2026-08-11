@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
@@ -30,6 +31,7 @@ from validation.lab_report import (
     ResidueRecord,
     RunRecord,
     StableStateRecord,
+    is_python310_qualification,
     latest_report,
     report_from_preflight,
     report_from_qualification,
@@ -391,6 +393,9 @@ class QualificationReportTests(unittest.TestCase):
             directory=result.run_directory,
         )
 
+    def pass_document(self) -> dict[str, object]:
+        return report_from_qualification(self.run_gate(), code=CODE).document()
+
     def test_a_pass_fills_every_section_and_points_LATEST_at_the_run(self) -> None:
         result = self.run_gate()
         location = self.write(result)
@@ -422,6 +427,55 @@ class QualificationReportTests(unittest.TestCase):
             (self.runs / LATEST_NAME).read_text(encoding="utf-8").strip(),
             result.run_directory.name,
         )
+
+    def test_pass_rejects_missing_substituted_duplicate_or_extra_runtime_hosts(self) -> None:
+        pristine = self.pass_document()
+        mutations = ("missing", "substituted", "duplicate", "extra")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                document = copy.deepcopy(pristine)
+                for phase in ("pre", "post"):
+                    probes = document["runtime"]["nodes"][phase]["probes"]
+                    if mutation == "missing":
+                        probes.pop()
+                    elif mutation == "substituted":
+                        probes[-1]["host"] = "substitute01"
+                    elif mutation == "duplicate":
+                        probes.append(copy.deepcopy(probes[-1]))
+                    else:
+                        extra = copy.deepcopy(probes[-1])
+                        extra["host"] = "extra01"
+                        probes.append(extra)
+                self.assertFalse(is_python310_qualification(document))
+
+    def test_pass_rejects_missing_substituted_duplicate_or_extra_residue_hosts(self) -> None:
+        pristine = self.pass_document()
+        mutations = ("missing", "substituted", "duplicate", "extra")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                document = copy.deepcopy(pristine)
+                residue = document["residue"]
+                if mutation == "missing":
+                    residue.pop()
+                elif mutation == "substituted":
+                    residue[-1]["host"] = "substitute01"
+                elif mutation == "duplicate":
+                    residue.append(copy.deepcopy(residue[-1]))
+                else:
+                    residue.append(
+                        {"host": "extra01", "result": "clean", "detail": "no residue"}
+                    )
+                self.assertFalse(is_python310_qualification(document))
+
+    def test_pass_rejects_incomplete_preflight_and_baseline_evidence(self) -> None:
+        pristine = self.pass_document()
+        document = copy.deepcopy(pristine)
+        document["preflight"] = document["preflight"][:-1]
+        self.assertFalse(is_python310_qualification(document))
+
+        document = copy.deepcopy(pristine)
+        document["baseline"]["shell_bundle_hash"] = None
+        self.assertFalse(is_python310_qualification(document))
 
     def test_markdown_and_json_say_the_same_thing(self) -> None:
         location = self.write(self.run_gate())

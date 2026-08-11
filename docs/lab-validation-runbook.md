@@ -92,14 +92,15 @@ collect starts.
 9. **Python full collect:** fixed `--mode auto --kube-mode local --since 24h
    --no-trust-ssh-host-key --redact`, plus profile inventory/key/Prometheus inputs. One invocation
    must cover Ceph, Rook, Prometheus, every node and `/var/log`.
-10. **Witness and full coverage:** the selected witness must have accepted Node Evidence plus
+10. **Verify and archive acceptance:** bundle must pass Python structural/content verification
+    before the gate reads any archive member as evidence.
+11. **Witness and full coverage:** the selected witness must have accepted Node Evidence plus
     `/var/log`; all other collector paths and nodes remain mandatory.
-11. **Verify and workstation cleanup:** bundle must pass Python structural/content verification;
-   the successful output directory may contain only the bundle plus `collect.log` and
-   `verify.log`—no `tmp.*` owned workdir.
-12. **Normalized comparison:** compare the preserved shell bundle with the new Python bundle
+12. **Workstation cleanup:** the successful output directory may contain only the bundle plus
+    `collect.log` and `verify.log`—no `tmp.*` owned workdir.
+13. **Normalized comparison:** compare the preserved shell bundle with the new Python bundle
    under [`lab-bundle-contract.md`](lab-bundle-contract.md).
-13. **Post proof:** every node's complete runtime identity must exactly match its pre facts,
+14. **Post proof:** every node's complete runtime identity must exactly match its pre facts,
     stable state must be unchanged and no node may gain an attributable workspace/helper process.
 
 Once a collect has started, post-runtime and remote-residue probes run even if verify, coverage,

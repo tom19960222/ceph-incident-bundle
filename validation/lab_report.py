@@ -20,6 +20,7 @@ only that it did.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -29,7 +30,11 @@ from typing import TYPE_CHECKING
 from validation.lab_output import utc_timestamp, write_owner_only
 from validation.lab_preflight import PreflightResult
 from validation.lab_profile import CREDENTIAL_MARKERS, safe_display_path
-from validation.lab_runtime import RuntimeIdentity, RuntimeSnapshot
+from validation.lab_runtime import (
+    RuntimeIdentity,
+    RuntimeSnapshot,
+    parse_runtime_identity,
+)
 
 if TYPE_CHECKING:  # a report describes a qualification; it must not import one
     from validation.lab_qualify import QualifyResult
@@ -44,6 +49,39 @@ STATUS_PASS = "pass"
 COLLECTOR_PATHS = ("ceph", "rook", "prometheus", "nodes", "var_log")
 RUN_ID_FORMAT = "%Y%m%dT%H%M%SZ"
 GIT_TIMEOUT_SECONDS = 10
+REQUIRED_QUALIFICATION_CHECKS = frozenset(
+    {
+        "code-identity",
+        "read-only-opt-ins",
+        "runtime-tooling",
+        "runtime-production",
+        "baseline-evidence",
+        "profile-state",
+        "credential-paths",
+        "ssh-fingerprints",
+        "required-hosts",
+        "ceph-identity",
+        "rook-identity",
+        "prometheus-readiness",
+        "baseline-identity",
+        "shared-inventory",
+        "runtime-node-pre",
+        "runtime-floor-witness",
+        "stable-state-pre",
+        "residue-baseline",
+        "code-identity-pre-collect",
+        "collect-python",
+        "runtime-floor-witness-collect",
+        "collector-coverage-python",
+        "workstation-cleanup-python",
+        "bundle-comparison",
+        "stable-state-post",
+        "runtime-node-post",
+        "remote-residue",
+        "runtime-floor-witness-proof",
+        "code-identity-final",
+    }
+)
 
 
 class ReportRejected(Exception):
@@ -576,39 +614,191 @@ def is_python310_qualification(document: dict[str, object]) -> bool:
     ):
         return False
     baseline = document.get("baseline")
+    code = document.get("code")
     comparison = document.get("comparison")
+    identity = document.get("lab_identity")
+    preflight = document.get("preflight")
+    profile = document.get("profile")
     stable = document.get("stable_state")
     runs = document.get("runs")
     residue = document.get("residue")
     if (
-        not isinstance(baseline, dict)
+        not isinstance(code, dict)
+        or re.fullmatch(r"[0-9a-f]{40}", str(code.get("commit", ""))) is None
+        or code.get("dirty") is not False
+        or not isinstance(profile, dict)
+        or profile.get("state") != "active"
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", str(profile.get("hash", "")))
+        is None
+        or not isinstance(profile.get("name"), str)
+        or not profile["name"]
+        or not isinstance(baseline, dict)
         or baseline.get("status") != "pass"
+        or not _baseline_is_complete(baseline)
+        or baseline.get("profile_hash") != profile.get("hash")
+        or not _preflight_is_complete(preflight)
         or not isinstance(comparison, dict)
         or comparison.get("result") != "equivalent"
+        or comparison.get("differences") != []
         or not isinstance(stable, dict)
+        or stable.get("snapshot_schema_version") != 1
         or stable.get("result") != "unchanged"
+        or stable.get("differences") != []
         or not isinstance(runs, list)
         or not isinstance(residue, list)
         or not residue
+        or not _identity_is_complete(identity)
     ):
         return False
-    live = [
-        run
-        for run in runs
-        if isinstance(run, dict) and run.get("implementation") == "python"
-    ]
-    if len(live) != 1 or not _run_is_complete(live[0]):
+    if (
+        len(runs) != 2
+        or [run.get("implementation") for run in runs if isinstance(run, dict)]
+        != ["shell", "python"]
+        or not all(isinstance(run, dict) and _run_is_complete(run) for run in runs)
+        or runs[0].get("bundle_path") != baseline.get("shell_bundle_path")
+        or runs[0].get("bundle_hash") != baseline.get("shell_bundle_hash")
+    ):
         return False
-    return all(
-        isinstance(entry, dict) and entry.get("result") == "clean"
-        for entry in residue
+    verified_hosts = _verified_host_names(identity)
+    runtime_hosts = _runtime_host_names(document.get("runtime"))
+    residue_hosts = _residue_host_names(residue)
+    return (
+        verified_hosts is not None
+        and verified_hosts == runtime_hosts == residue_hosts
     )
+
+
+def _baseline_is_complete(baseline: dict[str, object]) -> bool:
+    return (
+        isinstance(baseline.get("report_path"), str)
+        and Path(baseline["report_path"]).is_absolute()
+        and isinstance(baseline.get("shell_bundle_path"), str)
+        and Path(baseline["shell_bundle_path"]).is_absolute()
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(baseline.get("report_hash", "")))
+        is not None
+        and re.fullmatch(r"[0-9a-f]{40}", str(baseline.get("code_commit", "")))
+        is not None
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(baseline.get("profile_hash", "")))
+        is not None
+        and re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(baseline.get("shell_bundle_hash", ""))
+        )
+        is not None
+    )
+
+
+def _preflight_is_complete(value: object) -> bool:
+    if not isinstance(value, list) or not value:
+        return False
+    checks: dict[str, bool] = {}
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"name", "ok", "detail"}
+            or not isinstance(item.get("name"), str)
+            or not isinstance(item.get("detail"), str)
+            or item.get("ok") is not True
+            or item["name"] in checks
+        ):
+            return False
+        checks[item["name"]] = True
+    return REQUIRED_QUALIFICATION_CHECKS <= set(checks)
+
+
+def _verified_host_names(value: object) -> set[str] | None:
+    if not _identity_is_complete(value):
+        return None
+    assert isinstance(value, dict)
+    assert isinstance(value["hosts"], list)
+    names = [
+        host.get("name")
+        for host in value["hosts"]
+        if isinstance(host, dict) and isinstance(host.get("name"), str)
+    ]
+    return set(names) if names and len(names) == len(value["hosts"]) == len(set(names)) else None
+
+
+def _identity_is_complete(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "ceph_fsid",
+        "rook_fsid",
+        "prometheus",
+        "hosts",
+    }:
+        return False
+    prometheus = value.get("prometheus")
+    hosts = value.get("hosts")
+    if (
+        not isinstance(value.get("ceph_fsid"), str)
+        or not value["ceph_fsid"]
+        or not isinstance(value.get("rook_fsid"), str)
+        or not value["rook_fsid"]
+        or not isinstance(prometheus, dict)
+        or set(prometheus) != {"url", "ready"}
+        or not isinstance(prometheus.get("url"), str)
+        or not prometheus["url"]
+        or prometheus.get("ready") is not True
+        or not isinstance(hosts, list)
+        or not hosts
+    ):
+        return False
+    for host in hosts:
+        if not isinstance(host, dict) or set(host) != {
+            "name",
+            "address",
+            "hostname",
+            "ssh_fingerprints_verified",
+        }:
+            return False
+        fingerprints = host.get("ssh_fingerprints_verified")
+        if (
+            not all(
+                isinstance(host.get(field), str) and host[field]
+                for field in ("name", "address", "hostname")
+            )
+            or not isinstance(fingerprints, list)
+            or not fingerprints
+            or not all(isinstance(item, str) and item for item in fingerprints)
+            or len(fingerprints) != len(set(fingerprints))
+        ):
+            return False
+    names = [host["name"] for host in hosts]
+    return len(names) == len(set(names))
+
+
+def _runtime_host_names(value: object) -> set[str] | None:
+    if not isinstance(value, dict) or not isinstance(value.get("nodes"), dict):
+        return None
+    pre = _probe_documents(value["nodes"].get("pre"))
+    return None if pre is None else set(pre)
+
+
+def _residue_host_names(value: list[object]) -> set[str] | None:
+    names: list[str] = []
+    for entry in value:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"host", "result", "detail"}
+            or not isinstance(entry.get("host"), str)
+            or not entry["host"]
+            or entry.get("result") != "clean"
+            or not isinstance(entry.get("detail"), str)
+        ):
+            return None
+        names.append(entry["host"])
+    return set(names) if len(names) == len(set(names)) else None
 
 
 def _run_is_complete(run: dict[str, object]) -> bool:
     coverage = run.get("coverage")
     return (
         run.get("exit_code") == 0
+        and isinstance(run.get("invocation_id"), str)
+        and bool(run["invocation_id"])
+        and isinstance(run.get("bundle_path"), str)
+        and Path(run["bundle_path"]).is_absolute()
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(run.get("bundle_hash", "")))
+        is not None
         and run.get("verify_result") == "pass"
         and isinstance(coverage, dict)
         and set(coverage) == set(COLLECTOR_PATHS)
@@ -680,36 +870,13 @@ def _runtime_matches(
     exact: tuple[int, int] | None = None,
     implementation: str | None = None,
 ) -> bool:
-    if not isinstance(value, dict):
+    try:
+        runtime = parse_runtime_identity(json.dumps(value))
+    except (TypeError, ValueError):
         return False
-    version = value.get("version_info")
-    observed_implementation = value.get("implementation")
-    executable = value.get("executable")
-    if (
-        set(value) != {"executable", "implementation", "version_info"}
-        or not isinstance(version, dict)
-        or set(version) != {"major", "minor", "micro", "releaselevel", "serial"}
-        or not isinstance(executable, str)
-        or not executable.startswith("/")
-        or not isinstance(observed_implementation, str)
-        or (implementation is not None and observed_implementation != implementation)
-    ):
+    if implementation is not None and runtime.implementation != implementation:
         return False
-    major = version.get("major")
-    minor = version.get("minor")
-    micro = version.get("micro")
-    serial = version.get("serial")
-    releaselevel = version.get("releaselevel")
-    if (
-        type(major) is not int
-        or type(minor) is not int
-        or type(micro) is not int
-        or type(serial) is not int
-        or min(major, minor, micro, serial) < 0
-        or releaselevel not in {"alpha", "beta", "candidate", "final"}
-    ):
-        return False
-    pair = (major, minor)
+    pair = (runtime.version_info.major, runtime.version_info.minor)
     return (minimum is None or pair >= minimum) and (exact is None or pair == exact)
 
 
