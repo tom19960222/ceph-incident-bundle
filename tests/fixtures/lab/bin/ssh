@@ -89,7 +89,11 @@ print(json.dumps({
     },
 }, sort_keys=True, separators=(",", ":")))
 """
-RUNTIME_PROBE_COMMAND = shlex.join(("python3", "-I", "-c", RUNTIME_PROBE_SOURCE))
+# Keep this whitelist independent of production code on purpose: changing the
+# real command without updating the expected fake-lab surface must go red.
+RUNTIME_PROBE_COMMAND = shlex.join(
+    ("python3", "-I", "-B", "-S", "-c", RUNTIME_PROBE_SOURCE)
+)
 # The stable state a healthy fake lab reports.  Every value here is identity or
 # desired configuration; the snapshot projection is what decides that, so the
 # fixture also serves volatile fields (epochs, counters, status) to prove they

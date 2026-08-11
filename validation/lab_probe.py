@@ -105,7 +105,9 @@ print(json.dumps({
     },
 }, sort_keys=True, separators=(",", ":")))
 """
-RUNTIME_PROBE_COMMAND = shlex.join(("python3", "-I", "-c", RUNTIME_PROBE_SOURCE))
+RUNTIME_PROBE_COMMAND = shlex.join(
+    ("python3", "-I", "-B", "-S", "-c", RUNTIME_PROBE_SOURCE)
+)
 
 
 @dataclass(frozen=True)

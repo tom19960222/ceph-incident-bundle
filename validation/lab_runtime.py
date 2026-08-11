@@ -23,6 +23,7 @@ RESULT_CHANGED = "changed"
 RESULT_UNAVAILABLE = "unavailable"
 STATUS_OK = "ok"
 STATUS_FAILED = "failed"
+FAILURE_DETAIL_LIMIT = 50
 _RUNTIME_FIELDS = frozenset({"executable", "implementation", "version_info"})
 _VERSION_FIELDS = frozenset(
     {"major", "minor", "micro", "releaselevel", "serial"}
@@ -156,7 +157,11 @@ def compare_runtime_snapshots(
         if probe.status != STATUS_OK or probe.runtime is None
     ]
     if unavailable:
-        return RESULT_UNAVAILABLE, tuple(unavailable)
+        hidden = len(unavailable) - FAILURE_DETAIL_LIMIT
+        bounded = unavailable[:FAILURE_DETAIL_LIMIT]
+        if hidden > 0:
+            bounded.append(f"… and {hidden} further failed probe(s) not listed")
+        return RESULT_UNAVAILABLE, tuple(bounded)
     differences = describe_differences(
         before.structured_fields(), after.structured_fields()
     )
@@ -193,9 +198,8 @@ def parse_runtime_identity(text: str) -> RuntimeIdentity:
         if type(value) is not int or value < 0:
             raise ValueError(f"version_info.{field} is not a non-negative integer")
     releaselevel = version["releaselevel"]
-    if releaselevel not in _RELEASE_LEVELS:
+    if not isinstance(releaselevel, str) or releaselevel not in _RELEASE_LEVELS:
         raise ValueError("version_info.releaselevel is invalid")
-    assert isinstance(releaselevel, str)
     return RuntimeIdentity(
         executable,
         implementation,

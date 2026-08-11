@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,8 @@ from validation.lab_runtime import (
     RESULT_CHANGED,
     RESULT_UNAVAILABLE,
     RESULT_UNCHANGED,
+    RuntimeProbe,
+    RuntimeSnapshot,
     capture_runtime_snapshot,
     compare_runtime_snapshots,
 )
@@ -106,6 +109,10 @@ class RuntimeProbeTests(RuntimeFixture, unittest.TestCase):
         self.assertNotIn(str(self.profile.ssh_key_path), RUNTIME_PROBE_COMMAND)
         self.assertNotIn("cephadm", RUNTIME_PROBE_COMMAND)
         self.assertNotIn("kubectl", RUNTIME_PROBE_COMMAND)
+        self.assertEqual(
+            shlex.split(RUNTIME_PROBE_COMMAND)[:5],
+            ["python3", "-I", "-B", "-S", "-c"],
+        )
 
 
 class RuntimeFailureAndComparisonTests(RuntimeFixture, unittest.TestCase):
@@ -172,7 +179,7 @@ class RuntimeFailureAndComparisonTests(RuntimeFixture, unittest.TestCase):
         extra = json.loads(self.runtime())
         extra["version_info"]["build"] = "custom"
         wrong_type = json.loads(self.runtime())
-        wrong_type["version_info"]["minor"] = "10"
+        wrong_type["version_info"]["releaselevel"] = []
         snapshot = self.capture(
             FAKE_LAB_RUNTIME_OUTPUTS=self.outputs(
                 **{
@@ -211,6 +218,19 @@ class RuntimeFailureAndComparisonTests(RuntimeFixture, unittest.TestCase):
         result, differences = compare_runtime_snapshots(failed, failed)
         self.assertEqual(result, RESULT_UNAVAILABLE)
         self.assertTrue(any("mon02" in item for item in differences))
+
+    def test_many_failed_nodes_still_produce_a_bounded_comparison(self) -> None:
+        failed = RuntimeSnapshot(
+            tuple(
+                RuntimeProbe(f"node-{index}", 255, "failed", None, "transport failed")
+                for index in range(75)
+            )
+        )
+
+        result, differences = compare_runtime_snapshots(failed, failed)
+        self.assertEqual(result, RESULT_UNAVAILABLE)
+        self.assertLessEqual(len(differences), 51)
+        self.assertIn("not listed", differences[-1])
 
     def test_failure_diagnostics_are_bounded_and_do_not_persist_credentials(self) -> None:
         secret_marker = "PRIVATE KEY"
