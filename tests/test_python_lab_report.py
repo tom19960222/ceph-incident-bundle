@@ -208,7 +208,7 @@ class WriteTests(unittest.TestCase):
         self.assertTrue(first.json_path.is_file())
 
     def test_refuses_a_report_without_exactly_one_next_action(self) -> None:
-        for action in ("", "   ", "first\nsecond"):
+        for action in ("", "   ", "first\nsecond", "first\rsecond"):
             with self.subTest(action=action):
                 with self.assertRaises(ReportRejected):
                     write_report(self.runs, minimal_report(next_action=action))
@@ -476,6 +476,14 @@ class QualificationReportTests(unittest.TestCase):
         document = copy.deepcopy(pristine)
         document["baseline"]["shell_bundle_hash"] = None
         self.assertFalse(is_python310_qualification(document))
+
+    def test_pass_rejects_a_missing_or_multiline_next_action(self) -> None:
+        pristine = self.pass_document()
+        for action in (None, "", "first\nsecond", "first\rsecond"):
+            with self.subTest(action=action):
+                document = copy.deepcopy(pristine)
+                document["next_action"] = action
+                self.assertFalse(is_python310_qualification(document))
 
     def test_markdown_and_json_say_the_same_thing(self) -> None:
         location = self.write(self.run_gate())

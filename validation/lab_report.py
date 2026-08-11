@@ -591,10 +591,9 @@ def _reject_unusable(report: LabValidationReport) -> None:
         )
     if not report.status.strip():
         raise ReportRejected("a report must carry a status")
-    action = report.next_action.strip()
-    if not action:
+    if not report.next_action.strip():
         raise ReportRejected("a report must carry exactly one next_action")
-    if "\n" in report.next_action:
+    if not _next_action_is_usable(report.next_action):
         raise ReportRejected("a report must carry exactly one next_action, not a list")
     if report.status == STATUS_PASS and not is_python310_qualification(
         report.document()
@@ -610,6 +609,7 @@ def is_python310_qualification(document: dict[str, object]) -> bool:
     if (
         document.get("schema_version") != REPORT_SCHEMA_VERSION
         or document.get("status") != STATUS_PASS
+        or not _next_action_is_usable(document.get("next_action"))
         or not runtime_document_is_complete(document.get("runtime"))
     ):
         return False
@@ -684,6 +684,15 @@ def _baseline_is_complete(baseline: dict[str, object]) -> bool:
             r"sha256:[0-9a-f]{64}", str(baseline.get("shell_bundle_hash", ""))
         )
         is not None
+    )
+
+
+def _next_action_is_usable(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and "\n" not in value
+        and "\r" not in value
     )
 
 
