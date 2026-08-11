@@ -7,7 +7,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-import venv
 from pathlib import Path
 
 
@@ -25,8 +24,10 @@ def make_fake_python(
     version: tuple[int, int, int, str, int],
     implementation: str = "cpython",
     reported_executable: Path | None = None,
+    reported_prefix: Path | None = None,
 ) -> None:
     reported_executable = reported_executable or path
+    reported_prefix = reported_prefix or reported_executable.parent.parent
     path.write_text(
         f"#!{sys.executable}\n"
         "import json\n"
@@ -37,9 +38,11 @@ def make_fake_python(
         "import types\n"
         f"role = {role!r}\n"
         f"fake_executable = {str(reported_executable)!r}\n"
+        f"fake_prefix = {str(reported_prefix)!r}\n"
         f"fake_version = {version!r}\n"
         "if len(sys.argv) >= 3 and sys.argv[1] == '-c':\n"
         "    sys.executable = fake_executable\n"
+        "    sys.prefix = fake_prefix\n"
         f"    sys.implementation = types.SimpleNamespace(name={implementation!r})\n"
         "    sys.version_info = fake_version\n"
         "    code = sys.argv[2]\n"
@@ -143,7 +146,7 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
             production = directory / "production-python"
             tooling = directory / "tooling-python"
             make_fake_python(
-                production, role="production", version=(3, 11, 7, "final", 0)
+                production, role="production", version=(3, 10, 14, "final", 0)
             )
             make_fake_python(tooling, role="tooling", version=(3, 12, 2, "final", 0))
 
@@ -161,7 +164,7 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
         self.assertIn(f"executable: {production.absolute()}", output)
         self.assertIn("implementation: cpython", output)
         self.assertIn(
-            "version: major=3 minor=11 micro=7 releaselevel=final serial=0", output
+            "version: major=3 minor=10 micro=14 releaselevel=final serial=0", output
         )
         self.assertIn(f"executable: {tooling.absolute()}", output)
         self.assertIn(
@@ -179,8 +182,12 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
             any("test_python_lab_" in " ".join(argv) for argv in tooling_runs)
         )
 
-    def test_each_role_rejects_an_old_interpreter_before_tests_start(self) -> None:
-        for old_role in ("production", "tooling"):
+    def test_each_role_rejects_its_old_interpreter_before_tests_start(self) -> None:
+        cases = (
+            ("production", (3, 9, 18, "final", 0), "Python 3.10 or newer"),
+            ("tooling", (3, 10, 14, "final", 0), "Python 3.11 or newer"),
+        )
+        for old_role, old_version, required_version in cases:
             with self.subTest(role=old_role), tempfile.TemporaryDirectory() as temporary_directory:
                 directory = Path(temporary_directory)
                 production = directory / "production-python"
@@ -188,14 +195,14 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
                 make_fake_python(
                     production,
                     role="production",
-                    version=(3, 10, 14, "final", 0)
+                    version=old_version
                     if old_role == "production"
-                    else (3, 11, 9, "final", 0),
+                    else (3, 10, 14, "final", 0),
                 )
                 make_fake_python(
                     tooling,
                     role="tooling",
-                    version=(3, 10, 14, "final", 0)
+                    version=old_version
                     if old_role == "tooling"
                     else (3, 11, 9, "final", 0),
                 )
@@ -204,7 +211,7 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(
-                f"{old_role} interpreter requires Python 3.11 or newer",
+                f"{old_role} interpreter requires {required_version}",
                 result.stdout + result.stderr,
             )
             self.assertEqual(invocations, [])
@@ -270,7 +277,7 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
             make_fake_python(
                 production,
                 role="production",
-                version=(3, 11, 9, "final", 0),
+                version=(3, 10, 14, "final", 0),
                 implementation="pypy",
             )
             make_fake_python(
@@ -286,13 +293,34 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
         )
         self.assertEqual(invocations, [])
 
-    def test_a_shard_cannot_pass_without_running_tests(self) -> None:
+    def test_production_gate_requires_a_cpython_310_floor_witness(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             production = directory / "production-python"
             tooling = directory / "tooling-python"
             make_fake_python(
                 production, role="production", version=(3, 11, 9, "final", 0)
+            )
+            make_fake_python(
+                tooling, role="tooling", version=(3, 11, 9, "final", 0)
+            )
+
+            result, invocations = self.run_validate(production, tooling)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "production interpreter must be CPython 3.10.x for floor proof",
+            result.stdout + result.stderr,
+        )
+        self.assertEqual(invocations, [])
+
+    def test_a_shard_cannot_pass_without_running_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            production = directory / "production-python"
+            tooling = directory / "tooling-python"
+            make_fake_python(
+                production, role="production", version=(3, 10, 14, "final", 0)
             )
             make_fake_python(
                 tooling, role="tooling", version=(3, 11, 9, "final", 0)
@@ -313,7 +341,7 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
             production = directory / "production-python"
             tooling = directory / "tooling-python"
             make_fake_python(
-                production, role="production", version=(3, 11, 7, "final", 0)
+                production, role="production", version=(3, 10, 14, "final", 0)
             )
             make_fake_python(tooling, role="tooling", version=(3, 11, 7, "final", 0))
 
@@ -333,7 +361,7 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
             production = directory / "production-python"
             tooling = directory / "tooling-python"
             make_fake_python(
-                production, role="production", version=(3, 11, 7, "final", 0)
+                production, role="production", version=(3, 10, 14, "final", 0)
             )
             make_fake_python(tooling, role="tooling", version=(3, 12, 2, "final", 0))
 
@@ -364,7 +392,7 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
             make_fake_python(
                 production_target,
                 role="production",
-                version=(3, 11, 7, "final", 0),
+                version=(3, 10, 14, "final", 0),
                 reported_executable=production,
             )
             make_fake_python(
@@ -392,10 +420,22 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
             directory = Path(temporary_directory)
             production_environment = directory / "production-venv"
             tooling_environment = directory / "tooling-venv"
-            venv.EnvBuilder(with_pip=False).create(production_environment)
-            venv.EnvBuilder(with_pip=False).create(tooling_environment)
             production = production_environment / "bin" / "python"
             tooling = tooling_environment / "bin" / "python"
+            production.parent.mkdir(parents=True)
+            tooling.parent.mkdir(parents=True)
+            make_fake_python(
+                production,
+                role="production",
+                version=(3, 10, 14, "final", 0),
+                reported_prefix=production_environment,
+            )
+            make_fake_python(
+                tooling,
+                role="tooling",
+                version=(3, 11, 14, "final", 0),
+                reported_prefix=tooling_environment,
+            )
 
             fake_bin = directory / "fake-bin"
             fake_bin.mkdir()

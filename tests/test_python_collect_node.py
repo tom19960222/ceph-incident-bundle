@@ -1471,9 +1471,9 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
                         self.assertIsNotNone(merged)
                         self.assertNotIn(b"partial decode", merged.read())
 
-    def test_unsupported_node_is_skipped_in_a_partial_bundle(self) -> None:
+    def test_python39_and_missing_python_are_skipped_in_a_partial_bundle(self) -> None:
         for mode, diagnostic in (
-            ("unsupported", "Python 3.11 or newer is required"),
+            ("python39", "Python 3.10 or newer is required"),
             ("missing-python", "python3: command not found"),
         ):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary_directory:
@@ -1489,7 +1489,7 @@ class CollectSingleNodeCliTests(NodeCollectorFixture, unittest.TestCase):
                     skipped = archive.extractfile("./nodes/monitor01/SKIPPED.txt")
                     self.assertIsNotNone(skipped)
                     self.assertIn(
-                        b"Python 3.11 or newer is unavailable", skipped.read()
+                        b"Python 3.10 or newer is unavailable", skipped.read()
                     )
                     summary = archive.extractfile("./summary.txt")
                     self.assertIsNotNone(summary)

@@ -144,8 +144,8 @@ PROMETHEUS_SUCCESS_MARKER = b'"status":"success"'
 PROMETHEUS_SUCCESS_PROBE_BYTES = 512
 REMOTE_BOOTSTRAP = """\
 import sys
-if sys.version_info < (3, 11):
-    sys.stderr.write("SKIPPED: Python 3.11 or newer is required\\n")
+if sys.version_info < (3, 10):
+    sys.stderr.write("SKIPPED: Python 3.10 or newer is required\\n")
     raise SystemExit(75)
 source = sys.stdin.buffer.read()
 code = compile(source, "ceph_incident_node.py", "exec")
@@ -1778,7 +1778,7 @@ def collect_single_node(
     try:
         if candidate.stat().st_size == 0:
             if remote_exit_code in (75, 127):
-                reason = "Python 3.11 or newer is unavailable on node"
+                reason = "Python 3.10 or newer is unavailable on node"
             else:
                 reason = (
                     f"no usable node archive returned from {target} "

@@ -43,9 +43,11 @@ print(
     f"major={version[0]} minor={version[1]} micro={version[2]} "
     f"releaselevel={version[3]} serial={version[4]}"
 )
-if version[:2] < (3, 11):
+minimum = (3, 10) if role == "production" else (3, 11)
+if version[:2] < minimum:
     sys.stderr.write(
-        f"FAIL: {role} interpreter requires Python 3.11 or newer; "
+        f"FAIL: {role} interpreter requires "
+        f"Python {minimum[0]}.{minimum[1]} or newer; "
         f"got {sys.implementation.name} {version[0]}.{version[1]}.{version[2]}\n"
     )
     raise SystemExit(1)
@@ -53,6 +55,12 @@ if role == "production" and sys.implementation.name != "cpython":
     sys.stderr.write(
         "FAIL: production interpreter must be CPython for compatibility proof; "
         f"got {sys.implementation.name}\n"
+    )
+    raise SystemExit(1)
+if role == "production" and version[:2] != (3, 10):
+    sys.stderr.write(
+        "FAIL: production interpreter must be CPython 3.10.x for floor proof; "
+        f"got {sys.implementation.name} {version[0]}.{version[1]}.{version[2]}\n"
     )
     raise SystemExit(1)
 print("__CEPH_INCIDENT_RUNTIME_OK__")

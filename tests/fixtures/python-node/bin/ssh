@@ -55,9 +55,42 @@ if mode == "timeout":
             child_environment,
         )
 
-if mode == "unsupported":
-    print("SKIPPED: Python 3.11 or newer is required", file=sys.stderr)
-    raise SystemExit(75)
+if mode == "python39":
+    with tempfile.TemporaryDirectory() as python39_directory:
+        python39 = Path(python39_directory) / "python3"
+        python39.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "class UnreadableBuffer:\n"
+            "    def read(self, *args, **kwargs):\n"
+            "        raise RuntimeError('bootstrap read payload on Python 3.9')\n"
+            "class UnreadableStdin:\n"
+            "    buffer = UnreadableBuffer()\n"
+            "if len(sys.argv) < 3 or sys.argv[1] != '-c':\n"
+            "    raise SystemExit('expected python3 -c SOURCE CONFIG')\n"
+            "source = sys.argv[2]\n"
+            "arguments = sys.argv[3:]\n"
+            "sys.version_info = (3, 9, 18, 'final', 0)\n"
+            "sys.stdin = UnreadableStdin()\n"
+            "sys.argv = ['-c', *arguments]\n"
+            "exec(compile(source, '<remote-bootstrap>', 'exec'), {'__name__': '__main__'})\n",
+            encoding="utf-8",
+        )
+        python39.chmod(0o755)
+        python39_environment = {
+            **child_environment,
+            "PATH": f"{python39_directory}{os.pathsep}{child_environment['PATH']}",
+        }
+        result = subprocess.run(
+            ["/bin/sh", "-c", "exec " + remote_command],
+            input=payload,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr.buffer,
+            env=python39_environment,
+            check=False,
+        )
+    sys.stdout.buffer.write(result.stdout)
+    raise SystemExit(result.returncode)
 if mode == "missing-python":
     print("python3: command not found", file=sys.stderr)
     raise SystemExit(127)
