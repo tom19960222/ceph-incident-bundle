@@ -648,15 +648,23 @@ class RepositoryGateTests(unittest.TestCase):
         self.assertIn(f'PYTHON="{sys.executable}"', test_python_dry_run.stdout)
 
         validate_dry_run = subprocess.run(
-            ["make", "-n", "-j4", "validate", f"PYTHON={sys.executable}"],
+            [
+                "make",
+                "-n",
+                "-j4",
+                "validate",
+                f"PRODUCTION_PYTHON={sys.executable}",
+                f"TOOLING_PYTHON={sys.executable}",
+            ],
             cwd=ROOT,
             text=True,
             capture_output=True,
             check=False,
         )
         self.assertEqual(validate_dry_run.returncode, 0, validate_dry_run.stderr)
-        first_command = validate_dry_run.stdout.splitlines()[0]
-        self.assertIn("version_info < (3, 11)", first_command)
+        self.assertIn("run-offline-validation.sh", validate_dry_run.stdout)
+        self.assertIn(f'PRODUCTION_PYTHON="{sys.executable}"', validate_dry_run.stdout)
+        self.assertIn(f'TOOLING_PYTHON="{sys.executable}"', validate_dry_run.stdout)
 
 
 if __name__ == "__main__":
