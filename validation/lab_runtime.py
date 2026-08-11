@@ -1,20 +1,22 @@
 """Structured interpreter identity observations for real-lab qualification.
 
-This module is deliberately independent of the schema-v2 qualification result.
-It provides the read-only capture and comparison capability that the schema-v3
-integration gate can compose later without adding runtime evidence to either an
-Incident Bundle or a Node Evidence Archive.
+The schema-v3 qualification gate composes these local and node observations
+without adding runtime evidence to either an Incident Bundle or a Node Evidence
+Archive. Historical schema-v2 reports remain unchanged.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from validation.lab_contract import describe_differences
-from validation.lab_probe import LabProber
+from validation.lab_probe import LabProber, RUNTIME_PROBE_SOURCE, bounded_diagnostic
 from validation.lab_profile import LabProfile
 
 
@@ -30,6 +32,11 @@ _VERSION_FIELDS = frozenset(
 )
 _RELEASE_LEVELS = frozenset({"alpha", "beta", "candidate", "final"})
 _IMPLEMENTATION_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
+LOCAL_PROBE_TIMEOUT_SECONDS = 30
+
+
+class LocalRuntimeUnavailable(Exception):
+    """A selected workstation interpreter could not provide structured facts."""
 
 
 @dataclass(frozen=True)
@@ -66,6 +73,62 @@ class RuntimeIdentity:
             "implementation": self.implementation,
             "version_info": self.version_info.document(),
         }
+
+
+def current_runtime_identity() -> RuntimeIdentity:
+    """Describe the interpreter that is actually running the lab harness."""
+
+    version = sys.version_info
+    return RuntimeIdentity(
+        os.path.abspath(sys.executable),
+        sys.implementation.name,
+        RuntimeVersionInfo(
+            version.major,
+            version.minor,
+            version.micro,
+            version.releaselevel,
+            version.serial,
+        ),
+    )
+
+
+def read_local_runtime_identity(executable: Path) -> RuntimeIdentity:
+    """Run one fixed metadata-only probe through the explicitly selected path."""
+
+    selected = str(executable)
+    if not executable.is_absolute():
+        raise LocalRuntimeUnavailable(
+            f"production interpreter must be selected by absolute path: {selected}"
+        )
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise LocalRuntimeUnavailable(
+            f"production interpreter is missing or not executable: {selected}"
+        )
+    try:
+        completed = subprocess.run(
+            [selected, "-I", "-B", "-S", "-c", RUNTIME_PROBE_SOURCE],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=LOCAL_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise LocalRuntimeUnavailable(
+            f"production interpreter probe failed: {type(error).__name__}"
+        ) from error
+    if completed.returncode != 0:
+        detail = bounded_diagnostic(completed.stderr) or "no diagnostic"
+        raise LocalRuntimeUnavailable(
+            f"production interpreter probe exited {completed.returncode}: {detail}"
+        )
+    try:
+        return parse_runtime_identity(completed.stdout)
+    except ValueError as error:
+        raise LocalRuntimeUnavailable(
+            "production interpreter returned malformed runtime identity"
+        ) from error
 
 
 @dataclass(frozen=True)

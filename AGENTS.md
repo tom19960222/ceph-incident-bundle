@@ -39,17 +39,21 @@ Issue #21 PASS evidence is run `20260805T155047Z`, commit `155e057`. Its shell b
 report and hashes remain local-only evidence. Issue #22 removed the shell runtime and dual-run
 fixtures.
 
-`make validate-lab` now requires both:
+`make validate-lab` now requires four absolute paths:
 
 ```text
 LAB_PROFILE=/absolute/path/to/lab.toml
 LAB_BASELINE_REPORT=/absolute/path/to/20260805T155047Z/report.json
+PRODUCTION_PYTHON=/absolute/path/to/cpython3.10
+TOOLING_PYTHON=/absolute/path/to/python3.11
 ```
 
 It validates that preserved PASS evidence before lab access, proves exact current lab identity,
 runs one Python four-path full collect, verifies it, checks successful workstation cleanup,
-compares it with the saved shell bundle, and proves stable state plus remote residue. Only a
-schema-v2 report with `status: pass` is post-cutover proof.
+compares it with the saved shell bundle, and proves stable state plus remote residue. A schema-v3
+report additionally proves workstation/node runtime identity and one complete CPython 3.10 floor
+witness. Only schema-v3 `status: pass` is Python 3.10 qualification proof; preserved schema-v2 PASS
+reports keep their historical post-cutover meaning but do not prove 3.10 compatibility.
 
 ## Equivalence claims
 

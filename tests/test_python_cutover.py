@@ -37,7 +37,7 @@ class PythonOnlyCutoverTests(unittest.TestCase):
                 self.assertNotIn(retired_target, makefile)
 
     def test_python_collect_and_verify_are_the_only_production_entrypoints(self) -> None:
-        (entrypoint,) = default_entrypoints()
+        (entrypoint,) = default_entrypoints(Path("/opt/cpython/bin/python3"))
         self.assertEqual(entrypoint.implementation, "python")
         self.assertEqual(entrypoint.collect[-1], "collect")
         self.assertEqual(entrypoint.verify[-1], "verify")

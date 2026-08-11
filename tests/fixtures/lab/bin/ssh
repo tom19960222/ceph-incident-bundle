@@ -225,7 +225,13 @@ if is_residue_probe:
     raise SystemExit(0)
 
 if is_runtime_probe:
-    exits = json.loads(os.environ.get("FAKE_LAB_RUNTIME_EXITS", "{}"))
+    post = bool(
+        os.environ.get("FAKE_LAB_COLLECT_MARKER")
+        and os.path.exists(os.environ["FAKE_LAB_COLLECT_MARKER"])
+    )
+    exits_name = "FAKE_LAB_RUNTIME_POST_EXITS" if post else "FAKE_LAB_RUNTIME_EXITS"
+    outputs_name = "FAKE_LAB_RUNTIME_POST_OUTPUTS" if post else "FAKE_LAB_RUNTIME_OUTPUTS"
+    exits = json.loads(os.environ.get(exits_name, "{}"))
     code = exits.get(address, 0)
     if code:
         diagnostics = json.loads(
@@ -237,7 +243,7 @@ if is_runtime_probe:
         }.get(code, "runtime probe failed")
         sys.stderr.write(diagnostics.get(address, default) + "\n")
         raise SystemExit(code)
-    outputs = json.loads(os.environ.get("FAKE_LAB_RUNTIME_OUTPUTS", "{}"))
+    outputs = json.loads(os.environ.get(outputs_name, os.environ.get("FAKE_LAB_RUNTIME_OUTPUTS", "{}")))
     default = {
         "executable": "/usr/bin/python3",
         "implementation": "cpython",

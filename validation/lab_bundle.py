@@ -85,7 +85,7 @@ PROMETHEUS_DUMP_INFO_NAME = "cluster/prometheus/dump-info.txt"
 # `environment.txt` is where the run records which source and runner it chose, so
 # these keys are the comparison's view of source and runner selection. `git_commit`
 # remains bundle provenance but is intentionally compared by the pinned baseline
-# record and schema-v2 report: a post-cutover bundle must come from a newer commit.
+# record and current report: a post-cutover bundle must come from a newer commit.
 # `created_utc` is the clock, and the candidate-only keys (`node_target_*`,
 # `node_invocation_id_*`, the Rook namespaces, `kube_context`) are the rewrite's
 # declared additional observability — see `docs/differential-normalizer.md`.

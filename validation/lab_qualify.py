@@ -40,7 +40,6 @@ import hashlib
 import os
 import re
 import subprocess
-import sys
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
@@ -75,10 +74,21 @@ from validation.lab_report import (
     BaselineRecord,
     ComparisonRecord,
     ResidueRecord,
+    RuntimeProofRecord,
     RunRecord,
     StableStateRecord,
     code_identity,
     tracked_modifications,
+)
+from validation.lab_runtime import (
+    RESULT_UNAVAILABLE as RUNTIME_UNAVAILABLE,
+    RESULT_UNCHANGED as RUNTIME_UNCHANGED,
+    LocalRuntimeUnavailable,
+    RuntimeIdentity,
+    capture_runtime_snapshot,
+    compare_runtime_snapshots,
+    current_runtime_identity,
+    read_local_runtime_identity,
 )
 from validation.lab_residue import (
     RESULT_CLEAN,
@@ -113,6 +123,12 @@ FAILURE_STABLE_STATE = "stable-state-changed"
 FAILURE_RESIDUE = "remote-residue"
 FAILURE_BASELINE = "baseline-invalid"
 FAILURE_WORKSTATION_RESIDUE = "workstation-residue"
+FAILURE_TOOLING_RUNTIME = "tooling-runtime-unsupported"
+FAILURE_PRODUCTION_RUNTIME = "production-runtime-invalid"
+FAILURE_NODE_RUNTIME = "node-runtime-invalid"
+FAILURE_FLOOR_WITNESS = "runtime-floor-witness-missing"
+FAILURE_RUNTIME_DRIFT = "runtime-identity-changed"
+FAILURE_WITNESS_INCOMPLETE = "runtime-floor-witness-incomplete"
 
 # The qualification collect vector.  It is a constant, not an operator input:
 # the gate's claim is about *this* invocation shape, and the two side-effecting
@@ -153,14 +169,14 @@ class CollectEntrypoint:
     verify: tuple[str, ...]
 
 
-def default_entrypoints() -> tuple[CollectEntrypoint, ...]:
+def default_entrypoints(production_python: Path) -> tuple[CollectEntrypoint, ...]:
     """The only production implementation after the cutover."""
 
     return (
         CollectEntrypoint(
             "python",
-            (sys.executable, str(REPOSITORY_ROOT / "ceph_incident_bundle.py"), "collect"),
-            (sys.executable, str(REPOSITORY_ROOT / "ceph_incident_bundle.py"), "verify"),
+            (str(production_python), str(REPOSITORY_ROOT / "ceph_incident_bundle.py"), "collect"),
+            (str(production_python), str(REPOSITORY_ROOT / "ceph_incident_bundle.py"), "verify"),
         ),
     )
 
@@ -211,6 +227,7 @@ class QualifyResult:
     comparison: ComparisonRecord = field(default_factory=ComparisonRecord)
     stable_state: StableStateRecord = field(default_factory=StableStateRecord)
     residue: tuple[ResidueRecord, ...] = ()
+    runtime: RuntimeProofRecord = field(default_factory=RuntimeProofRecord)
     blocked_reason: str | None = None
 
     @property
@@ -266,6 +283,7 @@ class QualifyResult:
             "comparison": self.comparison.document(),
             "stable_state": self.stable_state.document(),
             "residue": [entry.document() for entry in self.residue],
+            "runtime": self.runtime.document(),
             "status": self.status,
             "blocked_reason": self.blocked_reason,
             "next_action": self.next_action,
@@ -305,7 +323,10 @@ def qualify(
     *,
     run_directory: Path,
     baseline_report: Path,
+    production_python: Path,
     entrypoints: Sequence[CollectEntrypoint] | None = None,
+    tooling_runtime: RuntimeIdentity | None = None,
+    production_runtime: RuntimeIdentity | None = None,
     collect_timeout: int = DEFAULT_COLLECT_TIMEOUT_SECONDS,
     repository_root: Path = REPOSITORY_ROOT,
 ) -> QualifyResult:
@@ -318,6 +339,13 @@ def qualify(
     """
 
     profile = load_profile(profile_path)
+    tooling_runtime = tooling_runtime or current_runtime_identity()
+    production_runtime_error: str | None = None
+    if production_runtime is None:
+        try:
+            production_runtime = read_local_runtime_identity(production_python)
+        except LocalRuntimeUnavailable as error:
+            production_runtime_error = str(error)
     run = _Qualification(
         profile_path,
         profile,
@@ -326,8 +354,11 @@ def qualify(
         entrypoints=tuple(
             entrypoints
             if entrypoints is not None
-            else default_entrypoints()
+            else default_entrypoints(production_python)
         ),
+        tooling_runtime=tooling_runtime,
+        production_runtime=production_runtime,
+        production_runtime_error=production_runtime_error,
         collect_timeout=collect_timeout,
         repository_root=repository_root,
     )
@@ -353,6 +384,9 @@ class _Qualification:
         run_directory: Path,
         baseline_report: Path,
         entrypoints: tuple[CollectEntrypoint, ...],
+        tooling_runtime: RuntimeIdentity,
+        production_runtime: RuntimeIdentity | None,
+        production_runtime_error: str | None,
         collect_timeout: int,
         repository_root: Path,
     ) -> None:
@@ -361,6 +395,9 @@ class _Qualification:
         self.run_directory = run_directory
         self.baseline_report = baseline_report
         self.entrypoints = entrypoints
+        self.tooling_runtime = tooling_runtime
+        self.production_runtime = production_runtime
+        self.production_runtime_error = production_runtime_error
         self.collect_timeout = collect_timeout
         self.repository_root = repository_root
         self.checks: list[PreflightCheck] = []
@@ -376,6 +413,9 @@ class _Qualification:
         self.node_invocation_ids: tuple[str, ...] = ()
         self.baseline: CutoverBaseline | None = None
         self.expected_commit: str | None = None
+        self.runtime = RuntimeProofRecord(
+            tooling=tooling_runtime, production=production_runtime
+        )
 
     # -- stage plumbing ----------------------------------------------------
 
@@ -408,6 +448,7 @@ class _Qualification:
             stable_state=self.stable_state,
             residue=tuple(self.residue)
             or tuple(ResidueRecord(host.name) for host in self.profile.hosts),
+            runtime=self.runtime,
             blocked_reason=blocked_reason,
         )
 
@@ -437,6 +478,9 @@ class _Qualification:
         opt_ins = self._check_read_only_opt_ins()
         if opt_ins is not None:
             return opt_ins
+        runtimes = self._check_local_runtimes()
+        if runtimes is not None:
+            return runtimes
         try:
             self.baseline = load_cutover_baseline(
                 self.baseline_report, profile=self.profile
@@ -572,6 +616,174 @@ class _Qualification:
         )
         return None
 
+    def _check_local_runtimes(self) -> QualifyResult | None:
+        tooling = self.tooling_runtime
+        tooling_version = tooling.version_info
+        if (tooling_version.major, tooling_version.minor) < (3, 11):
+            return self._failed(
+                "runtime-tooling",
+                "the lab harness requires Python 3.11 or newer; observed "
+                f"{tooling.implementation} {tooling_version.major}."
+                f"{tooling_version.minor}.{tooling_version.micro}",
+                FAILURE_TOOLING_RUNTIME,
+                "Select a pre-provisioned Python 3.11 or newer TOOLING_PYTHON and "
+                f"re-run {qualify_command(self.profile_path, self.baseline_report)}",
+            )
+        self._passed(
+            "runtime-tooling",
+            f"{tooling.executable} is {tooling.implementation} "
+            f"{tooling_version.major}.{tooling_version.minor}.{tooling_version.micro}",
+        )
+
+        production = self.production_runtime
+        if production is None:
+            return self._failed(
+                "runtime-production",
+                self.production_runtime_error or "production runtime identity is unavailable",
+                FAILURE_PRODUCTION_RUNTIME,
+                "Select a pre-provisioned isolated CPython 3.10.x PRODUCTION_PYTHON "
+                f"and re-run {qualify_command(self.profile_path, self.baseline_report)}",
+            )
+        production_version = production.version_info
+        if production.implementation != "cpython" or (
+            production_version.major,
+            production_version.minor,
+        ) != (3, 10):
+            return self._failed(
+                "runtime-production",
+                "workstation collect and verify require exact CPython 3.10.x; observed "
+                f"{production.implementation} {production_version.major}."
+                f"{production_version.minor}.{production_version.micro}",
+                FAILURE_PRODUCTION_RUNTIME,
+                "Select a pre-provisioned isolated CPython 3.10.x PRODUCTION_PYTHON "
+                f"and re-run {qualify_command(self.profile_path, self.baseline_report)}",
+            )
+        self._passed(
+            "runtime-production",
+            f"collect and verify use {production.executable}, exact CPython "
+            f"3.10.{production_version.micro}",
+        )
+        return None
+
+    def _check_runtime_before(
+        self, prober: LabProber, known_hosts: Path
+    ) -> QualifyResult | None:
+        snapshot = capture_runtime_snapshot(prober, self.profile, known_hosts)
+        self.runtime = replace(self.runtime, nodes_pre=snapshot)
+        comparison, differences = compare_runtime_snapshots(snapshot, snapshot)
+        if comparison == RUNTIME_UNAVAILABLE:
+            return self._failed(
+                "runtime-node-pre",
+                "; ".join(differences),
+                FAILURE_NODE_RUNTIME,
+                "Restore the fixed read-only python3 runtime probe on every inventory "
+                f"node, then re-run {qualify_command(self.profile_path, self.baseline_report)}",
+            )
+        unsupported = [
+            probe.host
+            for probe in snapshot.probes
+            if probe.runtime is None or not _supported_node_runtime(probe.runtime)
+        ]
+        if unsupported:
+            return self._failed(
+                "runtime-node-pre",
+                "inventory nodes do not run supported CPython 3.10 or newer through "
+                f"fixed python3: {', '.join(unsupported)}",
+                FAILURE_NODE_RUNTIME,
+                "Pre-provision fixed python3 as CPython 3.10 or newer on every named "
+                f"node, then re-run {qualify_command(self.profile_path, self.baseline_report)}",
+            )
+        self._passed(
+            "runtime-node-pre",
+            f"all {len(snapshot.probes)} inventory node runtime probes succeeded",
+        )
+        witnesses = [
+            probe.host
+            for probe in snapshot.probes
+            if probe.runtime is not None and _is_cpython_310(probe.runtime)
+        ]
+        if not witnesses:
+            return self._failed(
+                "runtime-floor-witness",
+                "no inventory node's fixed python3 is exact CPython 3.10.x",
+                FAILURE_FLOOR_WITNESS,
+                "Pre-provision at least one inventory node whose fixed python3 is "
+                "CPython 3.10.x, without changing global Python during qualification, "
+                f"then re-run {qualify_command(self.profile_path, self.baseline_report)}",
+            )
+        witness = witnesses[0]
+        self.runtime = replace(self.runtime, floor_witness=witness)
+        self._passed(
+            "runtime-floor-witness",
+            f"{witness} is the selected fixed-python3 CPython 3.10.x witness",
+        )
+        return None
+
+    def _check_runtime_after(
+        self, prober: LabProber, known_hosts: Path
+    ) -> QualifyResult | None:
+        before = self.runtime.nodes_pre
+        if before is None:
+            return self._failed(
+                "runtime-node-post",
+                "no pre-collection runtime snapshot was recorded",
+                FAILURE_NODE_RUNTIME,
+                f"Review {self.run_directory}; runtime proof is incomplete",
+            )
+        after = capture_runtime_snapshot(prober, self.profile, known_hosts)
+        result, differences = compare_runtime_snapshots(before, after)
+        self.runtime = replace(
+            self.runtime,
+            nodes_post=after,
+            comparison_result=result,
+            differences=differences,
+        )
+        if result != RUNTIME_UNCHANGED:
+            failure = (
+                FAILURE_NODE_RUNTIME
+                if result == RUNTIME_UNAVAILABLE
+                else FAILURE_RUNTIME_DRIFT
+            )
+            return self._failed(
+                "runtime-node-post",
+                "; ".join(differences) or f"runtime comparison is {result}",
+                failure,
+                "Restore every inventory node's fixed python3 runtime and review the "
+                f"pre/post facts in {self.run_directory} before re-running qualification",
+            )
+        self._passed(
+            "runtime-node-post",
+            f"all {len(after.probes)} structured node runtime identities are unchanged",
+        )
+        return None
+
+    def _check_floor_witness_collect(
+        self, collected: _Collected
+    ) -> QualifyResult | None:
+        witness = self.runtime.floor_witness
+        if witness is None:
+            return self._failed(
+                "runtime-floor-witness-collect",
+                "no floor witness was selected before collection",
+                FAILURE_WITNESS_INCOMPLETE,
+                f"Review {self.run_directory}; runtime proof is incomplete",
+            )
+        coverage = coverage_of(collected.contents, [witness])
+        if coverage.nodes != "collected" or coverage.var_log != "collected":
+            return self._failed(
+                "runtime-floor-witness-collect",
+                f"{witness} did not complete Node Evidence and /var/log "
+                f"(nodes={coverage.nodes}, var_log={coverage.var_log})",
+                FAILURE_WITNESS_INCOMPLETE,
+                f"Review {self.run_directory}; the CPython 3.10 floor witness must "
+                "produce an accepted archive with complete node and /var/log evidence",
+            )
+        self._passed(
+            "runtime-floor-witness-collect",
+            f"{witness} has accepted Node Evidence and collected /var/log in the Full Collect",
+        )
+        return None
+
     def _collect_and_compare(
         self, workspace: Path, trusted_host_keys: tuple[str, ...]
     ) -> QualifyResult:
@@ -588,6 +800,10 @@ class _Qualification:
         prober = LabProber(self.profile, workspace=workspace)
         known_hosts = workspace / "probe-known-hosts"
         write_owner_only(known_hosts, "".join(f"{line}\n" for line in trusted_host_keys))
+
+        runtime = self._check_runtime_before(prober, known_hosts)
+        if runtime is not None:
+            return runtime
 
         try:
             before = capture_stable_state(prober, self.profile, known_hosts)
@@ -632,6 +848,9 @@ class _Qualification:
             # invocation is known to have missed a collector path the gate has
             # already failed, and a second full collect would touch every node in
             # the lab again to prove something the report can already say.
+            witness_failure = self._check_floor_witness_collect(outcome)
+            if witness_failure is not None:
+                return self._finish(witness_failure, prober, known_hosts, baseline)
             coverage_failure = self._check_coverage(outcome.record)
             if coverage_failure is not None:
                 return self._finish(coverage_failure, prober, known_hosts, baseline)
@@ -671,9 +890,19 @@ class _Qualification:
             )
         self._passed("stable-state-post", f"schema {schema} snapshot is {RESULT_UNCHANGED}")
 
+        runtime = self._check_runtime_after(prober, known_hosts)
+        if runtime is not None:
+            return self._finish(runtime, prober, known_hosts, baseline)
+
         residue = self._check_residue(prober, known_hosts, baseline)
         if residue is not None:
             return residue
+        witness = self.runtime.floor_witness
+        self._passed(
+            "runtime-floor-witness-proof",
+            f"{witness} completed Node Evidence, /var/log, accepted archive, "
+            "unchanged runtime and clean residue in one Full Collect",
+        )
         code = self._check_code_identity("code-identity-final")
         if code is not None:
             return code
@@ -944,6 +1173,11 @@ class _Qualification:
 
         if not self.collect_started:
             return failure
+        effective = failure
+        if self.runtime.nodes_post is None:
+            runtime = self._check_runtime_after(prober, known_hosts)
+            if runtime is not None:
+                effective = runtime
         residue = self._check_residue(prober, known_hosts, baseline)
         if residue is not None:
             return residue
@@ -951,7 +1185,9 @@ class _Qualification:
         # the empty residue list; the verdict is unchanged but the evidence is
         # not, and the report gets the newer one.
         return self._result(
-            failure.status, failure.next_action, blocked_reason=failure.blocked_reason
+            effective.status,
+            effective.next_action,
+            blocked_reason=effective.blocked_reason,
         )
 
     def _check_residue(
@@ -991,6 +1227,22 @@ class _Qualification:
             f"no collector workspace or helper process left on {len(self.residue)} node(s)",
         )
         return None
+
+
+def _is_cpython_310(runtime: RuntimeIdentity) -> bool:
+    version = runtime.version_info
+    return runtime.implementation == "cpython" and (
+        version.major,
+        version.minor,
+    ) == (3, 10)
+
+
+def _supported_node_runtime(runtime: RuntimeIdentity) -> bool:
+    version = runtime.version_info
+    return runtime.implementation == "cpython" and (
+        version.major,
+        version.minor,
+    ) >= (3, 10)
 
 
 def _node_invocation_ids(contents: BundleContents) -> tuple[str, ...]:

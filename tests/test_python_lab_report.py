@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
@@ -12,6 +13,7 @@ from tests.lab_fixture import (
     ROOK_FSID,
     FakeLab,
     fake_entrypoints,
+    fake_runtime_identity,
     host_fingerprint,
 )
 from tests.test_python_lab_baseline import authority_for, write_baseline
@@ -29,6 +31,7 @@ from validation.lab_report import (
     ResidueRecord,
     RunRecord,
     StableStateRecord,
+    is_python310_qualification,
     latest_report,
     report_from_preflight,
     report_from_qualification,
@@ -58,6 +61,7 @@ def minimal_report(**overrides: object) -> LabValidationReport:
 class SchemaTests(unittest.TestCase):
     def test_the_document_declares_every_required_section(self) -> None:
         document = minimal_report().document()
+        self.assertEqual(REPORT_SCHEMA_VERSION, 3)
         self.assertEqual(document["schema_version"], REPORT_SCHEMA_VERSION)
         for key in (
             "timestamp",
@@ -70,10 +74,22 @@ class SchemaTests(unittest.TestCase):
             "comparison",
             "stable_state",
             "residue",
+            "runtime",
             "status",
             "next_action",
         ):
             self.assertIn(key, document)
+
+        self.assertEqual(
+            document["runtime"],
+            {
+                "tooling": None,
+                "production": None,
+                "nodes": {"pre": None, "post": None},
+                "comparison": {"result": "not-run", "differences": []},
+                "floor_witness": None,
+            },
+        )
 
     def test_unfilled_sections_say_not_run_rather_than_pass(self) -> None:
         document = minimal_report(
@@ -192,7 +208,7 @@ class WriteTests(unittest.TestCase):
         self.assertTrue(first.json_path.is_file())
 
     def test_refuses_a_report_without_exactly_one_next_action(self) -> None:
-        for action in ("", "   ", "first\nsecond"):
+        for action in ("", "   ", "first\nsecond", "first\rsecond"):
             with self.subTest(action=action):
                 with self.assertRaises(ReportRejected):
                     write_report(self.runs, minimal_report(next_action=action))
@@ -200,6 +216,14 @@ class WriteTests(unittest.TestCase):
     def test_refuses_a_report_without_a_status(self) -> None:
         with self.assertRaises(ReportRejected):
             write_report(self.runs, minimal_report(status=" "))
+
+    def test_schema_v3_pass_cannot_omit_runtime_proof(self) -> None:
+        with self.assertRaisesRegex(ReportRejected, "runtime proof"):
+            write_report(self.runs, minimal_report(status="pass"))
+
+    def test_current_code_cannot_silently_write_a_historical_schema(self) -> None:
+        with self.assertRaisesRegex(ReportRejected, "schema version 3"):
+            write_report(self.runs, minimal_report(schema_version=2))
 
     def test_refuses_to_write_a_report_that_carries_credential_material(self) -> None:
         leaky = minimal_report(
@@ -353,6 +377,11 @@ class QualificationReportTests(unittest.TestCase):
                 baseline_report=baseline_report,
                 run_directory=run_directory,
                 entrypoints=fake_entrypoints(("python",)),
+                production_python=Path("/opt/cpython/bin/python3"),
+                tooling_runtime=fake_runtime_identity(
+                    executable="/opt/tooling/bin/python3", minor=11
+                ),
+                production_runtime=fake_runtime_identity(),
                 collect_timeout=120,
                 repository_root=self.lab.checkout(),
             )
@@ -363,6 +392,9 @@ class QualificationReportTests(unittest.TestCase):
             report_from_qualification(result, code=CODE),
             directory=result.run_directory,
         )
+
+    def pass_document(self) -> dict[str, object]:
+        return report_from_qualification(self.run_gate(), code=CODE).document()
 
     def test_a_pass_fills_every_section_and_points_LATEST_at_the_run(self) -> None:
         result = self.run_gate()
@@ -385,10 +417,73 @@ class QualificationReportTests(unittest.TestCase):
         self.assertEqual(document["stable_state"]["result"], "unchanged")
         self.assertEqual(document["stable_state"]["snapshot_schema_version"], 1)
         self.assertEqual(len(document["residue"]), 3)
+        self.assertEqual(document["runtime"]["tooling"]["version_info"]["minor"], 11)
+        self.assertEqual(document["runtime"]["production"]["version_info"]["minor"], 10)
+        self.assertEqual(document["runtime"]["floor_witness"], "monitor01")
+        self.assertEqual(document["runtime"]["comparison"]["result"], "unchanged")
+        self.assertEqual(len(document["runtime"]["nodes"]["pre"]["probes"]), 3)
+        self.assertEqual(len(document["runtime"]["nodes"]["post"]["probes"]), 3)
         self.assertEqual(
             (self.runs / LATEST_NAME).read_text(encoding="utf-8").strip(),
             result.run_directory.name,
         )
+
+    def test_pass_rejects_missing_substituted_duplicate_or_extra_runtime_hosts(self) -> None:
+        pristine = self.pass_document()
+        mutations = ("missing", "substituted", "duplicate", "extra")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                document = copy.deepcopy(pristine)
+                for phase in ("pre", "post"):
+                    probes = document["runtime"]["nodes"][phase]["probes"]
+                    if mutation == "missing":
+                        probes.pop()
+                    elif mutation == "substituted":
+                        probes[-1]["host"] = "substitute01"
+                    elif mutation == "duplicate":
+                        probes.append(copy.deepcopy(probes[-1]))
+                    else:
+                        extra = copy.deepcopy(probes[-1])
+                        extra["host"] = "extra01"
+                        probes.append(extra)
+                self.assertFalse(is_python310_qualification(document))
+
+    def test_pass_rejects_missing_substituted_duplicate_or_extra_residue_hosts(self) -> None:
+        pristine = self.pass_document()
+        mutations = ("missing", "substituted", "duplicate", "extra")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                document = copy.deepcopy(pristine)
+                residue = document["residue"]
+                if mutation == "missing":
+                    residue.pop()
+                elif mutation == "substituted":
+                    residue[-1]["host"] = "substitute01"
+                elif mutation == "duplicate":
+                    residue.append(copy.deepcopy(residue[-1]))
+                else:
+                    residue.append(
+                        {"host": "extra01", "result": "clean", "detail": "no residue"}
+                    )
+                self.assertFalse(is_python310_qualification(document))
+
+    def test_pass_rejects_incomplete_preflight_and_baseline_evidence(self) -> None:
+        pristine = self.pass_document()
+        document = copy.deepcopy(pristine)
+        document["preflight"] = document["preflight"][:-1]
+        self.assertFalse(is_python310_qualification(document))
+
+        document = copy.deepcopy(pristine)
+        document["baseline"]["shell_bundle_hash"] = None
+        self.assertFalse(is_python310_qualification(document))
+
+    def test_pass_rejects_a_missing_or_multiline_next_action(self) -> None:
+        pristine = self.pass_document()
+        for action in (None, "", "first\nsecond", "first\rsecond"):
+            with self.subTest(action=action):
+                document = copy.deepcopy(pristine)
+                document["next_action"] = action
+                self.assertFalse(is_python310_qualification(document))
 
     def test_markdown_and_json_say_the_same_thing(self) -> None:
         location = self.write(self.run_gate())

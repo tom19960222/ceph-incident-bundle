@@ -137,6 +137,13 @@ Offline proof 是必要條件，但不能替代 real-lab proof。
 
 Post-cutover real-lab qualification 必須先以固定 SHA-256、commit、shell bundle hash、profile hash 與完整 lab identity 驗證保存的 #21 PASS evidence；strict identity preflight 通過後，只執行一次 Python full collect。該 invocation 必須收齊 Ceph、Rook、Prometheus 與全部 inventory nodes（含 `/var/log`）。本次 stable-state 與 residue 驗證區間只包住這次 live Python collect；cross-implementation comparison 的另一端是已保存且不再重跑的 shell bundle。
 
+Harness 使用明確指定的 Python 3.11+ tooling interpreter；workstation collect/verify 使用
+明確指定的 exact CPython 3.10.x production interpreter。Strict identity 後、collect 前後
+以固定 read-only SSH argv 記錄每台 node 的 structured runtime；至少一台 fixed `python3`
+必須是 CPython 3.10.x，並在同一次 Full Collect 完成 Node Evidence、`/var/log`、archive
+acceptance 與 residue proof。Qualification 不得安裝、切換或修改任何 workstation/node
+runtime。
+
 通過條件全部為必要條件：
 
 1. 保存的 #21 report 與 shell bundle 通過固定 provenance/hash 驗證，本次 Python invocation 未使用 `cephadm shell`、`kubectl exec` 或其他禁止動作。
@@ -144,5 +151,7 @@ Post-cutover real-lab qualification 必須先以固定 SHA-256、commit、shell 
 3. 新 bundle 與保存的 shell baseline 正規化後 observable contracts 等價。
 4. 前後 stable identity/configuration 相同。比較應排除自然變動的 counters、epochs、timestamps、health history 與 audit/access records。
 5. 所有 inventory nodes 都通過本次 invocation 的 remote residue check。
+6. Schema-v3 report 記錄完整 local/node runtime proof，node pre/post 完全一致，且 selected
+   floor witness 的完整 lifecycle 通過。Schema-v2 PASS 不能取代這項 3.10 proof。
 
 任一條件失敗即 fail closed。Lab Validation Report 必須只提供一個具體、可執行且不放寬安全條件的 `next_action`；不得提供多個互相競爭的建議，也不得建議略過 identity、coverage、verification、state diff 或 residue gate。

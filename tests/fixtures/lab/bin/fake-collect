@@ -18,6 +18,7 @@ Knobs (env), all suffixed with the implementation name so the two runs diverge:
   FAKE_COLLECT_NO_BUNDLE_<impl>  produce no bundle at all
   FAKE_COLLECT_DROP_<impl>       omit these layers (ceph rook prometheus nodes varlog)
   FAKE_COLLECT_SKIP_<impl>       emit only a SKIPPED marker for these layers
+  FAKE_COLLECT_DROP_VARLOG_NODE_<impl> omit /var/log for one named node
   FAKE_COLLECT_DIVERGE_<impl>    manifest-exit | extra-artifact | not-json | selection
   FAKE_COLLECT_RESIDUE_<impl>    leave a workspace entry on every node
   FAKE_COLLECT_LOCAL_RESIDUE_<impl> leave a collector-owned local workdir
@@ -135,10 +136,15 @@ if not hosts:
 exit_code = int(knob("EXIT", "0"))
 dropped = set(knob("DROP").split())
 skipped = set(knob("SKIP").split())
+drop_varlog_node = knob("DROP_VARLOG_NODE")
 diverge = knob("DIVERGE")
 for layer in dropped | skipped:
     if layer not in LAYERS:
         reject(f"unknown layer knob: {layer}")
+
+collect_marker = os.environ.get("FAKE_LAB_COLLECT_MARKER")
+if collect_marker:
+    Path(collect_marker).touch()
 
 # The two runs happen at different moments against a live cluster, so the fixture
 # deliberately puts a different clock and a different counter in every bundle:
@@ -262,7 +268,7 @@ if "nodes" not in dropped:
             )
         if "varlog" in skipped:
             skip(f"nodes/{alias}/logs/var-log/SKIPPED.txt", "--skip-logs was requested")
-        elif "varlog" not in dropped:
+        elif "varlog" not in dropped and alias != drop_varlog_node:
             members[f"nodes/{alias}/logs/var-log/INDEX.tsv"] = (
                 f"syslog\t{counter}\n".encode("utf-8")
             )

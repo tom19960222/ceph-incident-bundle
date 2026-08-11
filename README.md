@@ -148,8 +148,8 @@ Exit code：
 
 ## 驗證
 
-離線 gate 要用絕對路徑明確提供彼此獨立的 production 與 tooling interpreter；目前的
-prefactor 階段要求 production 為 CPython 3.11+、tooling 為 Python 3.11+。入口會先
+離線 gate 要用絕對路徑明確提供彼此獨立的 production 與 tooling interpreter；production
+gate 要求 exact CPython 3.10.x，tooling gate 為 Python 3.11+。入口會先
 解析並列出兩者的 executable、
 implementation 與 structured version，再依序執行 production test gate 和既有完整
 suite。Repository 不會下載或安裝 runtime／package，也不會修改 system Python、global
@@ -170,8 +170,13 @@ baseline bundle/hash，再對同一 active Lab Profile 執行一次 Python 四�
 make validate-lab \
   LAB_PROFILE=/absolute/path/to/lab.toml \
   LAB_BASELINE_REPORT=/absolute/path/to/20260805T155047Z/report.json \
+  PRODUCTION_PYTHON=/absolute/path/to/cpython3.10 \
+  TOOLING_PYTHON=/absolute/path/to/python3.11 \
   CEPH_INCIDENT_LAB_CONFIRM=1
 ```
 
-只有 final `report.md`／`report.json` 的 `status: pass` 才是 post-cutover proof。詳細流程
-見 [`docs/lab-validation-runbook.md`](docs/lab-validation-runbook.md)。
+Harness 由 tooling interpreter 執行；workstation `collect`／`verify` 只由 production
+interpreter 執行。只有 schema-v3 final `report.md`／`report.json` 的 `status: pass`，連同
+每台 node 的 pre/post runtime facts 與 CPython 3.10 witness，才是 3.10 qualification
+proof。既有 schema-v2 PASS 保留原本 post-cutover proof 的意義，但不能被當成 3.10
+proof。詳細流程見 [`docs/lab-validation-runbook.md`](docs/lab-validation-runbook.md)。

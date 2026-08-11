@@ -281,6 +281,8 @@ class QualifyCommandTests(CliTestCase):
             str(profile),
             "--baseline-report",
             "/labs/report.json",
+            "--production-python",
+            "/opt/cpython/bin/python3",
             "--runs-dir",
             str(self.runs),
         )
@@ -309,6 +311,31 @@ class QualifyCommandTests(CliTestCase):
         self.assertEqual(relative.returncode, 1)
         self.assertIn("must be an absolute path", relative.stderr)
 
+    def test_requires_an_absolute_production_interpreter(self) -> None:
+        profile = self.lab.write_profile()
+        missing = self.run_cli(
+            "qualify",
+            "--profile",
+            str(profile),
+            "--baseline-report",
+            "/labs/report.json",
+            CEPH_INCIDENT_LAB_CONFIRM="1",
+        )
+        relative = self.run_cli(
+            "qualify",
+            "--profile",
+            str(profile),
+            "--baseline-report",
+            "/labs/report.json",
+            "--production-python",
+            "python3",
+            CEPH_INCIDENT_LAB_CONFIRM="1",
+        )
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("--production-python is required", missing.stderr)
+        self.assertEqual(relative.returncode, 1)
+        self.assertIn("must be an absolute path", relative.stderr)
+
     def test_an_unusable_profile_still_leaves_a_report_in_the_run_directory(self) -> None:
         broken = self.lab.profiles / "broken.toml"
         broken.write_text("this is not a lab profile\n", encoding="utf-8")
@@ -318,6 +345,8 @@ class QualifyCommandTests(CliTestCase):
             str(broken),
             "--baseline-report",
             "/labs/report.json",
+            "--production-python",
+            "/opt/cpython/bin/python3",
             "--runs-dir",
             str(self.runs),
             CEPH_INCIDENT_LAB_CONFIRM="1",

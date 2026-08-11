@@ -20,6 +20,7 @@ only that it did.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -29,12 +30,17 @@ from typing import TYPE_CHECKING
 from validation.lab_output import utc_timestamp, write_owner_only
 from validation.lab_preflight import PreflightResult
 from validation.lab_profile import CREDENTIAL_MARKERS, safe_display_path
+from validation.lab_runtime import (
+    RuntimeIdentity,
+    RuntimeSnapshot,
+    parse_runtime_identity,
+)
 
 if TYPE_CHECKING:  # a report describes a qualification; it must not import one
     from validation.lab_qualify import QualifyResult
 
 
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 3
 REPORT_JSON_NAME = "report.json"
 REPORT_MARKDOWN_NAME = "report.md"
 LATEST_NAME = "LATEST"
@@ -43,6 +49,39 @@ STATUS_PASS = "pass"
 COLLECTOR_PATHS = ("ceph", "rook", "prometheus", "nodes", "var_log")
 RUN_ID_FORMAT = "%Y%m%dT%H%M%SZ"
 GIT_TIMEOUT_SECONDS = 10
+REQUIRED_QUALIFICATION_CHECKS = frozenset(
+    {
+        "code-identity",
+        "read-only-opt-ins",
+        "runtime-tooling",
+        "runtime-production",
+        "baseline-evidence",
+        "profile-state",
+        "credential-paths",
+        "ssh-fingerprints",
+        "required-hosts",
+        "ceph-identity",
+        "rook-identity",
+        "prometheus-readiness",
+        "baseline-identity",
+        "shared-inventory",
+        "runtime-node-pre",
+        "runtime-floor-witness",
+        "stable-state-pre",
+        "residue-baseline",
+        "code-identity-pre-collect",
+        "collect-python",
+        "runtime-floor-witness-collect",
+        "collector-coverage-python",
+        "workstation-cleanup-python",
+        "bundle-comparison",
+        "stable-state-post",
+        "runtime-node-post",
+        "remote-residue",
+        "runtime-floor-witness-proof",
+        "code-identity-final",
+    }
+)
 
 
 class ReportRejected(Exception):
@@ -209,6 +248,36 @@ class StableStateRecord:
 
 
 @dataclass(frozen=True)
+class RuntimeProofRecord:
+    """Structured interpreter proof kept outside every evidence bundle."""
+
+    tooling: RuntimeIdentity | None = None
+    production: RuntimeIdentity | None = None
+    nodes_pre: RuntimeSnapshot | None = None
+    nodes_post: RuntimeSnapshot | None = None
+    comparison_result: str = NOT_RUN
+    differences: tuple[str, ...] = ()
+    floor_witness: str | None = None
+
+    def document(self) -> dict[str, object]:
+        return {
+            "tooling": None if self.tooling is None else self.tooling.document(),
+            "production": (
+                None if self.production is None else self.production.document()
+            ),
+            "nodes": {
+                "pre": None if self.nodes_pre is None else self.nodes_pre.document(),
+                "post": None if self.nodes_post is None else self.nodes_post.document(),
+            },
+            "comparison": {
+                "result": self.comparison_result,
+                "differences": list(self.differences),
+            },
+            "floor_witness": self.floor_witness,
+        }
+
+
+@dataclass(frozen=True)
 class ResidueRecord:
     """One node's remote residue check, scoped to this run's invocations."""
 
@@ -241,6 +310,7 @@ class LabValidationReport:
     comparison: ComparisonRecord = field(default_factory=ComparisonRecord)
     stable_state: StableStateRecord = field(default_factory=StableStateRecord)
     residue: tuple[ResidueRecord, ...] = ()
+    runtime: RuntimeProofRecord = field(default_factory=RuntimeProofRecord)
     schema_version: int = REPORT_SCHEMA_VERSION
 
     @property
@@ -267,6 +337,7 @@ class LabValidationReport:
             "comparison": self.comparison.document(),
             "stable_state": self.stable_state.document(),
             "residue": [entry.document() for entry in self.residue],
+            "runtime": self.runtime.document(),
             "status": self.status,
             "next_action": self.next_action,
         }
@@ -350,6 +421,8 @@ class LabValidationReport:
             f"- result: {self.stable_state.result}",
         ]
         lines += [f"- difference: {item}" for item in self.stable_state.differences]
+        lines += ["", "## Runtime proof", ""]
+        lines += _runtime_lines(self.runtime)
         lines += ["", "## Remote residue", ""]
         lines += _table(
             ("host", "result", "detail"),
@@ -457,6 +530,7 @@ def report_from_qualification(result: "QualifyResult", *, code: CodeIdentity) ->
         comparison=result.comparison,
         stable_state=result.stable_state,
         residue=result.residue,
+        runtime=result.runtime,
         status=result.status,
         next_action=result.next_action,
     )
@@ -511,13 +585,308 @@ def latest_report(runs_directory: Path) -> dict[str, object] | None:
 
 
 def _reject_unusable(report: LabValidationReport) -> None:
+    if report.schema_version != REPORT_SCHEMA_VERSION:
+        raise ReportRejected(
+            f"current reports must use schema version {REPORT_SCHEMA_VERSION}"
+        )
     if not report.status.strip():
         raise ReportRejected("a report must carry a status")
-    action = report.next_action.strip()
-    if not action:
+    if not report.next_action.strip():
         raise ReportRejected("a report must carry exactly one next_action")
-    if "\n" in report.next_action:
+    if not _next_action_is_usable(report.next_action):
         raise ReportRejected("a report must carry exactly one next_action, not a list")
+    if report.status == STATUS_PASS and not is_python310_qualification(
+        report.document()
+    ):
+        raise ReportRejected(
+            "a schema-v3 PASS requires complete runtime proof and qualification evidence"
+        )
+
+
+def is_python310_qualification(document: dict[str, object]) -> bool:
+    """Whether an untrusted stored report proves the schema-v3 runtime contract."""
+
+    if (
+        document.get("schema_version") != REPORT_SCHEMA_VERSION
+        or document.get("status") != STATUS_PASS
+        or not _next_action_is_usable(document.get("next_action"))
+        or not runtime_document_is_complete(document.get("runtime"))
+    ):
+        return False
+    baseline = document.get("baseline")
+    code = document.get("code")
+    comparison = document.get("comparison")
+    identity = document.get("lab_identity")
+    preflight = document.get("preflight")
+    profile = document.get("profile")
+    stable = document.get("stable_state")
+    runs = document.get("runs")
+    residue = document.get("residue")
+    if (
+        not isinstance(code, dict)
+        or re.fullmatch(r"[0-9a-f]{40}", str(code.get("commit", ""))) is None
+        or code.get("dirty") is not False
+        or not isinstance(profile, dict)
+        or profile.get("state") != "active"
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", str(profile.get("hash", "")))
+        is None
+        or not isinstance(profile.get("name"), str)
+        or not profile["name"]
+        or not isinstance(baseline, dict)
+        or baseline.get("status") != "pass"
+        or not _baseline_is_complete(baseline)
+        or baseline.get("profile_hash") != profile.get("hash")
+        or not _preflight_is_complete(preflight)
+        or not isinstance(comparison, dict)
+        or comparison.get("result") != "equivalent"
+        or comparison.get("differences") != []
+        or not isinstance(stable, dict)
+        or stable.get("snapshot_schema_version") != 1
+        or stable.get("result") != "unchanged"
+        or stable.get("differences") != []
+        or not isinstance(runs, list)
+        or not isinstance(residue, list)
+        or not residue
+        or not _identity_is_complete(identity)
+    ):
+        return False
+    if (
+        len(runs) != 2
+        or [run.get("implementation") for run in runs if isinstance(run, dict)]
+        != ["shell", "python"]
+        or not all(isinstance(run, dict) and _run_is_complete(run) for run in runs)
+        or runs[0].get("bundle_path") != baseline.get("shell_bundle_path")
+        or runs[0].get("bundle_hash") != baseline.get("shell_bundle_hash")
+    ):
+        return False
+    verified_hosts = _verified_host_names(identity)
+    runtime_hosts = _runtime_host_names(document.get("runtime"))
+    residue_hosts = _residue_host_names(residue)
+    return (
+        verified_hosts is not None
+        and verified_hosts == runtime_hosts == residue_hosts
+    )
+
+
+def _baseline_is_complete(baseline: dict[str, object]) -> bool:
+    return (
+        isinstance(baseline.get("report_path"), str)
+        and Path(baseline["report_path"]).is_absolute()
+        and isinstance(baseline.get("shell_bundle_path"), str)
+        and Path(baseline["shell_bundle_path"]).is_absolute()
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(baseline.get("report_hash", "")))
+        is not None
+        and re.fullmatch(r"[0-9a-f]{40}", str(baseline.get("code_commit", "")))
+        is not None
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(baseline.get("profile_hash", "")))
+        is not None
+        and re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(baseline.get("shell_bundle_hash", ""))
+        )
+        is not None
+    )
+
+
+def _next_action_is_usable(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and "\n" not in value
+        and "\r" not in value
+    )
+
+
+def _preflight_is_complete(value: object) -> bool:
+    if not isinstance(value, list) or not value:
+        return False
+    checks: dict[str, bool] = {}
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"name", "ok", "detail"}
+            or not isinstance(item.get("name"), str)
+            or not isinstance(item.get("detail"), str)
+            or item.get("ok") is not True
+            or item["name"] in checks
+        ):
+            return False
+        checks[item["name"]] = True
+    return REQUIRED_QUALIFICATION_CHECKS <= set(checks)
+
+
+def _verified_host_names(value: object) -> set[str] | None:
+    if not _identity_is_complete(value):
+        return None
+    assert isinstance(value, dict)
+    assert isinstance(value["hosts"], list)
+    names = [
+        host.get("name")
+        for host in value["hosts"]
+        if isinstance(host, dict) and isinstance(host.get("name"), str)
+    ]
+    return set(names) if names and len(names) == len(value["hosts"]) == len(set(names)) else None
+
+
+def _identity_is_complete(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "ceph_fsid",
+        "rook_fsid",
+        "prometheus",
+        "hosts",
+    }:
+        return False
+    prometheus = value.get("prometheus")
+    hosts = value.get("hosts")
+    if (
+        not isinstance(value.get("ceph_fsid"), str)
+        or not value["ceph_fsid"]
+        or not isinstance(value.get("rook_fsid"), str)
+        or not value["rook_fsid"]
+        or not isinstance(prometheus, dict)
+        or set(prometheus) != {"url", "ready"}
+        or not isinstance(prometheus.get("url"), str)
+        or not prometheus["url"]
+        or prometheus.get("ready") is not True
+        or not isinstance(hosts, list)
+        or not hosts
+    ):
+        return False
+    for host in hosts:
+        if not isinstance(host, dict) or set(host) != {
+            "name",
+            "address",
+            "hostname",
+            "ssh_fingerprints_verified",
+        }:
+            return False
+        fingerprints = host.get("ssh_fingerprints_verified")
+        if (
+            not all(
+                isinstance(host.get(field), str) and host[field]
+                for field in ("name", "address", "hostname")
+            )
+            or not isinstance(fingerprints, list)
+            or not fingerprints
+            or not all(isinstance(item, str) and item for item in fingerprints)
+            or len(fingerprints) != len(set(fingerprints))
+        ):
+            return False
+    names = [host["name"] for host in hosts]
+    return len(names) == len(set(names))
+
+
+def _runtime_host_names(value: object) -> set[str] | None:
+    if not isinstance(value, dict) or not isinstance(value.get("nodes"), dict):
+        return None
+    pre = _probe_documents(value["nodes"].get("pre"))
+    return None if pre is None else set(pre)
+
+
+def _residue_host_names(value: list[object]) -> set[str] | None:
+    names: list[str] = []
+    for entry in value:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"host", "result", "detail"}
+            or not isinstance(entry.get("host"), str)
+            or not entry["host"]
+            or entry.get("result") != "clean"
+            or not isinstance(entry.get("detail"), str)
+        ):
+            return None
+        names.append(entry["host"])
+    return set(names) if len(names) == len(set(names)) else None
+
+
+def _run_is_complete(run: dict[str, object]) -> bool:
+    coverage = run.get("coverage")
+    return (
+        run.get("exit_code") == 0
+        and isinstance(run.get("invocation_id"), str)
+        and bool(run["invocation_id"])
+        and isinstance(run.get("bundle_path"), str)
+        and Path(run["bundle_path"]).is_absolute()
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(run.get("bundle_hash", "")))
+        is not None
+        and run.get("verify_result") == "pass"
+        and isinstance(coverage, dict)
+        and set(coverage) == set(COLLECTOR_PATHS)
+        and all(value == "collected" for value in coverage.values())
+    )
+
+
+def runtime_document_is_complete(value: object) -> bool:
+    """Validate the machine-readable runtime proof without trusting its producer."""
+
+    if not isinstance(value, dict):
+        return False
+    tooling = value.get("tooling")
+    production = value.get("production")
+    if not _runtime_matches(tooling, minimum=(3, 11)):
+        return False
+    if not _runtime_matches(production, exact=(3, 10), implementation="cpython"):
+        return False
+    witness = value.get("floor_witness")
+    comparison = value.get("comparison")
+    nodes = value.get("nodes")
+    if (
+        not isinstance(witness, str)
+        or not witness
+        or not isinstance(comparison, dict)
+        or comparison.get("result") != "unchanged"
+        or comparison.get("differences") != []
+        or not isinstance(nodes, dict)
+    ):
+        return False
+    pre = _probe_documents(nodes.get("pre"))
+    post = _probe_documents(nodes.get("post"))
+    if pre is None or post is None or pre != post or witness not in pre:
+        return False
+    if not all(
+        _runtime_matches(probe.get("runtime"), minimum=(3, 10), implementation="cpython")
+        for probe in pre.values()
+    ):
+        return False
+    return _runtime_matches(
+        pre[witness].get("runtime"), exact=(3, 10), implementation="cpython"
+    )
+
+
+def _probe_documents(value: object) -> dict[str, dict[str, object]] | None:
+    if not isinstance(value, dict) or not isinstance(value.get("probes"), list):
+        return None
+    probes: dict[str, dict[str, object]] = {}
+    for item in value["probes"]:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"host", "exit_code", "status", "runtime", "detail"}
+            or not isinstance(item.get("host"), str)
+            or not item["host"]
+            or item.get("status") != "ok"
+            or item.get("exit_code") != 0
+            or not isinstance(item.get("detail"), str)
+            or item["host"] in probes
+        ):
+            return None
+        probes[item["host"]] = item
+    return probes or None
+
+
+def _runtime_matches(
+    value: object,
+    *,
+    minimum: tuple[int, int] | None = None,
+    exact: tuple[int, int] | None = None,
+    implementation: str | None = None,
+) -> bool:
+    try:
+        runtime = parse_runtime_identity(json.dumps(value))
+    except (TypeError, ValueError):
+        return False
+    if implementation is not None and runtime.implementation != implementation:
+        return False
+    pair = (runtime.version_info.major, runtime.version_info.minor)
+    return (minimum is None or pair >= minimum) and (exact is None or pair == exact)
 
 
 def _forbidden_marker(text: str) -> str | None:
@@ -575,6 +944,33 @@ def _identity_lines(identity: dict[str, object]) -> list[str]:
 
 def _coverage_gaps(coverage: CollectorCoverage) -> str:
     return ", ".join(coverage.gaps())
+
+
+def _runtime_lines(runtime: RuntimeProofRecord) -> list[str]:
+    tooling = runtime.tooling.document() if runtime.tooling is not None else None
+    production = (
+        runtime.production.document() if runtime.production is not None else None
+    )
+    lines = [
+        "- tooling: " + (json.dumps(tooling, sort_keys=True) if tooling else NOT_RUN),
+        "- production: "
+        + (json.dumps(production, sort_keys=True) if production else NOT_RUN),
+        f"- comparison: {runtime.comparison_result}",
+        f"- floor witness: {runtime.floor_witness or NOT_RUN}",
+    ]
+    lines += [f"- difference: {item}" for item in runtime.differences]
+    for moment, snapshot in (("pre", runtime.nodes_pre), ("post", runtime.nodes_post)):
+        if snapshot is None:
+            lines.append(f"- node probes {moment}: {NOT_RUN}")
+            continue
+        for probe in snapshot.probes:
+            identity = probe.runtime.document() if probe.runtime is not None else None
+            lines.append(
+                f"- node probe {moment} {probe.host}: {probe.status} "
+                f"(exit {probe.exit_code}, runtime "
+                f"{json.dumps(identity, sort_keys=True) if identity else '-'})"
+            )
+    return lines
 
 
 def _table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[str]:

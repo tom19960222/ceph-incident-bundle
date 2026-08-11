@@ -7,11 +7,16 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.lab_fixture import OTHER_FSID, FakeLab
+from tests.lab_fixture import OTHER_FSID, FakeLab, fake_runtime_identity
 from validation.lab_activation import activate
 from validation.lab_discovery import discover
 from validation.lab_preflight import preflight
-from validation.lab_report import CodeIdentity, report_from_preflight, write_report
+from validation.lab_report import (
+    REQUIRED_QUALIFICATION_CHECKS,
+    CodeIdentity,
+    report_from_preflight,
+    write_report,
+)
 from validation.lab_status import lab_status
 
 
@@ -225,11 +230,96 @@ class ReportHistoryTests(StatusTestCase):
         # not be flattened into "preflight passed".
         document["status"] = "pass"
         document["next_action"] = "Proceed to the cutover ticket"
+        witness = fake_runtime_identity().document()
+        host_names = [host["name"] for host in document["lab_identity"]["hosts"]]
+        probes = [
+            {
+                "host": host,
+                "exit_code": 0,
+                "status": "ok",
+                "runtime": witness,
+                "detail": f"runtime probe on {host}: exit 0",
+            }
+            for host in host_names
+        ]
+        document["runtime"] = {
+            "tooling": fake_runtime_identity(minor=11).document(),
+            "production": fake_runtime_identity().document(),
+            "nodes": {"pre": {"probes": probes}, "post": {"probes": probes}},
+            "comparison": {"result": "unchanged", "differences": []},
+            "floor_witness": "monitor01",
+        }
+        document["preflight"] = [
+            {"name": name, "ok": True, "detail": f"{name} passed"}
+            for name in sorted(REQUIRED_QUALIFICATION_CHECKS)
+        ]
+        bundle_path = str(self.runs / "baseline-shell.tar.gz")
+        bundle_hash = "sha256:" + "a" * 64
+        document["baseline"] = {
+            "status": "pass",
+            "report_path": str(self.runs / "baseline-report.json"),
+            "report_hash": "sha256:" + "b" * 64,
+            "code_commit": "1" * 40,
+            "profile_hash": document["profile"]["hash"],
+            "shell_bundle_path": bundle_path,
+            "shell_bundle_hash": bundle_hash,
+        }
+        complete_coverage = {
+            name: "collected"
+            for name in ("ceph", "rook", "prometheus", "nodes", "var_log")
+        }
+        document["runs"] = [
+            {
+                "implementation": "shell",
+                "exit_code": 0,
+                "invocation_id": "baseline-shell",
+                "bundle_path": bundle_path,
+                "bundle_hash": bundle_hash,
+                "verify_result": "pass",
+                "coverage": complete_coverage,
+            },
+            {
+                "implementation": "python",
+                "exit_code": 0,
+                "invocation_id": "run",
+                "bundle_path": "/tmp/bundle.tar.gz",
+                "bundle_hash": "sha256:" + "c" * 64,
+                "verify_result": "pass",
+                "coverage": complete_coverage,
+            }
+        ]
+        document["comparison"] = {"result": "equivalent", "differences": []}
+        document["stable_state"] = {
+            "snapshot_schema_version": 1,
+            "result": "unchanged",
+            "differences": [],
+        }
+        document["residue"] = [
+            {"host": host, "result": "clean", "detail": "no residue"}
+            for host in host_names
+        ]
         report_path.write_text(json.dumps(document), encoding="utf-8")
         status = self.status(profile)
         self.assertEqual(status.state, "gate-passed")
         self.assertTrue(status.ready)
         self.assertEqual(status.next_action, "Proceed to the cutover ticket")
+
+    def test_a_schema_v2_pass_remains_historical_not_python310_proof(self) -> None:
+        profile = self.lab.write_profile()
+        self.record_preflight(profile)
+        latest = (self.runs / "LATEST").read_text(encoding="utf-8").strip()
+        report_path = self.runs / latest / "report.json"
+        document = json.loads(report_path.read_text(encoding="utf-8"))
+        document["schema_version"] = 2
+        document["status"] = "pass"
+        document["next_action"] = "Old post-cutover handoff"
+        report_path.write_text(json.dumps(document), encoding="utf-8")
+
+        status = self.status(profile)
+
+        self.assertEqual(status.state, "historical-gate-passed")
+        self.assertIn("schema-v2", status.blocked_reason or "")
+        self.assertIn("make validate-lab", status.next_action)
 
     def test_reports_that_there_is_no_report_yet(self) -> None:
         status = self.status(self.lab.write_profile())
