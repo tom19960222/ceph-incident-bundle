@@ -33,7 +33,10 @@ import sys
 role = sys.argv[1]
 version = tuple(sys.version_info[:5])
 print(f"{role} interpreter:")
-print(f"  executable: {os.path.realpath(sys.executable)}")
+# Keep the selected virtual environment executable path intact. Resolving the
+# symlink with realpath would silently replace the isolated environment with
+# its base interpreter when the gates run.
+print(f"  executable: {os.path.abspath(sys.executable)}")
 print(f"  implementation: {sys.implementation.name}")
 print(
     "  version: "

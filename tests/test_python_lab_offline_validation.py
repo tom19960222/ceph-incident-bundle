@@ -22,7 +22,9 @@ def make_fake_python(
     role: str,
     version: tuple[int, int, int, str, int],
     implementation: str = "cpython",
+    reported_executable: Path | None = None,
 ) -> None:
+    reported_executable = reported_executable or path
     path.write_text(
         f"#!{sys.executable}\n"
         "import json\n"
@@ -31,7 +33,7 @@ def make_fake_python(
         "import sys\n"
         "import types\n"
         f"role = {role!r}\n"
-        f"fake_executable = {str(path)!r}\n"
+        f"fake_executable = {str(reported_executable)!r}\n"
         f"fake_version = {version!r}\n"
         "if len(sys.argv) >= 3 and sys.argv[1] == '-c':\n"
         "    sys.executable = fake_executable\n"
@@ -44,6 +46,10 @@ def make_fake_python(
         "if os.environ.get('REQUIRE_PINNED_PYTHON3') == '1':\n"
         "    if os.path.realpath(shutil.which('python3') or '') != os.path.realpath(fake_executable):\n"
         "        raise SystemExit(91)\n"
+        "expected_gate_executable = os.environ.get(role.upper() + '_EXPECTED_GATE_EXECUTABLE')\n"
+        "if expected_gate_executable is not None:\n"
+        "    if os.path.abspath(sys.argv[0]) != expected_gate_executable:\n"
+        "        raise SystemExit(92)\n"
         "with open(os.environ['OFFLINE_VALIDATION_INVOCATIONS'], 'a', encoding='utf-8') as stream:\n"
         "    stream.write(json.dumps([role, *sys.argv[1:]]) + '\\n')\n"
         "test_status = int(os.environ.get(role.upper() + '_TEST_RC', '0'))\n"
@@ -145,12 +151,12 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
         self.assertLess(production_identity, production_gate)
         self.assertLess(tooling_identity, production_gate)
         self.assertLess(production_gate, complete_gate)
-        self.assertIn(f"executable: {production.resolve()}", output)
+        self.assertIn(f"executable: {production.absolute()}", output)
         self.assertIn("implementation: cpython", output)
         self.assertIn(
             "version: major=3 minor=11 micro=7 releaselevel=final serial=0", output
         )
-        self.assertIn(f"executable: {tooling.resolve()}", output)
+        self.assertIn(f"executable: {tooling.absolute()}", output)
         self.assertIn(
             "version: major=3 minor=12 micro=2 releaselevel=final serial=0", output
         )
@@ -338,6 +344,41 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(runtime_shim_residue, [])
+
+    def test_a_selected_isolated_interpreter_is_not_replaced_by_its_realpath(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            production_target = directory / "production-base-python"
+            tooling_target = directory / "tooling-base-python"
+            production = directory / "production-venv" / "bin" / "python"
+            tooling = directory / "tooling-venv" / "bin" / "python"
+            production.parent.mkdir(parents=True)
+            tooling.parent.mkdir(parents=True)
+            make_fake_python(
+                production_target,
+                role="production",
+                version=(3, 11, 7, "final", 0),
+                reported_executable=production,
+            )
+            make_fake_python(
+                tooling_target,
+                role="tooling",
+                version=(3, 12, 2, "final", 0),
+                reported_executable=tooling,
+            )
+            production.symlink_to(production_target)
+            tooling.symlink_to(tooling_target)
+
+            result, _ = self.run_validate(
+                production,
+                tooling,
+                extra_env={
+                    "PRODUCTION_EXPECTED_GATE_EXECUTABLE": str(production),
+                    "TOOLING_EXPECTED_GATE_EXECUTABLE": str(tooling),
+                },
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class ProductionTestMembershipTests(unittest.TestCase):
