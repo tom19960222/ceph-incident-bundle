@@ -23,8 +23,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"
 ROOT="$(cd "$HERE/.." && pwd)"
 PYTHON="${PYTHON:-python3}"
-# The shards re-read PYTHON; exported so the interpreter that passed the 3.11
-# gate reaches them by the script's own doing, not the caller's spelling.
+# The shards re-read PYTHON; exported so the interpreter selected for this gate
+# reaches them by the script's own doing, not the caller's spelling.
 export PYTHON
 PATTERN='test_python_*.py'
 SCOPE="${TEST_SCOPE:-complete}"
@@ -47,7 +47,7 @@ if [[ "${1-}" == "--run-one" && "${RUN_PYTHON_TESTS_SHARD:-}" == "1" ]]; then
   cd "$ROOT"
   rc=0
   # `-p` is an fnmatch pattern, so a filename containing `*`, `?` or `[` could
-  # match nothing — and on Python 3.11, the gate's floor, "Ran 0 tests" exits 0.
+  # match nothing — and on either supported gate floor, "Ran 0 tests" exits 0.
   # The list feeding this entry point comes from `find`, so a plain filename
   # always matches itself; refuse the metacharacters instead of risking a shard
   # that silently tests nothing.

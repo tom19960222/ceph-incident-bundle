@@ -49,7 +49,7 @@ ENCODED_CONFIG = re.compile(r"[A-Za-z0-9_-]+")
 #   python3 -c 'import hashlib, ceph_incident_collectors as c; \
 #     print(hashlib.sha256(c.REMOTE_BOOTSTRAP.encode("utf-8")).hexdigest())'
 BOOTSTRAP_SOURCE_SHA256 = (
-    "420c17c1f51ef9dd5ff069edcd9cf4620eadc4ffa3f9d584d0afe9688c75f544"
+    "4128571729c2a519a6feaca3eb29201a401c874969b694e357125dbe7918390a"
 )
 
 

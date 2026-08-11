@@ -121,9 +121,10 @@ Residue check 只能檢查本次 invocation 的 identifier 或安全的固定 co
 Offline validation 必須可重複且不連接 lab，並至少證明：
 
 - `make validate` 必須明確接收、先解析並記錄彼此獨立的 `PRODUCTION_PYTHON` 與
-  `TOOLING_PYTHON` 絕對路徑。目前 production 維持 CPython 3.11+、tooling 維持
-  Python 3.11+ floor；production manifest 與既有 complete suite 是兩道可區分且
-  都必須通過的 gate。
+  `TOOLING_PYTHON` 絕對路徑。Production gate 使用預先提供的 CPython 3.10.x，
+  tooling gate 維持 Python 3.11+ floor；production manifest 與既有 complete suite
+  是兩道可區分且都必須通過的 gate。這項 offline proof 不取代 Python 3.10
+  real-lab qualification，也不自行更新尚未通過 qualification 的公開支援聲明。
 - fake adapters 記錄每個 external command 與 argv；測試對禁止的 mutating verbs、default-off fallback 與未預期 command fail closed。
 - 每個 collector 只寫入 owned workspace；path traversal、symlink/hardlink、archive special files、member collision、oversize 與 truncated stream 在 extraction 前被拒絕。
 - success、partial、failure、timeout 與 interrupt 都有 remote/local cleanup 或預期的 failure-workdir retention 測試。
