@@ -24,6 +24,9 @@ Knobs (env):
   FAKE_LAB_CEPH_STATE_FAIL space-separated ceph subcommands that fail
   FAKE_LAB_RESIDUE_FILE    JSON {address: ["workspace\\t...", "process\\t..."]}
   FAKE_LAB_RESIDUE_FAIL    space-separated addresses whose residue probe fails
+  FAKE_LAB_RUNTIME_OUTPUTS JSON {address: raw-stdout} overriding runtime JSON
+  FAKE_LAB_RUNTIME_EXITS   JSON {address: exit-code} failing runtime probes
+  FAKE_LAB_RUNTIME_DIAGNOSTICS JSON {address: stderr} for runtime failures
 """
 
 from __future__ import annotations
@@ -71,6 +74,22 @@ REMOTE_COMMANDS = ("hostname",) + tuple(
     for subcommand in CEPH_SUBCOMMANDS
 )
 RESIDUE_SENTINEL = "# ceph-incident-residue-probe"
+RUNTIME_PROBE_SOURCE = """import json
+import sys
+version = sys.version_info
+print(json.dumps({
+    "executable": sys.executable,
+    "implementation": sys.implementation.name,
+    "version_info": {
+        "major": version.major,
+        "minor": version.minor,
+        "micro": version.micro,
+        "releaselevel": version.releaselevel,
+        "serial": version.serial,
+    },
+}, sort_keys=True, separators=(",", ":")))
+"""
+RUNTIME_PROBE_COMMAND = shlex.join(("python3", "-I", "-c", RUNTIME_PROBE_SOURCE))
 # The stable state a healthy fake lab reports.  Every value here is identity or
 # desired configuration; the snapshot projection is what decides that, so the
 # fixture also serves volatile fields (epochs, counters, status) to prove they
@@ -167,7 +186,8 @@ if target is None:
 address = target.group(2)
 remote = arguments[-1]
 is_residue_probe = remote.startswith(RESIDUE_SENTINEL)
-if not is_residue_probe and remote not in REMOTE_COMMANDS:
+is_runtime_probe = remote == RUNTIME_PROBE_COMMAND
+if not is_residue_probe and not is_runtime_probe and remote not in REMOTE_COMMANDS:
     reject("remote command is not whitelisted")
 
 known_hosts = KNOWN_HOSTS_FILE.fullmatch(arguments[len(EXPECTED) - 1]).group(1)
@@ -198,6 +218,34 @@ if is_residue_probe:
             entries = []
     for entry in entries:
         sys.stdout.write(entry + "\n")
+    raise SystemExit(0)
+
+if is_runtime_probe:
+    exits = json.loads(os.environ.get("FAKE_LAB_RUNTIME_EXITS", "{}"))
+    code = exits.get(address, 0)
+    if code:
+        diagnostics = json.loads(
+            os.environ.get("FAKE_LAB_RUNTIME_DIAGNOSTICS", "{}")
+        )
+        default = {
+            127: "python3: command not found",
+            255: "ssh transport failure",
+        }.get(code, "runtime probe failed")
+        sys.stderr.write(diagnostics.get(address, default) + "\n")
+        raise SystemExit(code)
+    outputs = json.loads(os.environ.get("FAKE_LAB_RUNTIME_OUTPUTS", "{}"))
+    default = {
+        "executable": "/usr/bin/python3",
+        "implementation": "cpython",
+        "version_info": {
+            "major": 3,
+            "minor": 10,
+            "micro": 14,
+            "releaselevel": "final",
+            "serial": 0,
+        },
+    }
+    sys.stdout.write(outputs.get(address, json.dumps(default)) + "\n")
     raise SystemExit(0)
 
 if remote == "hostname":

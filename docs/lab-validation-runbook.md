@@ -22,6 +22,11 @@ post-cutover proof:
 `lab-preflight` proves identity only. Only a post-cutover `validate-lab` report with
 `status: pass` proves the shipped Python-only commit against the preserved baseline.
 
+The reusable structured node-runtime probe in `validation/lab_runtime.py` is a
+prefactor for the later schema-v3 integration. The current schema-v2 gate does not
+invoke it, record its results or treat a schema-v2 PASS as Python 3.10 qualification
+evidence.
+
 ## Non-Negotiable Safety Rules
 
 - Use only an explicitly selected, active TOML Lab Profile. Never parse
