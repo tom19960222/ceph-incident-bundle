@@ -29,12 +29,13 @@ from typing import TYPE_CHECKING
 from validation.lab_output import utc_timestamp, write_owner_only
 from validation.lab_preflight import PreflightResult
 from validation.lab_profile import CREDENTIAL_MARKERS, safe_display_path
+from validation.lab_runtime import RuntimeIdentity, RuntimeSnapshot
 
 if TYPE_CHECKING:  # a report describes a qualification; it must not import one
     from validation.lab_qualify import QualifyResult
 
 
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 3
 REPORT_JSON_NAME = "report.json"
 REPORT_MARKDOWN_NAME = "report.md"
 LATEST_NAME = "LATEST"
@@ -209,6 +210,36 @@ class StableStateRecord:
 
 
 @dataclass(frozen=True)
+class RuntimeProofRecord:
+    """Structured interpreter proof kept outside every evidence bundle."""
+
+    tooling: RuntimeIdentity | None = None
+    production: RuntimeIdentity | None = None
+    nodes_pre: RuntimeSnapshot | None = None
+    nodes_post: RuntimeSnapshot | None = None
+    comparison_result: str = NOT_RUN
+    differences: tuple[str, ...] = ()
+    floor_witness: str | None = None
+
+    def document(self) -> dict[str, object]:
+        return {
+            "tooling": None if self.tooling is None else self.tooling.document(),
+            "production": (
+                None if self.production is None else self.production.document()
+            ),
+            "nodes": {
+                "pre": None if self.nodes_pre is None else self.nodes_pre.document(),
+                "post": None if self.nodes_post is None else self.nodes_post.document(),
+            },
+            "comparison": {
+                "result": self.comparison_result,
+                "differences": list(self.differences),
+            },
+            "floor_witness": self.floor_witness,
+        }
+
+
+@dataclass(frozen=True)
 class ResidueRecord:
     """One node's remote residue check, scoped to this run's invocations."""
 
@@ -241,6 +272,7 @@ class LabValidationReport:
     comparison: ComparisonRecord = field(default_factory=ComparisonRecord)
     stable_state: StableStateRecord = field(default_factory=StableStateRecord)
     residue: tuple[ResidueRecord, ...] = ()
+    runtime: RuntimeProofRecord = field(default_factory=RuntimeProofRecord)
     schema_version: int = REPORT_SCHEMA_VERSION
 
     @property
@@ -267,6 +299,7 @@ class LabValidationReport:
             "comparison": self.comparison.document(),
             "stable_state": self.stable_state.document(),
             "residue": [entry.document() for entry in self.residue],
+            "runtime": self.runtime.document(),
             "status": self.status,
             "next_action": self.next_action,
         }
@@ -350,6 +383,8 @@ class LabValidationReport:
             f"- result: {self.stable_state.result}",
         ]
         lines += [f"- difference: {item}" for item in self.stable_state.differences]
+        lines += ["", "## Runtime proof", ""]
+        lines += _runtime_lines(self.runtime)
         lines += ["", "## Remote residue", ""]
         lines += _table(
             ("host", "result", "detail"),
@@ -457,6 +492,7 @@ def report_from_qualification(result: "QualifyResult", *, code: CodeIdentity) ->
         comparison=result.comparison,
         stable_state=result.stable_state,
         residue=result.residue,
+        runtime=result.runtime,
         status=result.status,
         next_action=result.next_action,
     )
@@ -511,6 +547,10 @@ def latest_report(runs_directory: Path) -> dict[str, object] | None:
 
 
 def _reject_unusable(report: LabValidationReport) -> None:
+    if report.schema_version != REPORT_SCHEMA_VERSION:
+        raise ReportRejected(
+            f"current reports must use schema version {REPORT_SCHEMA_VERSION}"
+        )
     if not report.status.strip():
         raise ReportRejected("a report must carry a status")
     action = report.next_action.strip()
@@ -518,6 +558,159 @@ def _reject_unusable(report: LabValidationReport) -> None:
         raise ReportRejected("a report must carry exactly one next_action")
     if "\n" in report.next_action:
         raise ReportRejected("a report must carry exactly one next_action, not a list")
+    if report.status == STATUS_PASS and not is_python310_qualification(
+        report.document()
+    ):
+        raise ReportRejected(
+            "a schema-v3 PASS requires complete runtime proof and qualification evidence"
+        )
+
+
+def is_python310_qualification(document: dict[str, object]) -> bool:
+    """Whether an untrusted stored report proves the schema-v3 runtime contract."""
+
+    if (
+        document.get("schema_version") != REPORT_SCHEMA_VERSION
+        or document.get("status") != STATUS_PASS
+        or not runtime_document_is_complete(document.get("runtime"))
+    ):
+        return False
+    baseline = document.get("baseline")
+    comparison = document.get("comparison")
+    stable = document.get("stable_state")
+    runs = document.get("runs")
+    residue = document.get("residue")
+    if (
+        not isinstance(baseline, dict)
+        or baseline.get("status") != "pass"
+        or not isinstance(comparison, dict)
+        or comparison.get("result") != "equivalent"
+        or not isinstance(stable, dict)
+        or stable.get("result") != "unchanged"
+        or not isinstance(runs, list)
+        or not isinstance(residue, list)
+        or not residue
+    ):
+        return False
+    live = [
+        run
+        for run in runs
+        if isinstance(run, dict) and run.get("implementation") == "python"
+    ]
+    if len(live) != 1 or not _run_is_complete(live[0]):
+        return False
+    return all(
+        isinstance(entry, dict) and entry.get("result") == "clean"
+        for entry in residue
+    )
+
+
+def _run_is_complete(run: dict[str, object]) -> bool:
+    coverage = run.get("coverage")
+    return (
+        run.get("exit_code") == 0
+        and run.get("verify_result") == "pass"
+        and isinstance(coverage, dict)
+        and set(coverage) == set(COLLECTOR_PATHS)
+        and all(value == "collected" for value in coverage.values())
+    )
+
+
+def runtime_document_is_complete(value: object) -> bool:
+    """Validate the machine-readable runtime proof without trusting its producer."""
+
+    if not isinstance(value, dict):
+        return False
+    tooling = value.get("tooling")
+    production = value.get("production")
+    if not _runtime_matches(tooling, minimum=(3, 11)):
+        return False
+    if not _runtime_matches(production, exact=(3, 10), implementation="cpython"):
+        return False
+    witness = value.get("floor_witness")
+    comparison = value.get("comparison")
+    nodes = value.get("nodes")
+    if (
+        not isinstance(witness, str)
+        or not witness
+        or not isinstance(comparison, dict)
+        or comparison.get("result") != "unchanged"
+        or comparison.get("differences") != []
+        or not isinstance(nodes, dict)
+    ):
+        return False
+    pre = _probe_documents(nodes.get("pre"))
+    post = _probe_documents(nodes.get("post"))
+    if pre is None or post is None or pre != post or witness not in pre:
+        return False
+    if not all(
+        _runtime_matches(probe.get("runtime"), minimum=(3, 10), implementation="cpython")
+        for probe in pre.values()
+    ):
+        return False
+    return _runtime_matches(
+        pre[witness].get("runtime"), exact=(3, 10), implementation="cpython"
+    )
+
+
+def _probe_documents(value: object) -> dict[str, dict[str, object]] | None:
+    if not isinstance(value, dict) or not isinstance(value.get("probes"), list):
+        return None
+    probes: dict[str, dict[str, object]] = {}
+    for item in value["probes"]:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"host", "exit_code", "status", "runtime", "detail"}
+            or not isinstance(item.get("host"), str)
+            or not item["host"]
+            or item.get("status") != "ok"
+            or item.get("exit_code") != 0
+            or not isinstance(item.get("detail"), str)
+            or item["host"] in probes
+        ):
+            return None
+        probes[item["host"]] = item
+    return probes or None
+
+
+def _runtime_matches(
+    value: object,
+    *,
+    minimum: tuple[int, int] | None = None,
+    exact: tuple[int, int] | None = None,
+    implementation: str | None = None,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    version = value.get("version_info")
+    observed_implementation = value.get("implementation")
+    executable = value.get("executable")
+    if (
+        set(value) != {"executable", "implementation", "version_info"}
+        or not isinstance(version, dict)
+        or set(version) != {"major", "minor", "micro", "releaselevel", "serial"}
+        or not isinstance(executable, str)
+        or not executable.startswith("/")
+        or not isinstance(observed_implementation, str)
+        or (implementation is not None and observed_implementation != implementation)
+    ):
+        return False
+    major = version.get("major")
+    minor = version.get("minor")
+    micro = version.get("micro")
+    serial = version.get("serial")
+    releaselevel = version.get("releaselevel")
+    if (
+        type(major) is not int
+        or type(minor) is not int
+        or type(micro) is not int
+        or type(serial) is not int
+        or min(major, minor, micro, serial) < 0
+        or releaselevel not in {"alpha", "beta", "candidate", "final"}
+    ):
+        return False
+    pair = (major, minor)
+    return (minimum is None or pair >= minimum) and (exact is None or pair == exact)
 
 
 def _forbidden_marker(text: str) -> str | None:
@@ -575,6 +768,33 @@ def _identity_lines(identity: dict[str, object]) -> list[str]:
 
 def _coverage_gaps(coverage: CollectorCoverage) -> str:
     return ", ".join(coverage.gaps())
+
+
+def _runtime_lines(runtime: RuntimeProofRecord) -> list[str]:
+    tooling = runtime.tooling.document() if runtime.tooling is not None else None
+    production = (
+        runtime.production.document() if runtime.production is not None else None
+    )
+    lines = [
+        "- tooling: " + (json.dumps(tooling, sort_keys=True) if tooling else NOT_RUN),
+        "- production: "
+        + (json.dumps(production, sort_keys=True) if production else NOT_RUN),
+        f"- comparison: {runtime.comparison_result}",
+        f"- floor witness: {runtime.floor_witness or NOT_RUN}",
+    ]
+    lines += [f"- difference: {item}" for item in runtime.differences]
+    for moment, snapshot in (("pre", runtime.nodes_pre), ("post", runtime.nodes_post)):
+        if snapshot is None:
+            lines.append(f"- node probes {moment}: {NOT_RUN}")
+            continue
+        for probe in snapshot.probes:
+            identity = probe.runtime.document() if probe.runtime is not None else None
+            lines.append(
+                f"- node probe {moment} {probe.host}: {probe.status} "
+                f"(exit {probe.exit_code}, runtime "
+                f"{json.dumps(identity, sort_keys=True) if identity else '-'})"
+            )
+    return lines
 
 
 def _table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[str]:

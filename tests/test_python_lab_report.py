@@ -12,6 +12,7 @@ from tests.lab_fixture import (
     ROOK_FSID,
     FakeLab,
     fake_entrypoints,
+    fake_runtime_identity,
     host_fingerprint,
 )
 from tests.test_python_lab_baseline import authority_for, write_baseline
@@ -58,6 +59,7 @@ def minimal_report(**overrides: object) -> LabValidationReport:
 class SchemaTests(unittest.TestCase):
     def test_the_document_declares_every_required_section(self) -> None:
         document = minimal_report().document()
+        self.assertEqual(REPORT_SCHEMA_VERSION, 3)
         self.assertEqual(document["schema_version"], REPORT_SCHEMA_VERSION)
         for key in (
             "timestamp",
@@ -70,10 +72,22 @@ class SchemaTests(unittest.TestCase):
             "comparison",
             "stable_state",
             "residue",
+            "runtime",
             "status",
             "next_action",
         ):
             self.assertIn(key, document)
+
+        self.assertEqual(
+            document["runtime"],
+            {
+                "tooling": None,
+                "production": None,
+                "nodes": {"pre": None, "post": None},
+                "comparison": {"result": "not-run", "differences": []},
+                "floor_witness": None,
+            },
+        )
 
     def test_unfilled_sections_say_not_run_rather_than_pass(self) -> None:
         document = minimal_report(
@@ -200,6 +214,14 @@ class WriteTests(unittest.TestCase):
     def test_refuses_a_report_without_a_status(self) -> None:
         with self.assertRaises(ReportRejected):
             write_report(self.runs, minimal_report(status=" "))
+
+    def test_schema_v3_pass_cannot_omit_runtime_proof(self) -> None:
+        with self.assertRaisesRegex(ReportRejected, "runtime proof"):
+            write_report(self.runs, minimal_report(status="pass"))
+
+    def test_current_code_cannot_silently_write_a_historical_schema(self) -> None:
+        with self.assertRaisesRegex(ReportRejected, "schema version 3"):
+            write_report(self.runs, minimal_report(schema_version=2))
 
     def test_refuses_to_write_a_report_that_carries_credential_material(self) -> None:
         leaky = minimal_report(
@@ -353,6 +375,11 @@ class QualificationReportTests(unittest.TestCase):
                 baseline_report=baseline_report,
                 run_directory=run_directory,
                 entrypoints=fake_entrypoints(("python",)),
+                production_python=Path("/opt/cpython/bin/python3"),
+                tooling_runtime=fake_runtime_identity(
+                    executable="/opt/tooling/bin/python3", minor=11
+                ),
+                production_runtime=fake_runtime_identity(),
                 collect_timeout=120,
                 repository_root=self.lab.checkout(),
             )
@@ -385,6 +412,12 @@ class QualificationReportTests(unittest.TestCase):
         self.assertEqual(document["stable_state"]["result"], "unchanged")
         self.assertEqual(document["stable_state"]["snapshot_schema_version"], 1)
         self.assertEqual(len(document["residue"]), 3)
+        self.assertEqual(document["runtime"]["tooling"]["version_info"]["minor"], 11)
+        self.assertEqual(document["runtime"]["production"]["version_info"]["minor"], 10)
+        self.assertEqual(document["runtime"]["floor_witness"], "monitor01")
+        self.assertEqual(document["runtime"]["comparison"]["result"], "unchanged")
+        self.assertEqual(len(document["runtime"]["nodes"]["pre"]["probes"]), 3)
+        self.assertEqual(len(document["runtime"]["nodes"]["post"]["probes"]), 3)
         self.assertEqual(
             (self.runs / LATEST_NAME).read_text(encoding="utf-8").strip(),
             result.run_directory.name,

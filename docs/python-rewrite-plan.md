@@ -161,15 +161,18 @@ lab harness 與 Python-only repo layout）。Closeout 必須明記實際使用 P
 
 ### Real-lab gate
 
-`make validate-lab LAB_PROFILE=/absolute/path/to/lab.toml LAB_BASELINE_REPORT=/absolute/path/to/report.json CEPH_INCIDENT_LAB_CONFIRM=1`：
+`make validate-lab LAB_PROFILE=/absolute/path/to/lab.toml LAB_BASELINE_REPORT=/absolute/path/to/report.json PRODUCTION_PYTHON=/absolute/path/to/cpython3.10 TOOLING_PYTHON=/absolute/path/to/python3.11 CEPH_INCIDENT_LAB_CONFIRM=1`：
 
 - Identity preflight 必須 fail closed。
 - 保存的 #21 PASS report、shell bundle/hash與目前 profile/identity 必須先通過。
 - Python 執行一次 full collect。
+- Harness/tooling 使用 Python 3.11+；workstation collect/verify 使用 exact CPython 3.10.x。
+- Strict identity 後對所有 node 做 pre/post structured runtime probe，並要求至少一台
+  CPython 3.10.x floor witness 完成 node evidence、`/var/log` 與 residue proof。
 - 四條 collector paths 必須完整，不能以 partial coverage 通過。
 - Python bundle 必須通過 structural/content-safety verify，且成功 output 不得殘留 owned workdir。
 - Report 必須記錄 baseline/current code identity、coverage、comparison、stable-state diff、
-  workstation/remote cleanup proof、status 與 next action。
+  workstation/remote cleanup proof、完整 schema-v3 runtime proof、status 與 next action。
 
 ## Replaceable Lab Workflow
 
@@ -179,7 +182,8 @@ lab harness 與 Python-only repo layout）。Closeout 必須明記實際使用 P
 - Repository 不硬編碼 endpoints、credentials 或即時 cluster identity。
 
 > Current status: profile workflow 保持不變；`validate-lab` 已是 #22 post-cutover gate。
-> `lab-preflight` 仍只證明 identity，只有 schema-v2 `status: pass` 是 current proof。
+> `lab-preflight` 仍只證明 identity；只有 schema-v3 `status: pass` 是 Python 3.10
+> qualification proof。既有 schema-v2 PASS 保留原本的 post-cutover 意義。
 
 ## Out of Scope
 

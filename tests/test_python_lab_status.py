@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.lab_fixture import OTHER_FSID, FakeLab
+from tests.lab_fixture import OTHER_FSID, FakeLab, fake_runtime_identity
 from validation.lab_activation import activate
 from validation.lab_discovery import discover
 from validation.lab_preflight import preflight
@@ -225,11 +225,67 @@ class ReportHistoryTests(StatusTestCase):
         # not be flattened into "preflight passed".
         document["status"] = "pass"
         document["next_action"] = "Proceed to the cutover ticket"
+        witness = fake_runtime_identity().document()
+        probe = {
+            "host": "monitor01",
+            "exit_code": 0,
+            "status": "ok",
+            "runtime": witness,
+            "detail": "runtime probe on monitor01: exit 0",
+        }
+        document["runtime"] = {
+            "tooling": fake_runtime_identity(minor=11).document(),
+            "production": fake_runtime_identity().document(),
+            "nodes": {"pre": {"probes": [probe]}, "post": {"probes": [probe]}},
+            "comparison": {"result": "unchanged", "differences": []},
+            "floor_witness": "monitor01",
+        }
+        document["baseline"]["status"] = "pass"
+        document["runs"] = [
+            {
+                "implementation": "python",
+                "exit_code": 0,
+                "invocation_id": "run",
+                "bundle_path": "/tmp/bundle.tar.gz",
+                "bundle_hash": "sha256:aa",
+                "verify_result": "pass",
+                "coverage": {
+                    name: "collected"
+                    for name in ("ceph", "rook", "prometheus", "nodes", "var_log")
+                },
+            }
+        ]
+        document["comparison"] = {"result": "equivalent", "differences": []}
+        document["stable_state"] = {
+            "snapshot_schema_version": 1,
+            "result": "unchanged",
+            "differences": [],
+        }
+        document["residue"] = [
+            {"host": "monitor01", "result": "clean", "detail": "no residue"}
+        ]
         report_path.write_text(json.dumps(document), encoding="utf-8")
         status = self.status(profile)
         self.assertEqual(status.state, "gate-passed")
         self.assertTrue(status.ready)
         self.assertEqual(status.next_action, "Proceed to the cutover ticket")
+
+    def test_a_schema_v2_pass_remains_historical_not_python310_proof(self) -> None:
+        profile = self.lab.write_profile()
+        self.record_preflight(profile)
+        latest = (self.runs / "LATEST").read_text(encoding="utf-8").strip()
+        report_path = self.runs / latest / "report.json"
+        document = json.loads(report_path.read_text(encoding="utf-8"))
+        document["schema_version"] = 2
+        document["status"] = "pass"
+        document["next_action"] = "Old post-cutover handoff"
+        report_path.write_text(json.dumps(document), encoding="utf-8")
+
+        status = self.status(profile)
+
+        self.assertEqual(status.state, "historical-gate-passed")
+        self.assertIn("schema-v2", status.blocked_reason or "")
+        self.assertIn("make validate-lab", status.next_action)
 
     def test_reports_that_there_is_no_report_yet(self) -> None:
         status = self.status(self.lab.write_profile())

@@ -10,13 +10,14 @@ from __future__ import annotations
 import json
 import os
 import stat
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import validation.lab_qualify as lab_qualify
-from tests.lab_fixture import FakeLab, fake_entrypoints
+from tests.lab_fixture import FakeLab, fake_entrypoints, fake_runtime_identity
 from tests.test_python_lab_baseline import authority_for, write_baseline
 from validation.lab_artifacts import purge_artifacts, scan_artifacts
 from validation.lab_report import CodeIdentity, report_from_qualification, write_report
@@ -39,12 +40,18 @@ class QualifyTestCase(unittest.TestCase):
         self.runs.mkdir()
         self.ssh_log = self.root / "ssh.log"
         self.kubectl_log = self.root / "kubectl.log"
+        self.tooling_runtime = fake_runtime_identity(
+            executable="/opt/tooling/bin/python3", minor=11
+        )
+        self.production_runtime = fake_runtime_identity()
 
     def run_gate(
         self,
         profile: Path | None = None,
         checkout: Path | None = None,
         run_id: str = "run",
+        tooling_runtime=None,
+        production_runtime=None,
         **knobs: str,
     ):
         profile = profile or self.lab.write_profile()
@@ -54,9 +61,11 @@ class QualifyTestCase(unittest.TestCase):
         authority = authority_for(baseline_report, baseline_bundle)
         run_directory = self.runs / run_id
         run_directory.mkdir(mode=0o700, exist_ok=True)
+        (self.root / "collect-completed").unlink(missing_ok=True)
         environment = self.lab.environment(
             FAKE_LAB_SSH_LOG=str(self.ssh_log),
             FAKE_LAB_KUBECTL_LOG=str(self.kubectl_log),
+            FAKE_LAB_COLLECT_MARKER=str(self.root / "collect-completed"),
             **knobs,
         )
         with (
@@ -70,6 +79,9 @@ class QualifyTestCase(unittest.TestCase):
                 baseline_report=baseline_report,
                 run_directory=run_directory,
                 entrypoints=fake_entrypoints(("python",)),
+                production_python=Path(self.production_runtime.executable),
+                tooling_runtime=tooling_runtime or self.tooling_runtime,
+                production_runtime=production_runtime or self.production_runtime,
                 collect_timeout=120,
                 repository_root=checkout or self.lab.checkout(),
             )
@@ -91,6 +103,8 @@ class PassingGateTests(QualifyTestCase):
             [
                 "code-identity",
                 "read-only-opt-ins",
+                "runtime-tooling",
+                "runtime-production",
                 "baseline-evidence",
                 "profile-state",
                 "credential-paths",
@@ -101,15 +115,20 @@ class PassingGateTests(QualifyTestCase):
                 "prometheus-readiness",
                 "baseline-identity",
                 "shared-inventory",
+                "runtime-node-pre",
+                "runtime-floor-witness",
                 "stable-state-pre",
                 "residue-baseline",
                 "code-identity-pre-collect",
                 "collect-python",
+                "runtime-floor-witness-collect",
                 "collector-coverage-python",
                 "workstation-cleanup-python",
                 "bundle-comparison",
                 "stable-state-post",
+                "runtime-node-post",
                 "remote-residue",
+                "runtime-floor-witness-proof",
                 "code-identity-final",
             ],
         )
@@ -139,7 +158,7 @@ class PassingGateTests(QualifyTestCase):
     def test_a_pass_still_names_exactly_one_next_action(self) -> None:
         result = self.run_gate()
         self.assertNotIn("\n", result.next_action)
-        self.assertIn("#22", result.next_action)
+        self.assertIn("#79", result.next_action)
         self.assertIn(str(result.run_directory), result.next_action)
 
     def test_keeps_the_live_invocations_command_ledgers_beside_its_bundle(self) -> None:
@@ -177,6 +196,9 @@ class PostCutoverGateTests(QualifyTestCase):
                 baseline_report=baseline_report,
                 run_directory=run_directory,
                 entrypoints=fake_entrypoints(("python",)),
+                production_python=Path(self.production_runtime.executable),
+                tooling_runtime=self.tooling_runtime,
+                production_runtime=self.production_runtime,
                 collect_timeout=120,
                 repository_root=self.lab.checkout(),
             )
@@ -212,6 +234,20 @@ class PostCutoverGateTests(QualifyTestCase):
         self.assertEqual(result.status, "workstation-residue")
         self.assertIn("tmp.python01", result.blocked_reason or "")
         self.assertEqual(result.comparison.result, "not-run")
+
+    def test_runtime_proof_is_report_only_not_a_bundle_or_normalizer_exception(self) -> None:
+        result, _ = self.run_post_cutover()
+        live_bundle = Path(result.runs[1].bundle_path or "")
+        with tarfile.open(live_bundle, "r:gz") as archive:
+            members = [member.name for member in archive.getmembers()]
+
+        self.assertEqual(result.status, STATUS_PASS, result.blocked_reason)
+        self.assertEqual(result.comparison.result, "equivalent")
+        self.assertFalse(any("runtime" in member.lower() for member in members))
+        document = report_from_qualification(
+            result, code=CodeIdentity("2" * 40, dirty=False)
+        ).document()
+        self.assertEqual(document["runtime"]["floor_witness"], "monitor01")
 
 
 class SharedInputTests(QualifyTestCase):
@@ -330,13 +366,46 @@ class SharedInputTests(QualifyTestCase):
         self.assertFalse((result.run_directory / "shell").exists())
 
     def test_the_production_entrypoint_is_the_python_implementation(self) -> None:
-        (python,) = default_entrypoints()
+        selected = Path("/opt/isolated/cpython3.10/bin/python3")
+        (python,) = default_entrypoints(selected)
         self.assertEqual(python.implementation, "python")
+        self.assertEqual(python.collect[0], str(selected))
+        self.assertEqual(python.verify[0], str(selected))
         self.assertEqual(python.collect[-1], "collect")
         self.assertEqual(python.verify[-1], "verify")
 
+    def test_no_cpython_310_node_stops_before_collect(self) -> None:
+        runtime_311 = json.dumps(
+            fake_runtime_identity(minor=11).document()
+        )
+        outputs = json.dumps(
+            {address: runtime_311 for address in ("10.0.0.11", "10.0.0.12", "10.0.0.21")}
+        )
+
+        result = self.run_gate(FAKE_LAB_RUNTIME_OUTPUTS=outputs)
+
+        self.assertEqual(result.status, "runtime-floor-witness-missing")
+        self.assertFalse((result.run_directory / "python").exists())
+        self.assertIn("CPython 3.10", result.next_action)
+
 
 class IdentityGateTests(QualifyTestCase):
+    def test_wrong_workstation_production_runtime_stops_before_lab_access(self) -> None:
+        result = self.run_gate(production_runtime=fake_runtime_identity(minor=11))
+
+        self.assertEqual(result.status, "production-runtime-invalid")
+        self.assertNotIn("profile-state", self.checks(result))
+        self.assertFalse(self.ssh_log.exists())
+        self.assertIn("CPython 3.10.x", result.next_action)
+
+    def test_tooling_below_python311_stops_before_lab_access(self) -> None:
+        result = self.run_gate(tooling_runtime=fake_runtime_identity(minor=10))
+
+        self.assertEqual(result.status, "tooling-runtime-unsupported")
+        self.assertNotIn("profile-state", self.checks(result))
+        self.assertFalse(self.ssh_log.exists())
+        self.assertIn("Python 3.11", result.next_action)
+
     def test_a_candidate_profile_never_reaches_a_collect(self) -> None:
         result = self.run_gate(self.lab.write_profile("candidate.toml", state="candidate"))
         self.assertEqual(result.status, "profile-not-active")
@@ -358,6 +427,31 @@ class IdentityGateTests(QualifyTestCase):
         result = self.run_gate(FAKE_LAB_PROM_MODE="down")
         self.assertEqual(result.status, "prometheus-not-ready")
         self.assertFalse((result.run_directory / "shell").exists())
+
+    def test_a_failed_node_runtime_probe_stops_before_collect(self) -> None:
+        result = self.run_gate(
+            FAKE_LAB_RUNTIME_EXITS=json.dumps({"10.0.0.12": 127})
+        )
+
+        self.assertEqual(result.status, "node-runtime-invalid")
+        self.assertFalse((result.run_directory / "python").exists())
+        self.assertIn("mon02", result.blocked_reason or "")
+
+    def test_an_unsupported_node_runtime_stops_before_collect(self) -> None:
+        runtime = fake_runtime_identity(implementation="pypy")
+        outputs = json.dumps({"10.0.0.12": json.dumps(runtime.document())})
+        result = self.run_gate(FAKE_LAB_RUNTIME_OUTPUTS=outputs)
+        self.assertEqual(result.status, "node-runtime-invalid")
+        self.assertFalse((result.run_directory / "python").exists())
+        self.assertIn("mon02", result.blocked_reason or "")
+
+    def test_a_node_below_python310_stops_before_collect(self) -> None:
+        runtime = fake_runtime_identity(minor=9)
+        outputs = json.dumps({"10.0.0.12": json.dumps(runtime.document())})
+        result = self.run_gate(FAKE_LAB_RUNTIME_OUTPUTS=outputs)
+        self.assertEqual(result.status, "node-runtime-invalid")
+        self.assertFalse((result.run_directory / "python").exists())
+        self.assertIn("mon02", result.blocked_reason or "")
 
 
 class CollectGateTests(QualifyTestCase):
@@ -455,8 +549,20 @@ class CoverageGateTests(QualifyTestCase):
 
     def test_a_node_without_var_log_fails_the_gate(self) -> None:
         result = self.run_gate(FAKE_COLLECT_DROP_python="varlog")
+        self.assertEqual(result.status, "runtime-floor-witness-incomplete")
+        self.assertIn("monitor01", result.blocked_reason or "")
+
+    def test_a_non_witness_node_without_var_log_still_fails_full_coverage(self) -> None:
+        result = self.run_gate(FAKE_COLLECT_DROP_VARLOG_NODE_python="mon02")
         self.assertEqual(result.status, "coverage-incomplete")
-        self.assertIn("var_log=mon02=missing, monitor01=missing, osd01=missing", result.blocked_reason or "")
+        self.assertIn("var_log=mon02=missing", result.blocked_reason or "")
+
+    def test_the_selected_floor_witness_must_itself_collect_var_log(self) -> None:
+        result = self.run_gate(FAKE_COLLECT_DROP_VARLOG_NODE_python="monitor01")
+
+        self.assertEqual(result.status, "runtime-floor-witness-incomplete")
+        self.assertIn("monitor01", result.blocked_reason or "")
+        self.assertIn("var_log=monitor01=missing", result.blocked_reason or "")
 
 
 class ComparisonGateTests(QualifyTestCase):
@@ -526,6 +632,31 @@ class StableStateGateTests(QualifyTestCase):
         self.assertEqual(result.stable_state.result, "changed")
         self.assertTrue(result.stable_state.differences)
         self.assertIn("persistent state", result.next_action)
+
+
+class RuntimeStabilityGateTests(QualifyTestCase):
+    def test_a_failed_post_collection_runtime_probe_fails_closed(self) -> None:
+        result = self.run_gate(
+            FAKE_LAB_RUNTIME_POST_EXITS=json.dumps({"10.0.0.12": 127})
+        )
+
+        self.assertEqual(result.status, "node-runtime-invalid")
+        self.assertIn("mon02", result.blocked_reason or "")
+        self.assertEqual(result.runtime.comparison_result, "unavailable")
+        self.assertTrue(all(entry.result == "clean" for entry in result.residue))
+
+    def test_a_post_collection_runtime_change_fails_closed(self) -> None:
+        changed = fake_runtime_identity(minor=11).document()
+        result = self.run_gate(
+            FAKE_LAB_RUNTIME_POST_OUTPUTS=json.dumps(
+                {"10.0.0.21": json.dumps(changed)}
+            )
+        )
+
+        self.assertEqual(result.status, "runtime-identity-changed")
+        self.assertIn("osd01", result.blocked_reason or "")
+        self.assertEqual(result.runtime.comparison_result, "changed")
+        self.assertTrue(all(entry.result == "clean" for entry in result.residue))
 
 
 class ResidueGateTests(QualifyTestCase):

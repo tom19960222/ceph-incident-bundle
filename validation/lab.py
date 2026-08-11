@@ -7,6 +7,7 @@
                                         [--replace-active] [--json]
     python3 -m validation.lab preflight --profile PATH [--runs-dir PATH] [--json]
     python3 -m validation.lab qualify   --profile PATH --baseline-report PATH
+                                        --production-python PATH
                                         [--runs-dir PATH]
                                         [--collect-timeout SECONDS] [--json]
     python3 -m validation.lab clean     [--runs-dir PATH] [--keep N] [--json]
@@ -78,6 +79,7 @@ USAGE = """Usage:
       [--replace-active] [--json]
   python3 -m validation.lab preflight --profile PATH [--runs-dir PATH] [--json]
   python3 -m validation.lab qualify --profile PATH --baseline-report PATH
+      --production-python PATH
       [--runs-dir PATH]
       [--collect-timeout SECONDS] [--json]
   python3 -m validation.lab clean [--runs-dir PATH] [--keep N] [--json]"""
@@ -252,6 +254,7 @@ def _qualify(options: dict[str, object]) -> int:
             profile_path,
             run_directory=run_directory,
             baseline_report=options["baseline_report"],  # type: ignore[arg-type]
+            production_python=options["production_python"],  # type: ignore[arg-type]
             collect_timeout=int(options["collect_timeout"]),  # type: ignore[arg-type]
         )
     except LabProfileError as error:
@@ -336,6 +339,7 @@ def _parse(argv: list[str]) -> dict[str, object]:
         "profile": None,
         "candidate": None,
         "baseline_report": None,
+        "production_python": None,
         "runs_directory": DEFAULT_RUNS_DIRECTORY,
         "replace_candidate": False,
         "replace_active": False,
@@ -390,6 +394,7 @@ def _parse(argv: list[str]) -> dict[str, object]:
             "--candidate",
             "--candidate-out",
             "--baseline-report",
+            "--production-python",
             "--runs-dir",
         ):
             if index + 1 >= len(rest):
@@ -407,6 +412,10 @@ def _parse(argv: list[str]) -> dict[str, object]:
                 if command != "qualify":
                     raise UsageError(f"{option} is not valid for {command}")
                 values["baseline_report"] = _absolute(option, value)
+            elif option == "--production-python":
+                if command != "qualify":
+                    raise UsageError(f"{option} is not valid for {command}")
+                values["production_python"] = _absolute(option, value)
             elif option == "--runs-dir":
                 # `clean` is the one command that deletes, so it names its root
                 # outright rather than inheriting whatever the caller's cwd made
@@ -430,6 +439,8 @@ def _parse(argv: list[str]) -> dict[str, object]:
         raise UsageError("--candidate is required for activate")
     if command == "qualify" and values["baseline_report"] is None:
         raise UsageError("--baseline-report is required for qualify")
+    if command == "qualify" and values["production_python"] is None:
+        raise UsageError("--production-python is required for qualify")
     return values
 
 

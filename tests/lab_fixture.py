@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from validation.lab_qualify import CollectEntrypoint
+from validation.lab_runtime import RuntimeIdentity, RuntimeVersionInfo
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +32,22 @@ DEFAULT_HOSTS: tuple[tuple[str, str], ...] = (
     ("mon02", "10.0.0.12"),
     ("osd01", "10.0.0.21"),
 )
+
+
+def fake_runtime_identity(
+    *,
+    executable: str = "/opt/cpython/bin/python3",
+    implementation: str = "cpython",
+    minor: int = 10,
+    micro: int = 14,
+) -> RuntimeIdentity:
+    """A complete local runtime fact for the public qualification seam."""
+
+    return RuntimeIdentity(
+        executable,
+        implementation,
+        RuntimeVersionInfo(3, minor, micro, "final", 0),
+    )
 
 
 def fingerprint_of_seed(seed: str) -> str:

@@ -32,7 +32,7 @@ from validation.lab_discovery import CANDIDATE_SUFFIX
 from validation.lab_preflight import STATUS_PASS as PREFLIGHT_PASS_STATUS
 from validation.lab_preflight import credential_problem
 from validation.lab_profile import LabProfile, LabProfileError, load_profile, safe_display_path
-from validation.lab_report import STATUS_PASS, latest_report
+from validation.lab_report import STATUS_PASS, is_python310_qualification, latest_report
 
 
 STATE_PROFILE_MISSING = "profile-missing"
@@ -46,6 +46,7 @@ STATE_PREFLIGHT_PASSED = "preflight-passed"
 # Reachable only once the post-cutover gate records a full pass;
 # calling that state "preflight-passed" would understate what was proven.
 STATE_GATE_PASSED = "gate-passed"
+STATE_HISTORICAL_GATE_PASSED = "historical-gate-passed"
 STATE_LAST_ATTEMPT_FAILED = "last-attempt-failed"
 
 
@@ -310,6 +311,14 @@ def _verdict(
                 + " to run the full gate",
             )
         if status == STATUS_PASS:
+            if not is_python310_qualification(report):
+                schema = report.get("schema_version")
+                return (
+                    STATE_HISTORICAL_GATE_PASSED,
+                    f"schema-v{schema or 'unknown'} PASS remains historical evidence "
+                    "but is not CPython 3.10 qualification proof",
+                    "Run " + qualify_command(path) + " to produce schema-v3 proof",
+                )
             return (
                 STATE_GATE_PASSED,
                 None,

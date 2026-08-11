@@ -46,7 +46,7 @@ covered。
 
 刻意**不**比較的：
 
-- `environment.txt` 的 `git_commit`。Post-cutover bundle 必然來自比保存 baseline 更新的 commit；要求字串相同會讓 cutover proof 永遠失敗。這不是丟掉 code provenance：固定的 #21 authority 同時驗證 baseline report SHA-256、完整 commit 與 shell bundle SHA-256，schema-v2 report 的 `code.commit` 另外記錄且要求本次 checkout clean，兩端都各自被鎖住。
+- `environment.txt` 的 `git_commit`。Post-cutover bundle 必然來自比保存 baseline 更新的 commit；要求字串相同會讓 cutover proof 永遠失敗。這不是丟掉 code provenance：固定的 #21 authority 同時驗證 baseline report SHA-256、完整 commit 與 shell bundle SHA-256，schema-v3 report 的 `code.commit` 另外記錄且要求本次 checkout clean，兩端都各自被鎖住。
 - Captured artifact 的 body 本身，**包含它的 JSON key path**。兩個實作都不「轉換」
   evidence：它們執行一條指令並逐字記錄輸出。Manifest 已經釘住是哪條指令、exit code
   是多少；兩份 manifest 一致，就代表兩個 body 是同一個 cluster 對同一個問題在兩個
