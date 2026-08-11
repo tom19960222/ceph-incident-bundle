@@ -28,6 +28,7 @@ PYTHON="${PYTHON:-python3}"
 # gate reaches them by the script's own doing, not the caller's spelling.
 export PYTHON
 PATTERN='test_python_*.py'
+SCOPE="${TEST_SCOPE:-complete}"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
@@ -87,15 +88,39 @@ else
   jobs="$jobs_request"
 fi
 
-if [[ "$jobs" -eq 1 ]]; then
-  cd "$ROOT"
-  exec "$PYTHON" -m unittest discover -s "$ROOT/tests" -p "$PATTERN" -v
-fi
-
 module_files=()
-while IFS= read -r path; do
-  module_files+=("$(basename "$path")")
-done < <(find "$ROOT/tests" -maxdepth 1 -name "$PATTERN" | sort)
+case "$SCOPE" in
+  complete)
+    while IFS= read -r path; do
+      module_files+=("$(basename "$path")")
+    done < <(find "$ROOT/tests" -maxdepth 1 -name "$PATTERN" | sort)
+    ;;
+  production)
+    membership="$ROOT/tests/production-test-modules.txt"
+    [[ -f "$membership" ]] || fail "production test membership is missing: $membership"
+    while IFS= read -r module_file; do
+      [[ -z "$module_file" || "$module_file" == \#* ]] && continue
+      [[ "$module_file" =~ ^test_python_[a-z0-9_]+\.py$ ]] ||
+        fail "invalid production test module name: $module_file"
+      [[ -f "$ROOT/tests/$module_file" ]] ||
+        fail "production test module does not exist: $module_file"
+      module_files+=("$module_file")
+    done < "$membership"
+
+    discovered=()
+    while IFS= read -r path; do
+      discovered+=("$(basename "$path")")
+    done < <(
+      find "$ROOT/tests" -maxdepth 1 -name "$PATTERN" \
+        ! -name 'test_python_lab_*.py' | sort
+    )
+    [[ "${module_files[*]}" == "${discovered[*]}" ]] ||
+      fail "production test membership does not match all non-tooling test modules"
+    ;;
+  *)
+    fail "TEST_SCOPE must be 'complete' or 'production', got: $SCOPE"
+    ;;
+esac
 
 [[ ${#module_files[@]} -gt 0 ]] || fail "no test modules matched $PATTERN"
 
@@ -107,6 +132,14 @@ done < <(find "$ROOT/tests" -maxdepth 1 -name "$PATTERN" | sort)
 # loudly, not to paper over.
 stray="$(find "$ROOT/tests" -mindepth 2 -name "$PATTERN" | head -n 1)"
 [[ -z "$stray" ]] || fail "a test module below tests/ top level would never be sharded: $stray"
+unclassified="$(find "$ROOT/tests" -name 'test_*.py' ! -name "$PATTERN" | head -n 1)"
+[[ -z "$unclassified" ]] ||
+  fail "a test module is outside the complete-suite pattern: $unclassified"
+
+if [[ "$jobs" -eq 1 && "$SCOPE" == "complete" ]]; then
+  cd "$ROOT"
+  exec "$PYTHON" -m unittest discover -s "$ROOT/tests" -p "$PATTERN" -v
+fi
 
 logdir="$(mktemp -d "${TMPDIR:-/tmp}/ceph-incident-python-tests.XXXXXX")"
 trap 'rm -rf "$logdir"' EXIT

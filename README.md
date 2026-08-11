@@ -148,10 +148,17 @@ Exit code：
 
 ## 驗證
 
-離線 gate 必須明確用 Python 3.11 重跑：
+離線 gate 要明確提供彼此獨立的 production 與 tooling interpreter；兩者在目前的
+prefactor 階段都仍須為 Python 3.11+。入口會先解析並列出兩者的 executable、
+implementation 與 structured version，再依序執行 production test gate 和既有完整
+suite。Repository 不會下載或安裝 runtime／package，也不會修改 system Python、global
+site-packages、shell 或 version-manager default：
 
 ```bash
-PYENV_VERSION=3.11.14 make validate PYTHON=python3.11 TEST_JOBS=8
+make validate \
+  PRODUCTION_PYTHON=/absolute/path/to/production-python \
+  TOOLING_PYTHON=/absolute/path/to/tooling-python \
+  TEST_JOBS=8
 ```
 
 post-cutover real-lab gate 不再執行 shell。它先驗證保存的 #21 PASS report 與 shell

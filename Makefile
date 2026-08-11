@@ -3,6 +3,8 @@
 	validate-lab lab-clean
 
 PYTHON ?= python3
+PRODUCTION_PYTHON ?=
+TOOLING_PYTHON ?=
 
 # Job count for the sharded Python test runner; see tests/run-python-tests.sh.
 TEST_JOBS ?= auto
@@ -15,7 +17,10 @@ check-python:
 test-python: check-python
 	PYTHON="$(PYTHON)" bash tests/run-python-tests.sh $(TEST_JOBS)
 
-validate: test-python
+validate:
+	PRODUCTION_PYTHON="$(PRODUCTION_PYTHON)" \
+		TOOLING_PYTHON="$(TOOLING_PYTHON)" \
+		bash tests/run-offline-validation.sh $(TEST_JOBS)
 
 # Real-lab workflow.  `lab-status` is local-only; the others are explicit opt-ins
 # that touch a lab or the trusted profile, and none of them is reachable from

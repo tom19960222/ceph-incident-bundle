@@ -1,0 +1,14 @@
+# Production-runtime test modules. Keep sorted. The runner rejects omissions,
+# duplicates, missing files, and any non-lab test module not classified here.
+test_python_capture_stdin.py
+test_python_collect_ceph.py
+test_python_collect_cli.py
+test_python_collect_node.py
+test_python_collect_orchestration.py
+test_python_collect_prometheus.py
+test_python_collect_rook.py
+test_python_content_safety.py
+test_python_cutover.py
+test_python_fake_fidelity.py
+test_python_scenario_ledger.py
+test_python_verify.py

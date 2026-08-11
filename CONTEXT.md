@@ -17,7 +17,7 @@ _Avoid_: Client, local host, control node
 _Avoid_: Remote host, target server
 
 **Supported Node**:
-具備 Python 3.11 或更新版本，符合 node evidence 收集執行條件的 node。
+具備受支援的 production runtime，符合完整 node evidence 收集執行條件的 node。
 _Avoid_: Compatible node, healthy node
 
 **Skipped Node**:
