@@ -15,19 +15,25 @@ probe_runtime() {
     printf 'FAIL: %s is required for the %s interpreter\n' "$variable" "$role" >&2
     return 1
   fi
-  if ! resolved="$(command -v -- "$selection" 2>/dev/null)"; then
+  if [[ "$selection" != /* ]]; then
+    printf 'FAIL: %s interpreter must be selected by absolute path: %s\n' \
+      "$role" "$selection" >&2
+    return 1
+  fi
+  if [[ ! -f "$selection" || ! -x "$selection" ]]; then
     printf 'FAIL: %s interpreter is missing or not executable: %s\n' \
       "$role" "$selection" >&2
     return 1
   fi
 
-  output="$("$resolved" -c '
+  output="$("$selection" -c '
+import os
 import sys
 
 role = sys.argv[1]
 version = tuple(sys.version_info[:5])
 print(f"{role} interpreter:")
-print(f"  executable: {sys.executable}")
+print(f"  executable: {os.path.realpath(sys.executable)}")
 print(f"  implementation: {sys.implementation.name}")
 print(
     "  version: "
@@ -40,10 +46,32 @@ if version[:2] < (3, 11):
         f"got {sys.implementation.name} {version[0]}.{version[1]}.{version[2]}\n"
     )
     raise SystemExit(1)
+if role == "production" and sys.implementation.name != "cpython":
+    sys.stderr.write(
+        "FAIL: production interpreter must be CPython for compatibility proof; "
+        f"got {sys.implementation.name}\n"
+    )
+    raise SystemExit(1)
+print("__CEPH_INCIDENT_RUNTIME_OK__")
 ' "$role" 2>&1)"
   status=$?
+  if [[ $status -ne 0 ]]; then
+    printf '%s\n' "$output"
+    return "$status"
+  fi
+  if [[ "$output" != *$'\n__CEPH_INCIDENT_RUNTIME_OK__' ]]; then
+    printf 'FAIL: %s interpreter did not report a valid Python runtime identity\n' \
+      "$role" >&2
+    return 1
+  fi
+  output="${output%$'\n__CEPH_INCIDENT_RUNTIME_OK__'}"
   printf '%s\n' "$output"
-  [[ $status -eq 0 ]] || return "$status"
+  resolved="$(printf '%s\n' "$output" | sed -n 's/^  executable: //p')"
+  if [[ "$resolved" != /* || ! -f "$resolved" || ! -x "$resolved" ]]; then
+    printf 'FAIL: %s interpreter reported an unusable executable: %s\n' \
+      "$role" "$resolved" >&2
+    return 1
+  fi
   printf -v "$resolved_variable" '%s' "$resolved"
 }
 

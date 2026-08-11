@@ -8,7 +8,6 @@ test_python_collect_orchestration.py
 test_python_collect_prometheus.py
 test_python_collect_rook.py
 test_python_content_safety.py
-test_python_cutover.py
 test_python_fake_fidelity.py
 test_python_scenario_ledger.py
 test_python_verify.py

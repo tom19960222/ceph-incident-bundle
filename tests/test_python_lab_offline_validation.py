@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_MODULES = ROOT / "tests" / "production-test-modules.txt"
+TOOLING_ONLY_MODULES = ROOT / "tests" / "tooling-only-test-modules.txt"
 OFFLINE_RUNNER = ROOT / "tests" / "run-offline-validation.sh"
 
 
@@ -20,6 +21,7 @@ def make_fake_python(
     *,
     role: str,
     version: tuple[int, int, int, str, int],
+    implementation: str = "cpython",
 ) -> None:
     path.write_text(
         f"#!{sys.executable}\n"
@@ -33,7 +35,7 @@ def make_fake_python(
         f"fake_version = {version!r}\n"
         "if len(sys.argv) >= 3 and sys.argv[1] == '-c':\n"
         "    sys.executable = fake_executable\n"
-        "    sys.implementation = types.SimpleNamespace(name='cpython')\n"
+        f"    sys.implementation = types.SimpleNamespace(name={implementation!r})\n"
         "    sys.version_info = fake_version\n"
         "    code = sys.argv[2]\n"
         "    sys.argv = ['-c', *sys.argv[3:]]\n"
@@ -44,7 +46,10 @@ def make_fake_python(
         "        raise SystemExit(91)\n"
         "with open(os.environ['OFFLINE_VALIDATION_INVOCATIONS'], 'a', encoding='utf-8') as stream:\n"
         "    stream.write(json.dumps([role, *sys.argv[1:]]) + '\\n')\n"
-        "raise SystemExit(int(os.environ.get(role.upper() + '_TEST_RC', '0')))\n",
+        "test_status = int(os.environ.get(role.upper() + '_TEST_RC', '0'))\n"
+        "if test_status == 0 and os.environ.get('OMIT_UNITTEST_SUMMARY') != '1':\n"
+        "    print('Ran 1 test in 0.000s')\n"
+        "raise SystemExit(test_status)\n",
         encoding="utf-8",
     )
     path.chmod(0o755)
@@ -140,12 +145,12 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
         self.assertLess(production_identity, production_gate)
         self.assertLess(tooling_identity, production_gate)
         self.assertLess(production_gate, complete_gate)
-        self.assertIn(f"executable: {production}", output)
+        self.assertIn(f"executable: {production.resolve()}", output)
         self.assertIn("implementation: cpython", output)
         self.assertIn(
             "version: major=3 minor=11 micro=7 releaselevel=final serial=0", output
         )
-        self.assertIn(f"executable: {tooling}", output)
+        self.assertIn(f"executable: {tooling.resolve()}", output)
         self.assertIn(
             "version: major=3 minor=12 micro=2 releaselevel=final serial=0", output
         )
@@ -209,6 +214,86 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
         )
         self.assertEqual(invocations, [])
 
+    def test_path_dependent_interpreter_names_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            tooling = Path(temporary_directory) / "tooling-python"
+            make_fake_python(
+                tooling, role="tooling", version=(3, 11, 9, "final", 0)
+            )
+
+            result, invocations = self.run_validate(Path("python3"), tooling)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "production interpreter must be selected by absolute path: python3",
+            result.stdout + result.stderr,
+        )
+        self.assertEqual(invocations, [])
+
+    def test_a_non_python_executable_is_rejected_before_tests(self) -> None:
+        true_executable = Path(shutil.which("true") or "/usr/bin/true")
+        if not true_executable.is_absolute() or not true_executable.exists():
+            self.skipTest("an absolute true executable is required")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            tooling = Path(temporary_directory) / "tooling-python"
+            make_fake_python(
+                tooling, role="tooling", version=(3, 11, 9, "final", 0)
+            )
+
+            result, invocations = self.run_validate(true_executable, tooling)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "production interpreter did not report a valid Python runtime identity",
+            result.stdout + result.stderr,
+        )
+        self.assertEqual(invocations, [])
+
+    def test_production_requires_cpython_before_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            production = directory / "production-python"
+            tooling = directory / "tooling-python"
+            make_fake_python(
+                production,
+                role="production",
+                version=(3, 11, 9, "final", 0),
+                implementation="pypy",
+            )
+            make_fake_python(
+                tooling, role="tooling", version=(3, 11, 9, "final", 0)
+            )
+
+            result, invocations = self.run_validate(production, tooling)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "production interpreter must be CPython for compatibility proof",
+            result.stdout + result.stderr,
+        )
+        self.assertEqual(invocations, [])
+
+    def test_a_shard_cannot_pass_without_running_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            production = directory / "production-python"
+            tooling = directory / "tooling-python"
+            make_fake_python(
+                production, role="production", version=(3, 11, 9, "final", 0)
+            )
+            make_fake_python(
+                tooling, role="tooling", version=(3, 11, 9, "final", 0)
+            )
+
+            result, _ = self.run_validate(
+                production,
+                tooling,
+                extra_env={"OMIT_UNITTEST_SUMMARY": "1"},
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no positive unittest summary", result.stdout + result.stderr)
+
     def test_both_gates_are_mandatory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -256,10 +341,15 @@ class OfflineValidationEntrypointTests(unittest.TestCase):
 
 
 class ProductionTestMembershipTests(unittest.TestCase):
-    def test_every_non_tooling_module_is_in_the_production_gate(self) -> None:
+    def test_every_non_lab_module_has_an_explicit_gate_classification(self) -> None:
         declared = {
             line
             for line in PRODUCTION_MODULES.read_text(encoding="utf-8").splitlines()
+            if line and not line.startswith("#")
+        }
+        tooling_only = {
+            line
+            for line in TOOLING_ONLY_MODULES.read_text(encoding="utf-8").splitlines()
             if line and not line.startswith("#")
         }
         discovered = {
@@ -268,7 +358,9 @@ class ProductionTestMembershipTests(unittest.TestCase):
             if not path.name.startswith("test_python_lab_")
         }
 
-        self.assertEqual(declared, discovered)
+        self.assertEqual(declared | tooling_only, discovered)
+        self.assertFalse(declared & tooling_only)
+        self.assertEqual(tooling_only, {"test_python_cutover.py"})
         self.assertTrue(
             {
                 "test_python_collect_ceph.py",

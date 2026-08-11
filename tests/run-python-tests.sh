@@ -13,12 +13,11 @@ set -euo pipefail
 # that path working: an isolation bug that only appears under sharding is not
 # debuggable without a serial run to compare against.
 #
-# A shard's recorded exit status is the authority on whether it passed: each
-# shard writes its interpreter's exit code to a per-module status file as its
-# last act, and only a recorded 0 counts as a pass.  A shard that dies before
-# recording (crash, OOM, external kill, a disk too full to write one byte)
-# leaves no status and is reported as DIED -- it cannot look like a pass,
-# whatever its log says.  The `Ran N tests` line is scraped for reporting only.
+# A shard passes only with both a recorded exit 0 and a positive `Ran N tests`
+# summary. Each shard writes its interpreter's exit code to a per-module status
+# file as its last act. A shard that dies before recording (crash, OOM, external
+# kill, a disk too full to write one byte) leaves no status and is reported as
+# DIED; an executable that returns 0 without running unittest is FAIL.
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"
@@ -97,7 +96,10 @@ case "$SCOPE" in
     ;;
   production)
     membership="$ROOT/tests/production-test-modules.txt"
+    tooling_membership="$ROOT/tests/tooling-only-test-modules.txt"
     [[ -f "$membership" ]] || fail "production test membership is missing: $membership"
+    [[ -f "$tooling_membership" ]] ||
+      fail "tooling-only test membership is missing: $tooling_membership"
     while IFS= read -r module_file; do
       [[ -z "$module_file" || "$module_file" == \#* ]] && continue
       [[ "$module_file" =~ ^test_python_[a-z0-9_]+\.py$ ]] ||
@@ -107,15 +109,27 @@ case "$SCOPE" in
       module_files+=("$module_file")
     done < "$membership"
 
+    tooling_only=()
+    while IFS= read -r module_file; do
+      [[ -z "$module_file" || "$module_file" == \#* ]] && continue
+      [[ "$module_file" =~ ^test_python_[a-z0-9_]+\.py$ ]] ||
+        fail "invalid tooling-only test module name: $module_file"
+      [[ -f "$ROOT/tests/$module_file" ]] ||
+        fail "tooling-only test module does not exist: $module_file"
+      tooling_only+=("$module_file")
+    done < "$tooling_membership"
+
+    classified=()
+    while IFS= read -r module_file; do
+      classified+=("$module_file")
+    done < <(printf '%s\n' "${module_files[@]}" "${tooling_only[@]}" | sort)
     discovered=()
     while IFS= read -r path; do
       discovered+=("$(basename "$path")")
-    done < <(
-      find "$ROOT/tests" -maxdepth 1 -name "$PATTERN" \
-        ! -name 'test_python_lab_*.py' | sort
-    )
-    [[ "${module_files[*]}" == "${discovered[*]}" ]] ||
-      fail "production test membership does not match all non-tooling test modules"
+    done < <(find "$ROOT/tests" -maxdepth 1 -name "$PATTERN" \
+      ! -name 'test_python_lab_*.py' | sort)
+    [[ "${classified[*]}" == "${discovered[*]}" ]] ||
+      fail "production/tooling membership does not classify every non-lab test module"
     ;;
   *)
     fail "TEST_SCOPE must be 'complete' or 'production', got: $SCOPE"
@@ -138,7 +152,17 @@ unclassified="$(find "$ROOT/tests" -name 'test_*.py' ! -name "$PATTERN" | head -
 
 if [[ "$jobs" -eq 1 && "$SCOPE" == "complete" ]]; then
   cd "$ROOT"
-  exec "$PYTHON" -m unittest discover -s "$ROOT/tests" -p "$PATTERN" -v
+  serial_log="$(mktemp "${TMPDIR:-/tmp}/ceph-incident-python-tests.serial.XXXXXX")"
+  trap 'rm -f "$serial_log"' EXIT
+  serial_status=0
+  "$PYTHON" -m unittest discover -s "$ROOT/tests" -p "$PATTERN" -v \
+    >"$serial_log" 2>&1 || serial_status=$?
+  cat "$serial_log"
+  [[ $serial_status -eq 0 ]] || exit "$serial_status"
+  serial_ran="$(sed -n 's/^Ran \([0-9]*\) test.*/\1/p' "$serial_log" | tail -1)"
+  [[ "$serial_ran" =~ ^[1-9][0-9]*$ ]] ||
+    fail "complete suite exited 0 without a positive unittest summary"
+  exit 0
 fi
 
 logdir="$(mktemp -d "${TMPDIR:-/tmp}/ceph-incident-python-tests.XXXXXX")"
@@ -152,7 +176,8 @@ printf 'running %s test modules across %s jobs\n' "${#module_files[@]}" "$jobs"
 printf '%s\n' "${module_files[@]}" |
   RUN_PYTHON_TESTS_SHARD=1 xargs -P "$jobs" -I {} bash "$SELF" --run-one {} "$logdir" || true
 
-# Collect every verdict before reporting anything: the EXIT trap removes the
+# Collect every status and positive unittest count before reporting anything:
+# the EXIT trap removes the
 # logs, so bailing out mid-loop would destroy the evidence for the failure being
 # reported *and* for every module after it.
 total=0
@@ -167,9 +192,12 @@ for module_file in "${module_files[@]}"; do
   status=""
   [[ -f "$logdir/$module.status" ]] && status="$(<"$logdir/$module.status")"
 
-  if [[ "$status" == "0" ]]; then
+  if [[ "$status" == "0" && "$ran" =~ ^[1-9][0-9]*$ ]]; then
     total=$((total + ${ran:-0}))
     printf '  ok   %-44s %s\n' "$module" "$summary"
+  elif [[ "$status" == "0" ]]; then
+    failed+=("$module")
+    printf '  FAIL %-44s exit 0, no positive unittest summary\n' "$module"
   elif [[ -z "$status" ]]; then
     failed+=("$module")
     printf '  DIED %-44s shard exited without recording a status\n' "$module"

@@ -148,8 +148,9 @@ Exit code：
 
 ## 驗證
 
-離線 gate 要明確提供彼此獨立的 production 與 tooling interpreter；兩者在目前的
-prefactor 階段都仍須為 Python 3.11+。入口會先解析並列出兩者的 executable、
+離線 gate 要用絕對路徑明確提供彼此獨立的 production 與 tooling interpreter；目前的
+prefactor 階段要求 production 為 CPython 3.11+、tooling 為 Python 3.11+。入口會先
+解析並列出兩者的 executable、
 implementation 與 structured version，再依序執行 production test gate 和既有完整
 suite。Repository 不會下載或安裝 runtime／package，也不會修改 system Python、global
 site-packages、shell 或 version-manager default：
