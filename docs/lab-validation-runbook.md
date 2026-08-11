@@ -25,6 +25,8 @@ post-cutover proof:
 `lab-preflight` proves identity only. Only a schema-v3 `validate-lab` report with
 `status: pass` proves CPython 3.10 qualification. Existing schema-v2 PASS reports retain their
 historical post-cutover meaning and are deliberately not upgraded into Python 3.10 evidence.
+The shipped production support floor is CPython 3.10; validation and real-lab tooling remain on
+Python 3.11 or newer.
 
 ## Non-Negotiable Safety Rules
 

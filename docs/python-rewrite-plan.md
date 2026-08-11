@@ -69,7 +69,7 @@ identity後，只跑 Python，並把 final report 升為 schema 2。
 
 - 三個 production modules：公開入口、工作機 collectors、自足 node collector。
 - 公開入口使用明確的 `collect` 與 `verify` subcommands，不保留 shell compatibility wrapper。
-- Supported node 需要 Python 3.11+；條件不符時 graceful skip，其他 evidence 繼續收集，整體為 partial。
+- Supported node 目前需要 Python 3.10+；條件不符時 graceful skip，其他 evidence 繼續收集，整體為 partial。原始 rewrite 的 3.11 floor 已由 ADR 0013 supersede。
 - Node collector payload 經 SSH stdin 傳送；node evidence archive 經 stdout 回傳；所有診斷走 stderr。
 - Content safety 先忠實移植並通過功能等價驗證，再以獨立變更移除；structural verification 長期保留。
 - 驗收要求 observable contract equivalence，不要求 tar/gzip/JSON 等非語意 serialization byte-identical。
@@ -155,9 +155,11 @@ shell 的 `node_copy_file` 複製 evidence 時不寫 manifest entry，`lib/colle
 
 ### Offline gate
 
-`make validate` 必須保持離線且可重複；它 fail-fast 檢查 Python 3.11 floor，然後執行
-完整 Python suite（含 134 個 behavior mappings、scenario ledger/audit、collector、verify、
-lab harness 與 Python-only repo layout）。Closeout 必須明記實際使用 Python 3.11。
+`make validate` 必須保持離線且可重複；production gate 使用 exact CPython 3.10.x，
+tooling gate 使用 Python 3.11+。前者執行完整 production surface，後者執行完整 Python
+suite（含 134 個 behavior mappings、scenario ledger/audit、collector、verify、lab harness
+與 Python-only repo layout）。Closeout 必須明記兩個 interpreter 的 resolved path、
+implementation 與 structured version。
 
 ### Real-lab gate
 

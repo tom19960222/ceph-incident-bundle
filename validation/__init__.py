@@ -7,5 +7,6 @@ airgap workstation to run a collect.  It holds the Lab Profile schema, the
 read-only discovery and strict identity preflight used by the real-lab gate, the
 local status entry point and the Lab Validation Report writer.
 
-Like production code, it uses the Python 3.11 standard library only.
+Production code supports CPython 3.10; this local-only validation package uses
+the Python 3.11 standard library only.
 """

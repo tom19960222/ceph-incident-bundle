@@ -46,6 +46,42 @@ class PythonOnlyCutoverTests(unittest.TestCase):
         self.assertNotIn("bash run/collect.sh", readme)
         self.assertNotIn("bash lib/verify-bundle.sh", readme)
 
+    def test_current_runtime_guidance_publishes_cpython_310_support(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        safety = (ROOT / "docs" / "read-only-safety.md").read_text(encoding="utf-8")
+        runbook = (ROOT / "docs" / "lab-validation-runbook.md").read_text(
+            encoding="utf-8"
+        )
+        rewrite_plan = (ROOT / "docs" / "python-rewrite-plan.md").read_text(
+            encoding="utf-8"
+        )
+        validation_package = (ROOT / "validation" / "__init__.py").read_text(
+            encoding="utf-8"
+        )
+        collectors = (ROOT / "ceph_incident_collectors.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "CPython 3.10 以上是 production runtime 的最低正式支援版本", readme
+        )
+        self.assertNotIn("python3.11 ceph_incident_bundle.py", readme)
+        self.assertIn("CPython 3.10+ is the production support floor", agents)
+        self.assertIn("CPython 3.10+ 現在是唯一 production implementation", safety)
+        self.assertIn("Only a schema-v3 `validate-lab` report", runbook)
+        self.assertIn("Supported node 目前需要 Python 3.10+", rewrite_plan)
+        self.assertIn("production gate 使用 exact CPython 3.10.x", rewrite_plan)
+        self.assertIn("Production code supports CPython 3.10", validation_package)
+        self.assertIn("Python 3.10 or newer is required", collectors)
+        self.assertNotIn("Python 3.11 or newer is required", collectors)
+
+        # The rewrite plan remains a historical record: publishing the new floor
+        # must not rewrite the Python 3.11 bootstrap fact from issue #11.
+        self.assertIn(
+            "固定 bootstrap 在同一連線檢查 Python 3.11", rewrite_plan
+        )
+
 
 class RepositoryGateTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("git"), "git is required for repository gates")
