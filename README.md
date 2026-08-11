@@ -4,7 +4,8 @@
 SSH 收集 Ceph node、Ceph、Rook、Prometheus 與 `/var/log` 證據，產生可獨立驗證的
 `.tar.gz` bundle；它不會修復叢集、變更設定、重啟服務或建立 Kubernetes workload。
 
-Python 3.11 以上是唯一 production runtime。Shell reference、相容 wrapper 與
+CPython 3.10 以上是 production runtime 的最低正式支援版本；validation 與 real-lab
+tooling 仍需要 Python 3.11 以上。Shell reference、相容 wrapper 與
 `/etc/hosts` 轉 inventory 的 shell helper 已在完成 offline 與 real-lab qualification
 後移除。
 
@@ -13,7 +14,7 @@ Python 3.11 以上是唯一 production runtime。Shell reference、相容 wrappe
 在 repo root 執行：
 
 ```bash
-python3.11 ceph_incident_bundle.py collect \
+python3 ceph_incident_bundle.py collect \
   --inventory inventory/ceph-lab.example.env \
   --ssh-key .ssh/id_ed25519 \
   --seed ikaros@192.168.18.166 \
@@ -30,7 +31,7 @@ bundle: results/ceph-incident-YYYYMMDDTHHMMSSZ.tar.gz
 驗證 bundle：
 
 ```bash
-python3.11 ceph_incident_bundle.py verify \
+python3 ceph_incident_bundle.py verify \
   results/ceph-incident-YYYYMMDDTHHMMSSZ.tar.gz
 ```
 
@@ -76,7 +77,7 @@ Python implementation 沒有 `cephadm shell` 或 `kubectl exec` opt-in；這兩�
 常用範例：
 
 ```bash
-python3.11 ceph_incident_bundle.py collect \
+python3 ceph_incident_bundle.py collect \
   --inventory inventory/external.env \
   --ssh-key ~/.ssh/id_ed25519 \
   --mode auto \

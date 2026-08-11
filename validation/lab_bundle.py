@@ -14,10 +14,11 @@ So this module compares the part of a bundle that must not depend on when it was
 taken:
 
 - which members exist, at which paths — except inside the `/var/log` payload
-  trees, whose file set is the live machine's doing rather than either
-  implementation's: a collect on the far side of a UTC day boundary finds a
-  `sysstat/sa03` the earlier one could not, and journald renames its archived
-  files between two runs (#52);
+  trees and the per-job Prometheus metric payload set. Those file sets are the
+  live target's doing rather than either implementation's: a collect on the far
+  side of a UTC day boundary finds a `sysstat/sa03` the earlier one could not,
+  journald renames archived files between runs (#52), and an exporter can expose
+  a metric that did not exist at the baseline moment;
 - the manifest — every collector, every artifact, the exact command argv and the
   exact exit code, which is where CLI semantics, runner selection and source
   selection become observable.  Node manifests are compared over the surface
@@ -32,10 +33,12 @@ taken:
 - how each SKIPPED or partial outcome was classified;
 - which of the four collector paths were covered.
 
-Evidence *bodies*, `/var/log` payloads and recompressed metric dumps are recorded
-as present-and-opaque, down to their JSON key paths.  Collector-authored control
-documents are the exception: the explicit field lists below retain decisions
-without turning live observations into contract.  Neither implementation
+Evidence *bodies* and `/var/log` payloads are not compared. Per-job Prometheus
+metric payloads are also omitted as a set: their names and aggregate count are
+live observations, while the job index artifact, query template, relative
+window, step and exit status remain contract. Collector-authored control
+documents are reduced field by field so decisions remain without turning live
+observations into contract. Neither implementation
 *transforms* cluster evidence: each runs a command and records its output
 verbatim, and the manifest above already pins which command ran and what it
 exited with.  If both manifests agree, the two evidence bodies came from the same
@@ -128,6 +131,12 @@ NODE_MANIFEST = re.compile(r"nodes/([^/]+)/manifest\.jsonl\Z")
 # under `logs/var-log/` (the journal capture, the INDEX) are still compared, and
 # per-bundle coverage still requires every node's `/var/log` path collected.
 VAR_LOG_PAYLOAD = re.compile(r"nodes/[^/]+/logs/var-log/(?:merged|raw|original)/")
+# A Prometheus job directory contains one recompressed payload per metric name.
+# The exporter decides that inventory at the live moment; `index.txt` and its
+# manifest entry retain the collector's stable job/query/window/step decisions.
+PROMETHEUS_METRIC_PAYLOAD = re.compile(
+    r"cluster/prometheus/[^/]+/[^/]+\.json\.gz\Z"
+)
 SKIP_MARKER = "SKIPPED:"
 # The collector's own index verbs (ADR 0010).  `collect-node copy` marks evidence
 # the reference duplicates without recording, and `collect-var-log /var/log` the
@@ -163,6 +172,10 @@ CLUSTER_LAYERS = {"ceph": "cluster/ceph/", "rook": "cluster/rook/", "prometheus"
 # the path rather than at its start, because the cluster manifest records the
 # workstation-absolute path and only the normalizer's `<workdir>` sits in front.
 PROMETHEUS_ARTIFACT = re.compile(r"(?:\A|/)" + CLUSTER_LAYERS["prometheus"])
+PROMETHEUS_JOB_INDEX_ARTIFACT = re.compile(
+    r"(?:\A|/)cluster/prometheus/[^/]+/index\.txt\Z"
+)
+PROMETHEUS_METRIC_COUNT = re.compile(r"\(\d+ metrics\)\Z")
 
 TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?")
 ARCHIVE_STAMP = re.compile(r"ceph-incident-\d{8}T\d{6}Z")
@@ -371,10 +384,11 @@ def contract_of(
     # the timestamp inside one would stop the literal from ever matching.
     rules = [*substitutions, *_default_substitutions()]
     contract: dict[str, object] = {
-        # The `/var/log` payload trees are the one member-set exception: their
-        # file set drifts naturally between two collects, so their contents stay
-        # out of the comparison — see VAR_LOG_PAYLOAD for the boundary.
-        "members": [name for name in contents.names if not VAR_LOG_PAYLOAD.match(name)],
+        # These payload file sets drift naturally between two live collects;
+        # their control artifacts remain compared below.
+        "members": [
+            name for name in contents.names if not _is_live_payload_member(name)
+        ],
         "manifests": _manifests(contents, rules),
         "artifacts": _artifacts(contents, rules),
         "errors": _error_classes(contents, rules),
@@ -585,6 +599,8 @@ def _argv(
     command: str, rules: Sequence[tuple[re.Pattern[str], str]], artifact: str = ""
 ) -> list[str]:
     normalized = normalize(command, rules)
+    if PROMETHEUS_JOB_INDEX_ARTIFACT.search(artifact):
+        normalized = PROMETHEUS_METRIC_COUNT.sub("(<count> metrics)", normalized)
     try:
         argv = shlex.split(normalized)
     except ValueError:
@@ -645,12 +661,18 @@ def _artifacts(
         name = member.name
         if name == MANIFEST_NAME or NODE_MANIFEST.fullmatch(name) is not None:
             continue
-        if VAR_LOG_PAYLOAD.match(name):
-            # Which files the payload trees hold is the machine's doing, not the
-            # implementation's — see VAR_LOG_PAYLOAD for the boundary.
+        if _is_live_payload_member(name):
+            # Which files these payload sets hold is the live target's doing,
+            # not the implementation's. Their control artifacts remain below.
             continue
         artifacts[normalize(name, rules)] = _artifact_contract(contents, member, rules)
     return artifacts
+
+
+def _is_live_payload_member(name: str) -> bool:
+    return bool(
+        VAR_LOG_PAYLOAD.match(name) or PROMETHEUS_METRIC_PAYLOAD.fullmatch(name)
+    )
 
 
 def _artifact_contract(

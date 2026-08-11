@@ -27,7 +27,7 @@ Real lab 兩者都不是。保存的 shell collect 與本次 Python collect 打�
 
 | 比較項目 | 為什麼它是 contract |
 | --- | --- |
-| member 路徑集合 | 兩個實作必須產出同一組 artifact，放在同一個位置——唯一例外是 `/var/log` payload 樹內的檔案集合，見下方「刻意不比較」 |
+| member 路徑集合 | 兩個實作必須產出同一組 artifact，放在同一個位置——例外是 `/var/log` payload 樹與每個 Prometheus job 的 metric payload 集合，見下方「刻意不比較」 |
 | 頂層 `manifest.jsonl` | collector、artifact、完整 command argv 與 exit code — CLI semantics、runner 選擇與 source 選擇都在這裡變成可觀測 |
 | 每個 node 的 `manifest.jsonl` | 同上，但只比對「兩邊都宣稱的那一面」，見下節 |
 | 每個 captured artifact 的 `# key: value` header | host、collector、timeout 與 truncation 標記——`# timeout` 逐字比對，qualification 工作機因此必須提供 timeout binary（[ADR 0011](adr/0011-require-a-timeout-binary-on-the-qualification-workstation.md)） |
@@ -54,8 +54,14 @@ covered。
   `health.checks` 是 `{}`，一出現 slow op 就多一個 key；某個 counter 這次是 `0`
   下次是 `0.5`。會因為一次暫時性 HEALTH_WARN 就失敗的 gate，只會被學會「重跑到過為
   止」，那比一個少比但說得準的 gate 更糟。
-- 重壓縮後的 metric dump bytes（任何 `.gz`／`.xz`／`.bz2`／`.zst`）。這些只比對
-  「存在與路徑」。
+- 每個 Prometheus job 的重壓縮 metric payload 集合
+  （`cluster/prometheus/<job>/<metric>.json.gz`），連「存在與路徑」都不跨時刻比較。
+  Metric 名稱集合與 aggregate count 是 exporter 在該次 collect 的 live answer；#79
+  qualification 的保存 baseline 有 478 個 `ceph-exporter` metrics，後來的同一 job 有
+  480 個，只多兩個 kernel discard metrics。逐路徑或逐數量比較會把正常 exporter
+  inventory drift 誤報成 implementation difference。Job 的 `index.txt` member、manifest
+  entry、endpoint、query template、相對 window、step 與 exit code 仍逐項比較；只有
+  manifest command 中的 `(<count> metrics)` 數量被化約。
 - 超過 4 MiB 的 artifact 內容；同樣只比對存在與路徑。
 - `cluster/prometheus/dump-info.txt` 清單外的欄位。`metrics_ok`／
   `metrics_failed` 是兩次 collect 之間會改變的活體 metric 集合；
@@ -81,8 +87,8 @@ Evidence 處理本身的 byte-level 等價是 offline gate 的職責：那裡的
 `cluster/prometheus/<job>/index.txt` 已逐欄檢查，但不選取 body 欄位。它的 metric
 名稱與逐筆 `ok`／`failed`／`skipped` 是活體 Prometheus 在該次 collect 回答的集合與
 結果；`TRUNCATED` 則已由 `dump-info.txt` 的 `truncated` 決策欄位表達。Gate 仍比較
-`index.txt` 的 member 路徑，以及 manifest 中產生它的 argv 與 exit code，所以路徑、
-窗口、step 或成功／partial 語意不會因此消失。
+`index.txt` 的 member 路徑，以及 manifest 中產生它的 argv（除 live metric count）與
+exit code，所以路徑、query template、窗口、step 或成功／partial 語意不會因此消失。
 
 其餘同類文件也沒有未承接的穩定決策：`CONTENTS.md` 是 manifests 與 member set 的人讀
 投影；`README-FIRST.txt` 是固定說明；`errors.log` 已化約成事件分類集合；

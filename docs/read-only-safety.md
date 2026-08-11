@@ -28,10 +28,11 @@ collect 前 fail closed。
 
 ## Current Python Production Status
 
-Python 3.11+ 現在是唯一 production implementation；公開入口只有
-`ceph_incident_bundle.py collect` 與 `verify`。Content safety 與 structural verification
-在 cutover 中維持原行為。一般 `make validate` 仍完全離線；真 lab 的 current proof 只
-能由帶 active Lab Profile、preserved baseline 與明確確認的 `make validate-lab` 產生。
+CPython 3.10+ 現在是唯一 production implementation 的正式支援範圍；公開入口只有
+`ceph_incident_bundle.py collect` 與 `verify`。Validation 與 real-lab tooling 維持
+Python 3.11+。Content safety 與 structural verification 在 cutover 中維持原行為。一般
+`make validate` 仍完全離線；真 lab 的 current proof 只能由帶 active Lab Profile、
+preserved baseline 與明確確認的 `make validate-lab` 產生。
 
 ## Safety Boundary
 

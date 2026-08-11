@@ -21,8 +21,9 @@ Non-negotiable rules:
   state or Kubernetes objects/workloads. Writes stay in collector-owned workspaces and output.
 - Treat every Node Evidence Archive as untrusted. Validate all members before extraction; reject
   absolute/traversal paths, links, devices, FIFOs, collisions and workspace escapes.
-- Python 3.11+ is the only production implementation. `cephadm shell` and `kubectl exec` have no
-  supported path and must not be reintroduced as fallbacks.
+- CPython 3.10+ is the production support floor; validation and real-lab tooling remain Python
+  3.11+. `cephadm shell` and `kubectl exec` have no supported path and must not be reintroduced as
+  fallbacks.
 - Real-lab work uses an explicitly selected active TOML Lab Profile, never
   `CEPH-LAB-CONNECTION.md`, and fails closed on every identity mismatch.
 - Profiles/reports may reference credential paths but never contain private keys, keyrings,

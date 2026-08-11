@@ -302,6 +302,38 @@ class ContractTests(BundleTestCase):
         members[PROMETHEUS_DUMP_INFO] = dump_info
         return contract_of(read_bundle(self.write(members, name)))
 
+    def contract_with_prometheus_metric_inventory(
+        self,
+        extra_metrics: tuple[str, ...],
+        name: str,
+        endpoint: str = "http://prometheus.example:9090/api/v1/query_range",
+    ):
+        members = bundle_members()
+        index = "cluster/prometheus/ceph/index.txt"
+        members[index] = b"ok up up.json.gz\n" + b"".join(
+            f"ok {metric} {metric}.json.gz\n".encode("ascii")
+            for metric in extra_metrics
+        )
+        for metric in extra_metrics:
+            members[f"cluster/prometheus/ceph/{metric}.json.gz"] = gzip.compress(
+                b'{"status":"success","data":[]}'
+            )
+        record = {
+            "host": "prometheus",
+            "collector": "collect-prometheus",
+            "artifact": "/out/tmp.workdir/cluster/prometheus/ceph/index.txt",
+            "command": (
+                f"GET {endpoint} "
+                "query={__name__=<metric>,job=ceph} start=1 end=86401 step=15 "
+                f"({1 + len(extra_metrics)} metrics)"
+            ),
+            "exit_code": 0,
+            "started": "2026-07-31T01:00:00Z",
+            "ended": "2026-07-31T01:00:00Z",
+        }
+        members["manifest.jsonl"] += (json.dumps(record) + "\n").encode("utf-8")
+        return contract_of(read_bundle(self.write(members, name)))
+
     def test_two_collects_of_a_live_cluster_are_equivalent(self) -> None:
         reference = self.contract(started="2026-07-31T01:00:00Z", counter=11)
         candidate = self.contract(started="2026-07-31T01:07:42Z", counter=93)
@@ -528,6 +560,30 @@ class ContractTests(BundleTestCase):
             }
         )
         self.assertEqual(describe_differences(reference, candidate), ())
+
+    def test_prometheus_metric_inventory_is_live_evidence(self) -> None:
+        reference = self.contract_with_prometheus_metric_inventory(
+            (), "prometheus-metrics-reference.tar.gz"
+        )
+        candidate = self.contract_with_prometheus_metric_inventory(
+            ("new_kernel_metric",), "prometheus-metrics-candidate.tar.gz"
+        )
+
+        self.assertEqual(describe_differences(reference, candidate), ())
+
+    def test_prometheus_metric_count_rewrite_does_not_hide_endpoint_changes(self) -> None:
+        reference = self.contract_with_prometheus_metric_inventory(
+            (),
+            "prometheus-endpoint-reference.tar.gz",
+            endpoint="http://prometheus.example:9090/(478 metrics)/query_range",
+        )
+        candidate = self.contract_with_prometheus_metric_inventory(
+            (),
+            "prometheus-endpoint-candidate.tar.gz",
+            endpoint="http://prometheus.example:9090/(480 metrics)/query_range",
+        )
+
+        self.assertNotEqual(describe_differences(reference, candidate), ())
 
     def test_a_different_partial_status_is_a_difference(self) -> None:
         reference = self.contract()
