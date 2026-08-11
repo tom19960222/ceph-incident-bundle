@@ -1,9 +1,10 @@
 """Read-only lab probes shared by discovery, identity preflight and qualification.
 
-Every probe here is a query: `ssh-keyscan`, `hostname`, a direct read-only `ceph`
-subcommand, a local `kubectl get`, one Prometheus readiness GET, and a listing of
-collector leftovers on a node.  Nothing in this module may create, change or
-delete lab state — see `docs/read-only-safety.md`.
+Every probe here is a query: `ssh-keyscan`, `hostname`, structured interpreter
+identity, a direct read-only `ceph` subcommand, a local `kubectl get`, one
+Prometheus readiness GET, and a listing of collector leftovers on a node.
+Nothing in this module may create, change or delete lab state — see
+`docs/read-only-safety.md`.
 
 Two rules shape the SSH surface.  Commands are built as argv vectors, never as a
 local shell expression, so no profile value can become a shell token.  And every
@@ -22,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -84,6 +86,28 @@ done
 IFS=$old
 exit 0
 """
+# This source and the argv around it are constant.  Lab Profile values belong in
+# OpenSSH option arguments only; none is ever interpolated into this remote shell
+# expression.  The program observes interpreter process metadata and writes one
+# bounded JSON document to stdout.  It does not read or write node files.
+RUNTIME_PROBE_SOURCE = """import json
+import sys
+version = sys.version_info
+print(json.dumps({
+    "executable": sys.executable,
+    "implementation": sys.implementation.name,
+    "version_info": {
+        "major": version.major,
+        "minor": version.minor,
+        "micro": version.micro,
+        "releaselevel": version.releaselevel,
+        "serial": version.serial,
+    },
+}, sort_keys=True, separators=(",", ":")))
+"""
+RUNTIME_PROBE_COMMAND = shlex.join(
+    ("python3", "-I", "-B", "-S", "-c", RUNTIME_PROBE_SOURCE)
+)
 
 
 @dataclass(frozen=True)
@@ -116,6 +140,7 @@ class ProbeOutcome:
     ok: bool
     value: str | None
     detail: str
+    exit_code: int | None = None
 
 
 def fingerprint_of(blob: str) -> str:
@@ -296,6 +321,31 @@ class LabProber:
                 False, None, _failure_detail("residue probe", code, err)
             )
         return ProbeOutcome(True, out, f"residue probe on {host.name}")
+
+    def read_runtime_identity(self, host: LabHost, known_hosts: Path) -> ProbeOutcome:
+        """Observe one node's fixed ``python3`` runtime through pinned SSH."""
+
+        code, out, err = _run(
+            self._ssh_command(host, known_hosts, RUNTIME_PROBE_COMMAND),
+            timeout=self.command_timeout,
+        )
+        if code != 0:
+            if code == EXIT_TIMEOUT:
+                detail = "timed out"
+            else:
+                detail = bounded_diagnostic(err) or "no diagnostic"
+            return ProbeOutcome(
+                False,
+                None,
+                f"runtime probe on {host.name}: exit {code}: {detail}",
+                code,
+            )
+        return ProbeOutcome(
+            True,
+            out,
+            f"runtime probe on {host.name}: exit 0",
+            code,
+        )
 
     def read_rook_fsid(self) -> ProbeOutcome:
         """Read the Rook CephCluster FSID with one local read-only kubectl get."""
