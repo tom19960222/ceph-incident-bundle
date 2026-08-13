@@ -145,7 +145,7 @@ Every command Probe preserves byte-for-byte standard output and standard error b
     - The remote program streams the archive and never leaves a remote archive file.
 
 21. **Handle an unsupported remote runtime as a Skipped Node.** As an operator, I want other evidence retained when one server cannot run the collector.
-    - Missing `python3`, non-CPython, or a version older than 3.10 yields no admitted archive for that node, prints one concise node-specific line, makes the result partial, and continues.
+    - Missing `python3`, non-CPython, or a version older than 3.10 yields no admitted archive for that node, records one concise node-specific problem on standard error, makes the result partial, and continues.
     - Do not install or repair Python and do not fall back to shell collection.
 
 22. **Treat every Node Evidence Archive as untrusted.** As an operator, I want a compromised node unable to escape the workstation workspace.
@@ -161,9 +161,9 @@ Every command Probe preserves byte-for-byte standard output and standard error b
     - Extract manually inside the collector-owned workspace only after full admission.
 
 24. **Preserve useful complete archives despite SSH status.** As an operator, I want structurally safe evidence retained when transport reports a late error.
-    - A complete admitted archive is preserved even if SSH exits nonzero; print one concise warning and mark partial.
+    - A complete admitted archive is preserved even if SSH exits nonzero; print one concise warning on standard error and mark partial.
     - Connection failure, interruption, incomplete transfer, or rejected structure admits nothing and creates no node directory.
-    - A workstation write or admission failure confined to one node also skips that node and does not prevent attempts against later nodes or workstation evidence sources.
+    - A workstation receive, staging, admission, or evidence-writing failure confined to one node also skips that node and does not prevent attempts against later nodes or workstation evidence sources.
     - Do not put SSH stderr, a transport Capture, a failure ledger, or transport metadata in the bundle.
 
 ### Evidence and Probe model
@@ -189,7 +189,7 @@ Every command Probe preserves byte-for-byte standard output and standard error b
     - Recheck at open time and copy only a source that is still a regular file.
     - A hard-linked source may be copied as independent bytes, but no link identity is preserved.
     - Preserve bytes and mirrored source path only; do not promise source mode, owner, group, mtime, ACLs, xattrs, SELinux labels, or hard-link relationships.
-    - A selected file inspection/read/copy failure prints one concise line, marks partial, creates no placeholder, and does not stop other files.
+    - A selected file inspection/read/copy failure records one concise problem on standard error, marks partial, creates no placeholder, and does not stop other files.
 
 ### Target Node evidence
 
@@ -314,8 +314,9 @@ Every command Probe preserves byte-for-byte standard output and standard error b
     - `collect` exits zero whenever it delivers the final bundle, complete or partial, and its final stdout line contains the path plus `(complete)` or `(partial)`.
     - Startup rejection or a workstation failure that prevents delivery of any final bundle exits nonzero.
 
-51. **Print simple operator-visible failures.** As an operator, I want immediate readable feedback without another in-bundle reporting system.
-    - Reserve standard output for the single final bundle path and outcome line. Print progress plus concise node, path, cleanup, capability, and delivery failure/warning lines on standard error.
+51. **Print simple operator-visible failures.** As an operator, I want readable feedback without another in-bundle reporting system.
+    - Reserve standard output for exactly one final bundle path and outcome line emitted after successful delivery. Print progress plus concise node, path, cleanup, capability, and delivery failure/warning lines on standard error.
+    - A run that delivers no final Incident Bundle prints no false final-result line on standard output.
     - Do not add transport stderr, placeholders, error manifests, debug logs, or a failure ledger to the bundle.
 
 52. **Clean collector-owned work.** As an operator, I want ephemeral collection work removed without broad cleanup behavior.
@@ -355,13 +356,15 @@ src/ceph_incident_bundle/
   remote_collector.py
 ```
 
-`cli.py` parses arguments and dispatches only. `inventory.py` owns Node Inventory generation, parsing, complete startup validation, immutable configuration values, and the exact accepted inventory bytes. `generate_inventory.py` owns the `generate-inventory` command behavior. `collect/__init__.py` exposes `run()` and is the readable top-level flow: it owns the workstation workspace, fixed capability order, optional-capability decisions, accumulated problems, the final `complete` or `partial` decision, and command output. It passes explicit destination paths to the capability modules rather than introducing a workspace manager, bundle draft, or general context object.
+`cli.py` parses arguments and dispatches only. `inventory.py` owns Node Inventory generation, parsing, complete startup validation, immutable configuration values, and the exact accepted inventory bytes. `generate_inventory.py` owns the `generate-inventory` command behavior. `collect/__init__.py` exposes `run()` and is the readable top-level flow: it owns the workstation workspace, fixed capability order, optional-capability decisions, accumulated problems, the final `complete` or `partial` decision, and command output. Optional capability modules receive complete validated settings and never silently no-op on missing configuration. The flow passes explicit destination paths rather than introducing a standalone workspace abstraction, bundle draft, or general context object.
 
-`collect/node.py` owns the complete one-Target-Node operation, including the one OpenSSH process, unchanged Remote Node Collector source transfer, stream draining, candidate archive receipt, and same-session Ceph behavior. `collect/node_archive.py` owns complete validation and safe extraction of the untrusted Node Evidence Archive. `collect/kubernetes.py`, `collect/prometheus.py`, and `collect/bundle.py` respectively own their evidence behavior and final atomic bundle publication. `remote_collector.py` remains a readable self-contained procedural source file with a high-level `main()` and ordinary functions grouped by evidence capability; it does not import workstation package code.
+`collect/node.py` owns the complete one-Target-Node operation, including the one OpenSSH process, unchanged Remote Node Collector source transfer, stream draining, candidate archive receipt, and same-session Ceph behavior. `collect/node_archive.py` owns complete validation and safe extraction of the untrusted Node Evidence Archive. `collect/kubernetes.py` and `collect/prometheus.py` own their respective evidence behavior. `collect/bundle.py` owns final metadata, final-tree structural validation, and atomic bundle publication. `remote_collector.py` remains a readable self-contained procedural source file with a high-level `main()` and ordinary functions grouped by evidence capability; it does not import workstation package code.
 
-Each capability collection function returns `list[str]` containing the concrete operator-visible problems it encountered. `collect.run()` adds those lists with `problems.extend(...)`; when one unexpected ordinary exception escapes an independent evidence-source call, it adds that one problem with `problems.append(...)` and continues with the next independent source. There is no problem class, reporter callback, severity hierarchy, fatal domain category, manager, builder, registry, plug-in framework, `common.py`, or `utils.py`. A nonzero command result means no final Incident Bundle could be delivered, not that an internal error was assigned a fatal classification. `KeyboardInterrupt` is not treated as an evidence problem and retains its explicit cleanup and exit-130 behavior.
+Each independent evidence-source collection function returns `list[str]` containing the concrete operator-visible problems it encountered. `collect.run()` adds those lists with `problems.extend(...)`; when one unexpected ordinary exception escapes an independent evidence-source call, it adds that one problem with `problems.append(...)` and continues with the next independent source. Only this top-level flow decides `complete` or `partial` and owns the command's standard-output and standard-error policy. A nonzero command result means no final Incident Bundle could be delivered, not that an internal error was assigned a fatal classification. `KeyboardInterrupt` is not treated as an evidence problem and retains its explicit cleanup and exit-130 behavior.
 
-The capability modules do not call one another or import command flow. Ceph has no shallow workstation `ceph.py`: its configured source is selected by `collect.run()` and its evidence remains inside the node's one SSH operation. `node_archive.py` and `bundle.py` each keep their input-specific portable-path checks rather than introducing a shared abstraction for only two different representations. Node/Ceph and Kubernetes Probe execution may likewise retain small explicit implementations on their separate deployment sides instead of generating or sharing Remote Node Collector source.
+Dependencies remain one-way. `collect.run()` may call each capability, `node.py` alone depends on `node_archive.py`, peer evidence capabilities do not call one another, and none imports the top-level flow. Ceph has no shallow workstation `ceph.py`: its configured source is selected by `collect.run()` and its evidence remains inside the node's one SSH operation. `node_archive.py` and `bundle.py` each keep their input-specific portable-path checks rather than introducing a shared artifact-path abstraction for only two different representations. Node/Ceph and Kubernetes Probe execution likewise retain small explicit implementations on their separate deployment sides instead of using a shared Probe or command-runner framework or generating Remote Node Collector source.
+
+Do not add a second collection-flow module, generic commands package, standalone workspace abstraction, generic models or errors module, bundle draft, general context object, problem class, reporter callback, mutable status object, severity or exception hierarchy, fatal domain category, collector class hierarchy, dependency-injection framework, manager, builder, registry, plug-in framework, `common.py`, or `utils.py`.
 
 ### Strict inventory schema
 
@@ -515,7 +518,7 @@ Probe captures remain flat under `nodes/<inventory_name>/probes/`, `ceph/probes/
 
 ## Testing Decisions
 
-1. The highest acceptance seam is the installed CLI, exercised as an external process. Unit tests may cover parsers and structural helpers but cannot replace black-box acceptance.
+1. The highest acceptance seam is the installed CLI, exercised as an external process. Direct tests additionally exercise the public top-level collection flow for unexpected evidence-source exception orchestration, the Inventory Module for generation, parsing, and complete validation, Node Evidence Archive admission, and final bundle publication. The Remote Node Collector is exercised as an external subprocess. Tests assert public behavior only; private helpers and test-only interfaces are not testing seams.
 2. The default suite is fully offline. It uses fixture filesystems, executable fake `ssh` and `kubectl` programs on `PATH`, and a loopback fake Prometheus HTTP server. It never contacts real infrastructure.
 3. The production-floor gate runs both the installed workstation package and Remote Node Collector with an actual pre-provisioned CPython 3.10 interpreter in an isolated environment. It proves CPython and exact minor version and never silently substitutes the developer's Python or changes global Python.
 4. Fake SSH records argv, stdin bytes, process count, destination, order, stderr, and exit status. It proves one process per node, unchanged source stdin, fixed `python3 -`, noninteractive options, same-session Ceph, no local shell, and no SCP/SFTP. At least one path executes the received source using real CPython 3.10 to produce a genuine archive.
@@ -531,6 +534,9 @@ Probe captures remain flat under `nodes/<inventory_name>/probes/`, `ceph/probes/
 14. Cleanup tests cover remote and local success, Probe failure, archive failure/admission rejection, cleanup failure, packaging failure that prevents delivery, and Ctrl-C. They assert cleanup stays within the unique owned workspace and no production-boundary event mutates services, packages, mounts, Ceph state, or Kubernetes state.
 15. Negative tests assert there is no shell collector, `sudo`, `cephadm`, alternate interpreter, package installation, remote kubectl, `kubectl exec`, curl, arbitrary command, verifier, redactor, secret scanner, or concurrency surface.
 16. Live acceptance is separate and explicit. Once the operator provides inventory, access, and authorization, the implementation agent first runs one Target Node to prove real Python 3.10+, one-SSH behavior, readable evidence, and remote cleanup. If that passes, the agent automatically runs the full configured nodes, direct Ceph, Rook, and Prometheus collection, inspects the bundle and residue, and refines the provisional broad Rook-log selection without relaxing the `get`/`logs` boundary.
+17. CLI tests assert that successful delivery produces exactly one standard-output line containing the final path and outcome, while progress, all accumulated problems, warnings, and delivery failures remain on standard error. A nondelivery result emits no false final-result line.
+18. Installed-CLI tests cover ordinary boundary failures and the observable output, delivery, and exit contract. Direct tests of the public top-level collection flow inject receiving, staging, admission, and local write failures for a Target Node plus unexpected ordinary exceptions at each independent Target Node, Kubernetes, and Prometheus seam. They prove that later sources and final packaging are still attempted, every returned problem string is retained, one escaped exception adds one problem, and a delivered bundle is partial with exit zero. Ctrl-C remains outside this path.
+19. Node archive admission and bundle publication run the same portable-path adversarial cases through their separate public interfaces; production code is not forced through a shared path abstraction.
 
 ## Out of Scope
 
