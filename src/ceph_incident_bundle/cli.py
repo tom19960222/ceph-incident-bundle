@@ -26,7 +26,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     collect_parser.add_argument("--inventory", type=Path, default=Path("inventory.ini"))
     collect_parser.add_argument("--since", default="24h")
-    collect_parser.add_argument("--output-dir", type=Path, default=Path.cwd())
+    collect_parser.add_argument("--output-dir", type=Path, default=Path("."))
 
     arguments = parser.parse_args(argv)
     if arguments.subcommand == "generate-inventory":
