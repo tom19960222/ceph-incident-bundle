@@ -14,6 +14,23 @@ from ceph_incident_bundle.inventory import draft_inventory
 COMMAND = os.environ.get("CEPH_INCIDENT_BUNDLE_COMMAND")
 
 
+def missing_username_without_a_home() -> str:
+    """Return a deterministic username whose tilde cannot be expanded."""
+    for username in (
+        "cib_no_user_6f9e2d7c",
+        "cib_no_user_14a8c3b5",
+        "cib_no_user_f27d91e4",
+    ):
+        try:
+            pwd.getpwnam(username)
+        except KeyError:
+            try:
+                Path(f"~{username}/probe").expanduser()
+            except RuntimeError:
+                return username
+    raise AssertionError("deterministic missing-user candidates unexpectedly exist")
+
+
 @unittest.skipUnless(COMMAND, "installed CLI path not provided")
 class InstalledCliTests(unittest.TestCase):
     def run_cli(
@@ -171,24 +188,7 @@ request_timeout = 5m
         self.assertEqual(completed.stderr, expected_stderr)
 
     def test_unresolvable_user_paths_fail_without_traceback_or_residue(self) -> None:
-        missing_username = None
-        for username in (
-            "cib_no_user_6f9e2d7c",
-            "cib_no_user_14a8c3b5",
-            "cib_no_user_f27d91e4",
-        ):
-            try:
-                pwd.getpwnam(username)
-            except KeyError:
-                candidate = Path(f"~{username}/probe")
-                try:
-                    candidate.expanduser()
-                except RuntimeError:
-                    missing_username = username
-                    break
-        if missing_username is None:
-            self.fail("deterministic missing-user candidates unexpectedly exist")
-
+        missing_username = missing_username_without_a_home()
         unresolved_hosts = f"~{missing_username}/hosts"
         unresolved_output = f"~{missing_username}/inventory.ini"
         with TemporaryDirectory() as directory:
@@ -238,6 +238,62 @@ request_timeout = 5m
         self.assertTrue(
             completed.stderr.endswith(b"FAIL: no Incident Bundle delivered\n")
         )
+
+    def test_collect_unresolvable_inventory_user_rejects_before_activity(
+        self,
+    ) -> None:
+        missing_username = missing_username_without_a_home()
+        unresolved_inventory = f"~{missing_username}/inventory.ini"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            process_marker = cwd / "ssh-started"
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(process_marker)!r}).write_text("started", encoding="ascii")
+raise SystemExit(99)
+""",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o755)
+            temporary_root = cwd / "temporary"
+            temporary_root.mkdir()
+            output = cwd / "output"
+            output.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+
+            completed = self.run_cli(
+                "collect",
+                "--inventory",
+                unresolved_inventory,
+                "--output-dir",
+                str(output),
+                cwd=cwd,
+                env=environment,
+            )
+
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+            output_entries = list(output.iterdir())
+            process_started = process_marker.exists()
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, b"")
+        diagnostic, final_line = completed.stderr.splitlines()
+        self.assertTrue(
+            diagnostic.startswith(
+                f"cannot read Inventory {unresolved_inventory}: ".encode("utf-8")
+            )
+        )
+        self.assertEqual(final_line, b"FAIL: no Incident Bundle delivered")
+        self.assertNotIn(b"Traceback", completed.stderr)
+        self.assertFalse(process_started)
+        self.assertEqual(workspaces, [])
+        self.assertEqual(output_entries, [])
 
     def test_collect_does_not_accept_abbreviated_controls(self) -> None:
         with TemporaryDirectory() as directory:
