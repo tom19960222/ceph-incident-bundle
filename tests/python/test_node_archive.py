@@ -1,3 +1,4 @@
+import errno
 import gzip
 import io
 from pathlib import Path
@@ -43,6 +44,166 @@ BASE_MEMBERS = [
 
 
 class NodeArchiveAdmissionTests(unittest.TestCase):
+    def test_missing_archive_retains_its_file_system_error(self) -> None:
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            staging = workspace / "private" / "node-a"
+            staging.mkdir(parents=True)
+            archive = staging / "missing.tar.gz"
+            extraction = staging / "extracted"
+            contribution = workspace / "admitted" / "node-a"
+            contribution.parent.mkdir()
+
+            with self.assertRaises(FileNotFoundError):
+                admit_archive(
+                    archive, extraction, contribution, ceph_allowed=False
+                )
+
+            self.assertFalse(extraction.exists())
+            self.assertFalse(contribution.exists())
+
+    def test_invalid_contribution_parent_retains_its_file_system_error(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            staging = workspace / "private" / "node-a"
+            staging.mkdir(parents=True)
+            archive = staging / "received.tar.gz"
+            extraction = staging / "extracted"
+            contribution_parent = workspace / "admitted"
+            contribution_parent.write_bytes(b"not a directory")
+            contribution = contribution_parent / "node-a"
+            write_archive(archive, BASE_MEMBERS)
+
+            with self.assertRaises(NotADirectoryError) as caught:
+                admit_archive(
+                    archive, extraction, contribution, ceph_allowed=False
+                )
+
+            self.assertEqual(caught.exception.errno, errno.ENOTDIR)
+            self.assertFalse(extraction.exists())
+            self.assertEqual(contribution_parent.read_bytes(), b"not a directory")
+
+    def test_initial_tar_open_retains_its_file_system_error(self) -> None:
+        def fail_with_tar_read_error(*args, **kwargs):
+            file_error = OSError(errno.EIO, "injected archive read failure")
+            raise tarfile.ReadError("not a gzip file") from file_error
+
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            staging = workspace / "private" / "node-a"
+            staging.mkdir(parents=True)
+            archive = staging / "received.tar.gz"
+            extraction = staging / "extracted"
+            contribution = workspace / "admitted" / "node-a"
+            contribution.parent.mkdir()
+            write_archive(archive, BASE_MEMBERS)
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.node_archive.tarfile.open",
+                    new=fail_with_tar_read_error,
+                ),
+                self.assertRaises(OSError) as caught,
+            ):
+                admit_archive(
+                    archive, extraction, contribution, ceph_allowed=False
+                )
+
+            self.assertEqual(caught.exception.errno, errno.EIO)
+            self.assertFalse(extraction.exists())
+            self.assertFalse(contribution.exists())
+
+    def test_extraction_write_retains_its_file_system_error(self) -> None:
+        real_open = Path.open
+        write_error = OSError(errno.ENOSPC, "injected extraction write failure")
+
+        class FailingWriteStream:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+
+            def __exit__(self, exception_type, exception, traceback):
+                return self.stream.__exit__(
+                    exception_type, exception, traceback
+                )
+
+            def write(self, contents):
+                raise write_error
+
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            staging = workspace / "private" / "node-a"
+            staging.mkdir(parents=True)
+            archive = staging / "received.tar.gz"
+            extraction = staging / "extracted"
+            contribution = workspace / "admitted" / "node-a"
+            contribution.parent.mkdir()
+            outside_sentinel = workspace / "outside-sentinel"
+            outside_sentinel.write_bytes(b"unchanged")
+            evidence = extraction / "node" / "files" / "evidence"
+            write_archive(
+                archive, [*BASE_MEMBERS, ("node/files/evidence", b"private")]
+            )
+
+            def fail_evidence_write(path: Path, *args, **kwargs):
+                mode = args[0] if args else kwargs.get("mode", "r")
+                opened = real_open(path, *args, **kwargs)
+                if path == evidence and mode == "xb":
+                    return FailingWriteStream(opened)
+                return opened
+
+            with (
+                patch("pathlib.Path.open", new=fail_evidence_write),
+                self.assertRaises(OSError) as caught,
+            ):
+                admit_archive(
+                    archive, extraction, contribution, ceph_allowed=False
+                )
+
+            self.assertIs(caught.exception, write_error)
+            self.assertEqual(caught.exception.errno, errno.ENOSPC)
+            self.assertTrue(extraction.is_dir())
+            self.assertEqual(evidence.read_bytes(), b"")
+            self.assertFalse(contribution.exists())
+            self.assertEqual(outside_sentinel.read_bytes(), b"unchanged")
+
+    def test_final_promotion_retains_its_file_system_error(self) -> None:
+        promotion_error = OSError(errno.EIO, "injected promotion failure")
+
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            staging = workspace / "private" / "node-a"
+            staging.mkdir(parents=True)
+            archive = staging / "received.tar.gz"
+            extraction = staging / "extracted"
+            contribution = workspace / "admitted" / "node-a"
+            contribution.parent.mkdir()
+            outside_sentinel = workspace / "outside-sentinel"
+            outside_sentinel.write_bytes(b"unchanged")
+            write_archive(archive, BASE_MEMBERS)
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.node_archive.os.rename",
+                    side_effect=promotion_error,
+                ),
+                self.assertRaises(OSError) as caught,
+            ):
+                admit_archive(
+                    archive, extraction, contribution, ceph_allowed=False
+                )
+
+            self.assertIs(caught.exception, promotion_error)
+            self.assertEqual(caught.exception.errno, errno.EIO)
+            self.assertTrue((extraction / "node/probes").is_dir())
+            self.assertFalse(contribution.exists())
+            self.assertEqual(outside_sentinel.read_bytes(), b"unchanged")
+
     def test_complete_archive_is_privately_extracted_then_promoted(self) -> None:
         members = [
             ("node", None),
@@ -503,7 +664,7 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
                     self.assertFalse(extraction.exists())
                     self.assertFalse(contribution.exists())
 
-    def test_existing_contribution_is_never_replaced(self) -> None:
+    def test_existing_contribution_retains_its_file_system_error(self) -> None:
         with TemporaryDirectory() as directory:
             workspace = Path(directory)
             staging = workspace / "private" / "node-a"
@@ -516,7 +677,7 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
             sentinel.write_bytes(b"unchanged")
             write_archive(archive, BASE_MEMBERS)
 
-            with self.assertRaises(ArchiveRejected):
+            with self.assertRaises(FileExistsError):
                 admit_archive(archive, extraction, contribution, ceph_allowed=False)
 
             self.assertEqual(sentinel.read_bytes(), b"unchanged")

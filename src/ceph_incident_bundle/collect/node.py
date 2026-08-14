@@ -96,10 +96,16 @@ def collect_node(
             contribution_directory,
             ceph_allowed=ceph_allowed,
         )
-    except (ArchiveRejected, OSError) as error:
+    except ArchiveRejected as error:
         problems.append(
             f"Target Node {node.inventory_name}: "
             f"Node Evidence Archive rejected: {error}"
+        )
+        return problems
+    except OSError as error:
+        problems.append(
+            f"Target Node {node.inventory_name}: local Node Evidence Archive "
+            f"admission failed in private staging {staging_directory}: {error}"
         )
         return problems
 

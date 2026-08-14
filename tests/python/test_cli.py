@@ -343,6 +343,202 @@ node-a = node-a.example.test
         self.assertIn(b"Node Evidence Archive rejected", completed.stderr)
         self.assertEqual(node_names, [])
 
+    def test_local_admission_failure_is_not_reported_as_archive_rejection(
+        self,
+    ) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            temporary_root = cwd / "temporary"
+            temporary_root.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+            environment["FAKE_SSH_PRECREATE_EXTRACTION"] = "node-a"
+
+            completed = self.run_cli(
+                "collect", cwd=cwd, env=environment, timeout=20
+            )
+
+            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            bundle = bundles[0]
+            with tarfile.open(bundle, "r:gz") as archive:
+                root = bundle.name.removesuffix(".tar.gz")
+                names = {member.name for member in archive.getmembers()}
+                metadata_file = archive.extractfile(f"{root}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stdout,
+            f"{bundle.resolve()} (partial)\n".encode("utf-8"),
+        )
+        self.assertIn(
+            b"local Node Evidence Archive admission failed", completed.stderr
+        )
+        self.assertNotIn(b"Node Evidence Archive rejected", completed.stderr)
+        self.assertEqual(outcome, "partial")
+        self.assertFalse(
+            any(name.startswith(f"{root}/nodes/node-a") for name in names)
+        )
+        self.assertFalse(any("private" in name for name in names))
+        self.assertEqual(workspaces, [])
+
+    def test_truncated_genuine_ssh_archive_stays_private_and_delivers_partial(
+        self,
+    ) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            temporary_root = cwd / "temporary"
+            temporary_root.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+            environment["FAKE_SSH_TRUNCATE"] = "1"
+
+            completed = self.run_cli(
+                "collect", cwd=cwd, env=environment, timeout=20
+            )
+
+            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            bundle = bundles[0]
+            with tarfile.open(bundle, "r:gz") as archive:
+                root = bundle.name.removesuffix(".tar.gz")
+                names = {member.name for member in archive.getmembers()}
+                inventory_file = archive.extractfile(f"{root}/inventory.ini")
+                metadata_file = archive.extractfile(f"{root}/collection.json")
+                assert inventory_file is not None
+                assert metadata_file is not None
+                bundled_inventory = inventory_file.read()
+                outcome = json.load(metadata_file)["outcome"]
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stdout,
+            f"{bundle.resolve()} (partial)\n".encode("utf-8"),
+        )
+        self.assertEqual(
+            completed.stderr,
+            b"Target Node node-a: Node Evidence Archive rejected: "
+            b"Node Evidence Archive has an incomplete gzip member\n",
+        )
+        self.assertEqual(bundled_inventory, inventory)
+        self.assertEqual(outcome, "partial")
+        self.assertEqual(
+            names,
+            {
+                root,
+                f"{root}/inventory.ini",
+                f"{root}/nodes",
+                f"{root}/ceph",
+                f"{root}/kubernetes",
+                f"{root}/prometheus",
+                f"{root}/collection.json",
+            },
+        )
+        self.assertEqual(workspaces, [])
+
+    def test_structurally_hostile_ssh_archive_cannot_escape_private_staging(
+        self,
+    ) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            outside_sentinel = cwd / "outside-sentinel"
+            outside_sentinel.write_bytes(b"unchanged\n")
+            temporary_root = cwd / "temporary"
+            temporary_root.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+            environment["FAKE_SSH_ABSOLUTE_MEMBER"] = str(
+                outside_sentinel.resolve()
+            )
+
+            completed = self.run_cli(
+                "collect", cwd=cwd, env=environment, timeout=20
+            )
+
+            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            bundle = bundles[0]
+            with tarfile.open(bundle, "r:gz") as archive:
+                root = bundle.name.removesuffix(".tar.gz")
+                members = archive.getmembers()
+                names = {member.name for member in members}
+                regular_payloads = []
+                for member in members:
+                    if not member.isreg():
+                        continue
+                    payload = archive.extractfile(member)
+                    assert payload is not None
+                    regular_payloads.append(payload.read())
+                inventory_file = archive.extractfile(f"{root}/inventory.ini")
+                metadata_file = archive.extractfile(f"{root}/collection.json")
+                assert inventory_file is not None
+                assert metadata_file is not None
+                bundled_inventory = inventory_file.read()
+                metadata = json.load(metadata_file)
+            sentinel_bytes = outside_sentinel.read_bytes()
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stdout,
+            f"{bundle.resolve()} (partial)\n".encode("utf-8"),
+        )
+        self.assertEqual(
+            completed.stderr,
+            (
+                "Target Node node-a: Node Evidence Archive rejected: "
+                f"unsafe archive path: {str(outside_sentinel.resolve())!r}\n"
+            ).encode("utf-8"),
+        )
+        self.assertEqual(sentinel_bytes, b"unchanged\n")
+        self.assertEqual(bundled_inventory, inventory)
+        self.assertEqual(
+            set(metadata),
+            {"collector_version", "started_at", "finished_at", "since", "outcome"},
+        )
+        self.assertEqual(metadata["outcome"], "partial")
+        self.assertEqual(
+            names,
+            {
+                root,
+                f"{root}/inventory.ini",
+                f"{root}/nodes",
+                f"{root}/ceph",
+                f"{root}/kubernetes",
+                f"{root}/prometheus",
+                f"{root}/collection.json",
+            },
+        )
+        self.assertNotIn(
+            b"fake-ssh private archive payload\n", b"".join(regular_payloads)
+        )
+        self.assertEqual(workspaces, [])
+
     def test_publication_failure_has_controlled_installed_cli_nondelivery(self) -> None:
         inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
@@ -449,11 +645,13 @@ node-a = node-a.example.test
     def _write_fake_ssh(path: Path) -> None:
         path.write_text(
             f"""#!{sys.executable}
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 
 record = Path(os.environ["FAKE_SSH_RECORD"])
 record.mkdir()
@@ -461,11 +659,40 @@ record.mkdir()
 (record / "argv.json").write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
 source = sys.stdin.buffer.read()
 (record / "stdin.py").write_bytes(source)
+precreate_extraction = os.environ.get("FAKE_SSH_PRECREATE_EXTRACTION")
+if precreate_extraction:
+    temporary_root = Path(os.environ["TMPDIR"])
+    workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+    if len(workspaces) != 1:
+        raise RuntimeError("expected one workstation workspace")
+    (
+        workspaces[0]
+        / "private"
+        / "nodes"
+        / precreate_extraction
+        / "extracted"
+    ).mkdir()
 remove_output = os.environ.get("FAKE_REMOVE_OUTPUT_DIR")
 if remove_output:
     Path(remove_output).rmdir()
 if os.environ.get("FAKE_SSH_CORRUPT"):
     sys.stdout.buffer.write(b"not-an-archive")
+    raise SystemExit(0)
+absolute_member = os.environ.get("FAKE_SSH_ABSOLUTE_MEMBER")
+if absolute_member:
+    private_payload = b"fake-ssh private archive payload\\n"
+    hostile_archive = io.BytesIO()
+    with tarfile.open(fileobj=hostile_archive, mode="w:gz") as archive:
+        for name in ("node", "node/probes", "node/files"):
+            member = tarfile.TarInfo(name)
+            member.type = tarfile.DIRTYPE
+            member.mode = 0o700
+            archive.addfile(member)
+        hostile = tarfile.TarInfo(absolute_member)
+        hostile.mode = 0o600
+        hostile.size = len(private_payload)
+        archive.addfile(hostile, io.BytesIO(private_payload))
+    sys.stdout.buffer.write(hostile_archive.getvalue())
     raise SystemExit(0)
 remote_start = sys.argv.index("python3") + 1
 completed = subprocess.run(
@@ -475,7 +702,10 @@ completed = subprocess.run(
     stderr=subprocess.PIPE,
     check=False,
 )
-sys.stdout.buffer.write(completed.stdout)
+archive_bytes = completed.stdout
+if os.environ.get("FAKE_SSH_TRUNCATE"):
+    archive_bytes = archive_bytes[:-8]
+sys.stdout.buffer.write(archive_bytes)
 if os.environ.get("FAKE_SSH_LARGE_DIAGNOSTIC"):
     os.write(2, b"x" * 200000 + b"\\n")
 elif os.environ.get("FAKE_SSH_DIAGNOSTIC"):

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import errno
+import gzip
 import os
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -51,6 +53,12 @@ def admit_archive(
     except ArchiveRejected:
         raise
     except (EOFError, tarfile.TarError) as error:
+        # CPython's gzip tar opener translates an initial local OSError into a
+        # ReadError.  Restore that ordinary file-system meaning, while keeping
+        # BadGzipFile classified as corrupt archive input.
+        cause = error.__cause__
+        if isinstance(cause, OSError) and not isinstance(cause, gzip.BadGzipFile):
+            raise cause
         raise ArchiveRejected(f"invalid Node Evidence Archive: {error}") from error
 
     os.rename(extraction_directory, contribution_directory)
@@ -62,29 +70,25 @@ def _validate_destinations(
     extraction_directory: Path,
     contribution_directory: Path,
 ) -> None:
-    try:
-        archive_mode = archive_path.stat(follow_symlinks=False).st_mode
-    except OSError as error:
-        raise ArchiveRejected(
-            f"cannot inspect Node Evidence Archive: {error}"
-        ) from error
+    archive_mode = archive_path.stat(follow_symlinks=False).st_mode
     if not stat.S_ISREG(archive_mode):
         raise ArchiveRejected("Node Evidence Archive must be an owned regular file")
 
-    try:
-        staging_mode = staging_directory.stat(follow_symlinks=False).st_mode
-        contribution_parent_mode = contribution_directory.parent.stat(
-            follow_symlinks=False
-        ).st_mode
-    except OSError as error:
-        raise ArchiveRejected(
-            f"cannot inspect admission destinations: {error}"
-        ) from error
+    staging_mode = staging_directory.stat(follow_symlinks=False).st_mode
+    contribution_parent_mode = contribution_directory.parent.stat(
+        follow_symlinks=False
+    ).st_mode
     if not stat.S_ISDIR(staging_mode):
-        raise ArchiveRejected("node staging must be an ordinary directory")
+        raise NotADirectoryError(
+            errno.ENOTDIR,
+            "node staging must be an ordinary directory",
+            str(staging_directory),
+        )
     if not stat.S_ISDIR(contribution_parent_mode):
-        raise ArchiveRejected(
-            "admitted contribution parent must be an ordinary directory"
+        raise NotADirectoryError(
+            errno.ENOTDIR,
+            "admitted contribution parent must be an ordinary directory",
+            str(contribution_directory.parent),
         )
 
     staging = staging_directory.resolve()
@@ -95,15 +99,25 @@ def _validate_destinations(
     if extraction_directory.parent.resolve() != staging:
         raise ArchiveRejected("private extraction must be a child of node staging")
     if _path_exists(extraction_directory):
-        raise ArchiveRejected("private extraction destination already exists")
+        raise FileExistsError(
+            errno.EEXIST,
+            "private extraction destination already exists",
+            str(extraction_directory),
+        )
     if _path_exists(contribution_directory):
-        raise ArchiveRejected("admitted contribution destination already exists")
+        raise FileExistsError(
+            errno.EEXIST,
+            "admitted contribution destination already exists",
+            str(contribution_directory),
+        )
     if (
         staging_directory.stat(follow_symlinks=False).st_dev
         != contribution_directory.parent.stat(follow_symlinks=False).st_dev
     ):
-        raise ArchiveRejected(
-            "private staging and admitted contribution must share a filesystem"
+        raise OSError(
+            errno.EXDEV,
+            "private staging and admitted contribution must share a filesystem",
+            str(contribution_directory),
         )
 
 
@@ -166,7 +180,7 @@ def _one_gzip_member_chunks(archive_path: Path) -> Iterator[bytes]:
             # flush here would reintroduce an output allocation without a cap.
     except ArchiveRejected:
         raise
-    except (OSError, zlib.error) as error:
+    except zlib.error as error:
         raise ArchiveRejected(f"invalid compressed archive: {error}") from error
 
 
