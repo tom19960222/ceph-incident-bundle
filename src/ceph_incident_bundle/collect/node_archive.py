@@ -13,6 +13,9 @@ import unicodedata
 import zlib
 
 
+_STREAM_CHUNK_BYTES = 1024 * 1024
+
+
 class ArchiveRejected(Exception):
     """The complete Node Evidence Archive is not structurally admissible."""
 
@@ -47,7 +50,7 @@ def admit_archive(
             _extract_members(archive, members, extraction_directory)
     except ArchiveRejected:
         raise
-    except (gzip.BadGzipFile, EOFError, tarfile.TarError) as error:
+    except (EOFError, tarfile.TarError) as error:
         raise ArchiveRejected(f"invalid Node Evidence Archive: {error}") from error
 
     os.rename(extraction_directory, contribution_directory)
@@ -135,27 +138,32 @@ def _one_gzip_member_chunks(archive_path: Path) -> Iterator[bytes]:
     try:
         with archive_path.open("rb") as compressed:
             while True:
-                raw_chunk = compressed.read(1024 * 1024)
+                raw_chunk = compressed.read(_STREAM_CHUNK_BYTES)
                 if not raw_chunk:
                     break
                 if decompressor.eof:
                     raise ArchiveRejected(
                         "Node Evidence Archive has bytes after its gzip member"
                     )
-                uncompressed = decompressor.decompress(raw_chunk)
-                if decompressor.unused_data or decompressor.unconsumed_tail:
-                    raise ArchiveRejected(
-                        "Node Evidence Archive has bytes after its gzip member"
+                pending = raw_chunk
+                while pending:
+                    uncompressed = decompressor.decompress(
+                        pending, max_length=_STREAM_CHUNK_BYTES
                     )
-                if uncompressed:
-                    yield uncompressed
+                    pending = decompressor.unconsumed_tail
+                    if decompressor.unused_data:
+                        raise ArchiveRejected(
+                            "Node Evidence Archive has bytes after its gzip member"
+                        )
+                    if uncompressed:
+                        yield uncompressed
             if not decompressor.eof:
                 raise ArchiveRejected(
                     "Node Evidence Archive has an incomplete gzip member"
                 )
-            final_bytes = decompressor.flush()
-            if final_bytes:
-                yield final_bytes
+            # Reaching EOF after exhausting unconsumed_tail means every output
+            # byte was returned by the bounded decompress calls above.  Calling
+            # flush here would reintroduce an output allocation without a cap.
     except ArchiveRejected:
         raise
     except (OSError, zlib.error) as error:
@@ -163,25 +171,36 @@ def _one_gzip_member_chunks(archive_path: Path) -> Iterator[bytes]:
 
 
 def _first_tar_eof_offset(members: list[tarfile.TarInfo]) -> int:
-    """Derive the first tar EOF position from documented member attributes.
+    """Derive the first tar EOF position, failing closed on runtime drift.
 
-    ``TarInfo.offset_data`` is the start of a member's data and ``size`` is its
-    byte count.  Admission has already limited members to ordinary directories
-    and nonsparse regular files, so rounding each payload to a 512-byte tar block
-    gives the next possible header position.  The greatest such position is where
-    the first required pair of tar EOF blocks must start.
+    CPython 3.10's ``tarfile`` exposes ``TarInfo.offset_data`` but does not
+    document it as public API.  The product is explicitly CPython-only, so this
+    compatibility boundary checks the attribute's type, range, and tar-block
+    alignment before use.  Admission has already excluded sparse members; adding
+    the documented payload ``size`` rounded to a 512-byte block therefore finds
+    the next possible header.  The greatest such position is where the first pair
+    of tar EOF blocks must start.  A changed or malformed CPython representation
+    is rejected rather than guessed or partially re-parsed here.
     """
     member_end = 0
     for member in members:
-        if member.offset_data < 512 or member.offset_data % 512 != 0:
+        offset_data = getattr(member, "offset_data", None)
+        if (
+            type(offset_data) is not int
+            or offset_data < 512
+            or offset_data % 512 != 0
+        ):
             raise ArchiveRejected(
                 f"invalid archive member data offset: {member.name}"
             )
-        payload_size = member.size if member.isreg() else 0
+        size = getattr(member, "size", None)
+        if type(size) is not int or size < 0:
+            raise ArchiveRejected(f"invalid archive member size: {member.name}")
+        payload_size = size if member.isreg() else 0
         payload_blocks, remainder = divmod(payload_size, 512)
         if remainder:
             payload_blocks += 1
-        candidate_end = member.offset_data + payload_blocks * 512
+        candidate_end = offset_data + payload_blocks * 512
         member_end = max(member_end, candidate_end)
     return member_end
 
@@ -221,7 +240,24 @@ def _validate_members(
             raise ArchiveRejected(f"unknown archive root: {components[0]}")
         if components[0] == "ceph" and not ceph_allowed:
             raise ArchiveRejected("ceph evidence is not allowed for this Target Node")
-        if (not member.isdir() and not member.isreg()) or member.issparse():
+        # ``issparse`` is another CPython tarfile detail rather than a documented
+        # cross-implementation promise.  Guard it so runtime drift rejects input.
+        sparse_check = getattr(member, "issparse", None)
+        if not callable(sparse_check):
+            raise ArchiveRejected(
+                f"archive member lacks CPython sparse-layout check: {member.name}"
+            )
+        try:
+            is_sparse = sparse_check()
+        except Exception as error:
+            raise ArchiveRejected(
+                f"cannot check archive member sparse layout: {member.name}: {error}"
+            ) from error
+        if type(is_sparse) is not bool:
+            raise ArchiveRejected(
+                f"invalid archive member sparse-layout result: {member.name}"
+            )
+        if (not member.isdir() and not member.isreg()) or is_sparse:
             raise ArchiveRejected(f"unsupported archive member type: {member.name}")
         if components in by_path:
             raise ArchiveRejected(f"duplicate archive member: {member.name}")

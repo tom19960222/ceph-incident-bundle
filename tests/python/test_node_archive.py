@@ -4,6 +4,7 @@ from pathlib import Path
 import tarfile
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from ceph_incident_bundle.collect.node_archive import (
     ArchiveRejected,
@@ -16,8 +17,12 @@ def write_archive(
     members: list[tuple[str, bytes | None]],
     *,
     mode: str = "w:gz",
+    archive_format: int | None = None,
 ) -> None:
-    with tarfile.open(path, mode) as archive:
+    open_arguments = {}
+    if archive_format is not None:
+        open_arguments["format"] = archive_format
+    with tarfile.open(path, mode, **open_arguments) as archive:
         for name, contents in members:
             member = tarfile.TarInfo(name)
             if contents is None:
@@ -200,6 +205,162 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
             self.assertEqual(
                 (contribution / "node/files/513-bytes").read_bytes(), b"y" * 513
             )
+
+    def test_gnu_long_name_finds_the_first_tar_eof(self) -> None:
+        long_component = "g" * 120
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            staging = workspace / "private" / "node-a"
+            staging.mkdir(parents=True)
+            archive = staging / "received.tar.gz"
+            extraction = staging / "extracted"
+            contribution = workspace / "admitted" / "node-a"
+            contribution.parent.mkdir()
+            write_archive(
+                archive,
+                [*BASE_MEMBERS, (f"node/files/{long_component}", b"gnu\n")],
+                archive_format=tarfile.GNU_FORMAT,
+            )
+
+            admit_archive(archive, extraction, contribution, ceph_allowed=False)
+
+            self.assertEqual(
+                (contribution / "node/files" / long_component).read_bytes(),
+                b"gnu\n",
+            )
+
+    def test_highly_compressible_archive_is_admitted_without_a_total_cap(self) -> None:
+        evidence = b"\0" * (3 * 1024 * 1024 + 17)
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            staging = workspace / "private" / "node-a"
+            staging.mkdir(parents=True)
+            archive = staging / "received.tar.gz"
+            extraction = staging / "extracted"
+            contribution = workspace / "admitted" / "node-a"
+            contribution.parent.mkdir()
+            write_archive(
+                archive, [*BASE_MEMBERS, ("node/files/compressible", evidence)]
+            )
+
+            admit_archive(archive, extraction, contribution, ceph_allowed=False)
+
+            self.assertEqual(
+                (contribution / "node/files/compressible").read_bytes(), evidence
+            )
+
+    def test_invalid_tar_framing_is_reported_as_archive_rejection(self) -> None:
+        invalid_tar = b"not a tar header".ljust(512, b"x") + b"\0" * 1024
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            staging = workspace / "private" / "node-a"
+            staging.mkdir(parents=True)
+            archive = staging / "received.tar.gz"
+            archive.write_bytes(gzip.compress(invalid_tar))
+            extraction = staging / "extracted"
+            contribution = workspace / "admitted" / "node-a"
+            contribution.parent.mkdir()
+
+            with self.assertRaises(ArchiveRejected):
+                admit_archive(
+                    archive, extraction, contribution, ceph_allowed=False
+                )
+
+            self.assertFalse(extraction.exists())
+            self.assertFalse(contribution.exists())
+
+    def test_hostile_pax_size_is_rejected_before_extraction(self) -> None:
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            staging = workspace / "private" / "node-a"
+            staging.mkdir(parents=True)
+            archive = staging / "received.tar.gz"
+            extraction = staging / "extracted"
+            contribution = workspace / "admitted" / "node-a"
+            contribution.parent.mkdir()
+            with tarfile.open(
+                archive, "w:gz", format=tarfile.PAX_FORMAT
+            ) as opened:
+                for name, _contents in BASE_MEMBERS:
+                    member = tarfile.TarInfo(name)
+                    member.type = tarfile.DIRTYPE
+                    opened.addfile(member)
+                hostile = tarfile.TarInfo("node/files/hostile-size")
+                hostile.size = 1
+                hostile.pax_headers = {"size": "999999999"}
+                opened.addfile(hostile, io.BytesIO(b"x"))
+
+            with self.assertRaises(ArchiveRejected):
+                admit_archive(
+                    archive, extraction, contribution, ceph_allowed=False
+                )
+
+            self.assertFalse(extraction.exists())
+            self.assertFalse(contribution.exists())
+
+    def test_missing_or_malformed_cpython_member_offset_is_rejected(self) -> None:
+        original_open = tarfile.open
+        for label, replacement in (("missing", None), ("malformed", "512")):
+            with self.subTest(label=label), TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                staging = workspace / "private" / "node-a"
+                staging.mkdir(parents=True)
+                archive = staging / "received.tar.gz"
+                extraction = staging / "extracted"
+                contribution = workspace / "admitted" / "node-a"
+                contribution.parent.mkdir()
+                write_archive(archive, BASE_MEMBERS)
+
+                def open_with_changed_offset(*args, **kwargs):
+                    opened = original_open(*args, **kwargs)
+                    original_getmembers = opened.getmembers
+
+                    def changed_members():
+                        members = original_getmembers()
+                        if replacement is None:
+                            del members[-1].offset_data
+                        else:
+                            members[-1].offset_data = replacement
+                        return members
+
+                    opened.getmembers = changed_members
+                    return opened
+
+                with patch(
+                    "ceph_incident_bundle.collect.node_archive.tarfile.open",
+                    side_effect=open_with_changed_offset,
+                ):
+                    with self.assertRaises(ArchiveRejected):
+                        admit_archive(
+                            archive, extraction, contribution, ceph_allowed=False
+                        )
+
+                self.assertFalse(extraction.exists())
+                self.assertFalse(contribution.exists())
+
+    def test_missing_or_malformed_cpython_sparse_check_is_rejected(self) -> None:
+        for label, replacement in (
+            ("missing", None),
+            ("malformed", lambda _member: "not a boolean"),
+        ):
+            with self.subTest(label=label), TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                staging = workspace / "private" / "node-a"
+                staging.mkdir(parents=True)
+                archive = staging / "received.tar.gz"
+                extraction = staging / "extracted"
+                contribution = workspace / "admitted" / "node-a"
+                contribution.parent.mkdir()
+                write_archive(archive, BASE_MEMBERS)
+
+                with patch.object(tarfile.TarInfo, "issparse", replacement):
+                    with self.assertRaises(ArchiveRejected):
+                        admit_archive(
+                            archive, extraction, contribution, ceph_allowed=False
+                        )
+
+                self.assertFalse(extraction.exists())
+                self.assertFalse(contribution.exists())
 
     def test_exact_tar_eof_and_extra_zero_padding_are_accepted(self) -> None:
         with TemporaryDirectory() as directory:
