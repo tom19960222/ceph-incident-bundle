@@ -5,7 +5,7 @@ This context defines the language for preserving evidence during Ceph incident i
 ## Language
 
 **Incident Bundle**:
-A portable collection of raw evidence preserved by one incident-time collection. It is not a backup, a repair payload, or a claim that the evidence is complete or safe to share.
+A portable record of one incident-time collection containing its Inventory Snapshot, collection metadata, and whatever Raw Evidence was preserved. It may contain no Raw Evidence when every requested evidence attempt fails; it is not a backup, a repair payload, or a claim that evidence is complete or safe to share.
 _Avoid_: Diagnostic dump, backup
 
 **Raw Evidence**:
@@ -29,7 +29,7 @@ A collection that attempts independent evidence sources and preserves whatever s
 _Avoid_: All-or-nothing collection
 
 **Operationally Read-only Collection**:
-A collection run that leaves persistent configuration, services, packages, mounts, Ceph desired state, and Kubernetes objects or workloads unchanged. Collector-owned ephemeral work and unavoidable observation side effects are allowed, but unreported residue is not.
+A collection run that leaves persistent configuration, services, packages, mounts, Ceph desired state, and Kubernetes objects or workloads unchanged. Collector-owned ephemeral work and unavoidable observation side effects are allowed. Any residue known to the collector is reported; an uncatchable termination can prevent both cleanup and knowledge of residue.
 _Avoid_: Zero-write collection, non-invasive collection
 
 **Collection Workstation**:
@@ -61,7 +61,7 @@ Raw point-in-time output from the fixed direct `ceph` query set, collected once 
 _Avoid_: cephadm evidence, Ceph health result
 
 **Node-local Ceph Evidence**:
-Raw Ceph configuration files and a metadata-only view of Ceph state paths on each Target Node. It excludes daemon databases, block data, and all `cephadm` command output.
+Raw Ceph configuration files collected from each Target Node. It excludes daemon databases, block data, recursive state-path metadata listings, and all `cephadm` command output.
 _Avoid_: Ceph Cluster Evidence, Ceph data backup
 
 **Rook Cluster Evidence**:
@@ -109,7 +109,7 @@ An ephemeral collector executed on a Target Node to preserve node-local incident
 _Avoid_: Agent, daemon, installed collector
 
 **Node Evidence Archive**:
-The transient gzip-compressed tar stream emitted by one Remote Node Collector to transport that Target Node's evidence to the Collection Workstation. It is untrusted transport input, not an Incident Bundle, and exists on disk only in a collector-owned workstation workspace while structural admission is decided.
+The transient gzip-compressed tar stream emitted by one Remote Node Collector to transport that Target Node's evidence to the Collection Workstation. It is untrusted transport input, not an Incident Bundle, and always remains private workstation staging; successful admission creates a separate admitted contribution. Failed cleanup may leave the archive as reported collector-owned residue.
 _Avoid_: Incident Bundle, remote bundle, trusted archive
 
 **Skipped Node**:
@@ -117,5 +117,5 @@ A Target Node for which no Node Evidence Archive was admitted because collection
 _Avoid_: Ignored node, missing node
 
 **Partial Collection**:
-A collection that preserves a usable Incident Bundle while truthfully reporting that one or more requested evidence outcomes were skipped or failed.
+A completed collection that publishes an Incident Bundle while reporting skipped or failed requested evidence, or collector-owned residue that could not be removed. It does not require any requested evidence outcome to have succeeded.
 _Avoid_: Complete collection
