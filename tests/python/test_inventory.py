@@ -104,6 +104,55 @@ mon01 = mon01.second.example
         self.assertIn(b"node-v6 = node-v6.example.test", generated)
         self.assertEqual(problems, ())
 
+    def test_ceph_source_naming_substrings_are_case_insensitive(self) -> None:
+        examples = (
+            ("BACKUP-CP01.example.test", "BACKUP-CP01"),
+            ("archive-CM02.example.test", "archive-CM02"),
+            ("MON03.example.test", "MON03"),
+        )
+        for hostname, expected_source in examples:
+            with self.subTest(hostname=hostname), TemporaryDirectory() as directory:
+                hosts_path = Path(directory) / "hosts"
+                hosts_path.write_text(
+                    f"192.0.2.10 {hostname}\n",
+                    encoding="utf-8",
+                )
+
+                generated, problems = draft_inventory(hosts_path)
+
+            self.assertIn(
+                f"[ceph]\nsource = {expected_source}\n".encode("utf-8"), generated
+            )
+            self.assertEqual(problems, ())
+
+    def test_ceph_source_is_first_matching_hostname_in_hosts_order(self) -> None:
+        hosts = b"""\
+192.0.2.10 worker.example.test
+192.0.2.11 backup-cp01.example.test
+192.0.2.12 mon01.example.test
+"""
+        with TemporaryDirectory() as directory:
+            hosts_path = Path(directory) / "hosts"
+            hosts_path.write_bytes(hosts)
+
+            generated, problems = draft_inventory(hosts_path)
+
+        self.assertIn(b"[ceph]\nsource = backup-cp01\n", generated)
+        self.assertEqual(problems, ())
+
+    def test_ceph_source_is_inactive_when_no_hostname_matches(self) -> None:
+        with TemporaryDirectory() as directory:
+            hosts_path = Path(directory) / "hosts"
+            hosts_path.write_text(
+                "192.0.2.10 worker.example.test\n",
+                encoding="utf-8",
+            )
+
+            generated, problems = draft_inventory(hosts_path)
+
+        self.assertIn(b"[ceph]\n# source =\n", generated)
+        self.assertEqual(problems, ())
+
 
 class LoadInventoryTests(unittest.TestCase):
     def test_valid_inventory_is_immutable_ordered_and_keeps_exact_bytes(self) -> None:

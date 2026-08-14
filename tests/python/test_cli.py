@@ -24,9 +24,14 @@ class InstalledCliTests(unittest.TestCase):
             check=False,
         )
 
-    def test_installed_cli_runs_under_exact_cpython_3_10(self) -> None:
+    def test_installed_cli_entrypoint_uses_tested_cpython_3_10(self) -> None:
+        command = COMMAND
+        assert command is not None
+        console_script_shebang = Path(command).read_bytes().splitlines()[0]
+
         self.assertEqual(sys.implementation.name, "cpython")
         self.assertEqual(sys.version_info[:2], (3, 10))
+        self.assertEqual(console_script_shebang, f"#!{sys.executable}".encode("utf-8"))
 
     def test_default_output_contains_exact_generated_defaults(self) -> None:
         expected = b"""\

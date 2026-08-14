@@ -20,6 +20,8 @@ _FIXED_KEYS = {
     "prometheus": {"url", "metrics_filter_regex", "query_step", "request_timeout"},
 }
 _SECONDS_PER_UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+# This fixed naming heuristic drafts configuration; it never discovers a live capability.
+_CEPH_SOURCE_NAME_SUBSTRINGS = ("mon", "cp", "cm")
 
 
 class InventoryRejected(Exception):
@@ -118,7 +120,10 @@ def draft_inventory(hosts_path: Path) -> tuple[bytes, tuple[str, ...]]:
         (
             name
             for name, hostname in entries
-            if any(marker in hostname.casefold() for marker in ("mon", "cp", "cm"))
+            if any(
+                substring in hostname.casefold()
+                for substring in _CEPH_SOURCE_NAME_SUBSTRINGS
+            )
         ),
         None,
     )
