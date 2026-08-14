@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ipaddress
+import math
 from pathlib import Path
 import re
 import unicodedata
@@ -198,6 +199,10 @@ def load_inventory(inventory_path: Path) -> Inventory:
     probe_timeout_seconds = _duration_seconds(
         "probe_timeout", probe_timeout, "mhdw", allow_zero=True, problems=problems
     )
+    if probe_timeout_seconds and not _fits_process_wait_timeout(
+        probe_timeout_seconds
+    ):
+        problems.append(f"invalid probe_timeout '{probe_timeout}'")
     ssh_connect_timeout = common.get("ssh_connect_timeout", "15s")
     ssh_connect_timeout_seconds = _duration_seconds(
         "ssh_connect_timeout",
@@ -349,7 +354,22 @@ def _duration_seconds(
     if match is None or match.group(2) not in units:
         problems.append(f"invalid {key} '{value}'")
         return 0
-    return int(match.group(1)) * _SECONDS_PER_UNIT[match.group(2)]
+    try:
+        magnitude = int(match.group(1))
+    except ValueError:
+        # A decimal rejected by CPython's digit-limit is invalid Inventory input,
+        # not an interpreter failure that should escape complete validation.
+        problems.append(f"invalid {key} '{value}'")
+        return 0
+    return magnitude * _SECONDS_PER_UNIT[match.group(2)]
+
+
+def _fits_process_wait_timeout(seconds: int) -> bool:
+    """Return whether subprocess can represent this Inventory timeout."""
+    try:
+        return math.isfinite(float(seconds))
+    except OverflowError:
+        return False
 
 
 def _is_ssh_address(value: str) -> bool:

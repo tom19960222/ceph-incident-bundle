@@ -14,7 +14,11 @@ COMMAND = os.environ.get("CEPH_INCIDENT_BUNDLE_COMMAND")
 @unittest.skipUnless(COMMAND, "installed CLI path not provided")
 class InstalledCliTests(unittest.TestCase):
     def run_cli(
-        self, *arguments: str, cwd: Path
+        self,
+        *arguments: str,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         command = COMMAND
         assert command is not None
@@ -23,6 +27,8 @@ class InstalledCliTests(unittest.TestCase):
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
+            timeout=timeout,
             check=False,
         )
 
@@ -91,6 +97,68 @@ request_timeout = 5m
             completed.stderr.endswith(b"FAIL: no Incident Bundle delivered\n")
         )
 
+    def test_collect_does_not_accept_abbreviated_controls(self) -> None:
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            completed = self.run_cli("collect", "--out", str(cwd), cwd=cwd)
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, b"")
+        self.assertIn(b"unrecognized arguments: --out", completed.stderr)
+        self.assertTrue(
+            completed.stderr.endswith(b"FAIL: no Incident Bundle delivered\n")
+        )
+
+    def test_enormous_since_is_rejected_before_workspace_or_ssh(self) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            inventory_path = cwd / "inventory.ini"
+            inventory_path.write_bytes(inventory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            ssh_marker = cwd / "ssh-started"
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(ssh_marker)!r}).write_text("started", encoding="ascii")
+raise SystemExit(99)
+""",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o755)
+            temporary_root = cwd / "temporary"
+            temporary_root.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+            command = COMMAND
+            assert command is not None
+
+            completed = subprocess.run(
+                [command, "collect", "--since", f"{'9' * 5000}h"],
+                cwd=cwd,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            ssh_started = ssh_marker.exists()
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, b"")
+        self.assertIn(b"invalid evidence window", completed.stderr)
+        self.assertTrue(
+            completed.stderr.endswith(b"FAIL: no Incident Bundle delivered\n")
+        )
+        self.assertFalse(ssh_started)
+        self.assertEqual(workspaces, [])
+        self.assertEqual(bundles, [])
+
     def test_collect_uses_one_ssh_and_delivers_one_complete_bundle(self) -> None:
         inventory = b"""\
 [common]
@@ -144,6 +212,7 @@ node-a = node-a.example.test
             argv = json.loads(
                 (record / "argv.json").read_text(encoding="utf-8")
             )
+            process_count = (record / "count").read_text(encoding="ascii")
             transferred_source = (record / "stdin.py").read_bytes()
             from ceph_incident_bundle import remote_collector
 
@@ -173,12 +242,143 @@ node-a = node-a.example.test
             ],
         )
         self.assertEqual(transferred_source, installed_source)
+        self.assertEqual(process_count, "1\n")
         self.assertEqual(bundled_inventory, inventory)
         self.assertTrue(hostname)
         self.assertEqual(metadata["outcome"], "complete")
         self.assertTrue(all(member.isdir() or member.isreg() for member in members))
         for top_level in ("nodes", "ceph", "kubernetes", "prometheus"):
             self.assertIn(f"{root}/{top_level}", names)
+
+    def test_ssh_diagnostics_are_incrementally_escaped_without_losing_delivery(
+        self,
+    ) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+            environment["FAKE_SSH_DIAGNOSTIC"] = "1"
+
+            completed = self.run_cli(
+                "collect", cwd=cwd, env=environment, timeout=20
+            )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn(b"[node-a] remote\\x00\\xff\n", completed.stderr)
+        self.assertTrue(completed.stdout.endswith(b" (complete)\n"))
+
+    def test_large_ssh_diagnostics_and_nonzero_exit_keep_complete_evidence(
+        self,
+    ) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+            environment["FAKE_SSH_EXIT"] = "9"
+            environment["FAKE_SSH_LARGE_DIAGNOSTIC"] = "1"
+
+            completed = self.run_cli(
+                "collect", cwd=cwd, env=environment, timeout=20
+            )
+
+            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            with tarfile.open(bundles[0], "r:gz") as archive:
+                root = bundles[0].name.removesuffix(".tar.gz")
+                names = {member.name for member in archive.getmembers()}
+                metadata_file = archive.extractfile(f"{root}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(completed.stdout.endswith(b" (partial)\n"))
+        self.assertIn(b"Remote Node Collector exited with status 9", completed.stderr)
+        self.assertGreater(completed.stderr.count(b"x"), 100_000)
+        self.assertIn(f"{root}/nodes/node-a/probes/hostname/stdout", names)
+        self.assertEqual(outcome, "partial")
+
+    def test_corrupt_ssh_stdout_publishes_partial_without_a_node_contribution(
+        self,
+    ) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+            environment["FAKE_SSH_CORRUPT"] = "1"
+
+            completed = self.run_cli(
+                "collect", cwd=cwd, env=environment, timeout=20
+            )
+
+            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            with tarfile.open(bundles[0], "r:gz") as archive:
+                root = bundles[0].name.removesuffix(".tar.gz")
+                node_names = [
+                    member.name
+                    for member in archive.getmembers()
+                    if member.name.startswith(f"{root}/nodes/node-a")
+                ]
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(completed.stdout.endswith(b" (partial)\n"))
+        self.assertIn(b"Node Evidence Archive rejected", completed.stderr)
+        self.assertEqual(node_names, [])
+
+    def test_publication_failure_has_controlled_installed_cli_nondelivery(self) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            output = cwd / "output"
+            output.mkdir()
+            temporary_root = cwd / "temporary"
+            temporary_root.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+            environment["FAKE_REMOVE_OUTPUT_DIR"] = str(output)
+
+            completed = self.run_cli(
+                "collect",
+                "--output-dir",
+                str(output),
+                cwd=cwd,
+                env=environment,
+                timeout=20,
+            )
+
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, b"")
+        self.assertIn(b"cannot publish Incident Bundle", completed.stderr)
+        self.assertTrue(
+            completed.stderr.endswith(b"FAIL: no Incident Bundle delivered\n")
+        )
+        self.assertEqual(workspaces, [])
 
     def test_overrides_convert_hosts_and_force_only_controls_requested_output(self) -> None:
         with TemporaryDirectory() as directory:
@@ -257,9 +457,16 @@ import sys
 
 record = Path(os.environ["FAKE_SSH_RECORD"])
 record.mkdir()
+(record / "count").write_text("1\\n", encoding="ascii")
 (record / "argv.json").write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
 source = sys.stdin.buffer.read()
 (record / "stdin.py").write_bytes(source)
+remove_output = os.environ.get("FAKE_REMOVE_OUTPUT_DIR")
+if remove_output:
+    Path(remove_output).rmdir()
+if os.environ.get("FAKE_SSH_CORRUPT"):
+    sys.stdout.buffer.write(b"not-an-archive")
+    raise SystemExit(0)
 remote_start = sys.argv.index("python3") + 1
 completed = subprocess.run(
     [sys.executable, *sys.argv[remote_start:]],
@@ -269,8 +476,12 @@ completed = subprocess.run(
     check=False,
 )
 sys.stdout.buffer.write(completed.stdout)
+if os.environ.get("FAKE_SSH_LARGE_DIAGNOSTIC"):
+    os.write(2, b"x" * 200000 + b"\\n")
+elif os.environ.get("FAKE_SSH_DIAGNOSTIC"):
+    os.write(2, b"remote\\x00\\xff\\n")
 sys.stderr.buffer.write(completed.stderr)
-raise SystemExit(completed.returncode)
+raise SystemExit(int(os.environ.get("FAKE_SSH_EXIT", completed.returncode)))
 """,
             encoding="utf-8",
         )

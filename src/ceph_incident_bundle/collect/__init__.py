@@ -148,7 +148,15 @@ def _validate_startup(
             "m, h, d, or w"
         )
     else:
-        since_seconds = int(match.group(1)) * _SECONDS_PER_UNIT[match.group(2)]
+        try:
+            since_seconds = int(match.group(1)) * _SECONDS_PER_UNIT[match.group(2)]
+        except ValueError:
+            # CPython protects decimal conversion from extremely long inputs.
+            # That interpreter limit is still a normal CLI validation failure.
+            problems.append(
+                f"invalid evidence window '{since}'; expected a positive integer "
+                "plus m, h, d, or w"
+            )
 
     output: Path | None = None
     try:

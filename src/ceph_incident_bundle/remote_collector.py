@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -23,42 +24,51 @@ def _utc_now() -> str:
 def _run_hostname(capture: Path, timeout_seconds: int) -> bool:
     capture.mkdir(parents=True)
     started_at = _utc_now()
-    stdout = b""
-    stderr = b""
     outcome = "exited"
     exit_code = None
     error = None
 
-    try:
-        process = subprocess.Popen(
-            ["hostname"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
+    with (capture / "stdout").open("xb") as stdout_file, (
+        capture / "stderr"
+    ).open("xb") as stderr_file:
         try:
-            timeout = timeout_seconds or None
-            stdout, stderr = process.communicate(timeout=timeout)
-            exit_code = process.returncode
-        except subprocess.TimeoutExpired:
-            outcome = "timed_out"
-            os.killpg(process.pid, signal.SIGTERM)
-            stdout, stderr = process.communicate()
+            process = subprocess.Popen(
+                ["hostname"],
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+            )
+        except OSError as process_error:
+            outcome = "failed_to_start"
             error = {
-                "kind": "timeout",
-                "message": f"hostname exceeded {timeout_seconds} seconds",
+                "kind": type(process_error).__name__,
+                "message": str(process_error),
             }
-    except OSError as process_error:
-        outcome = "failed_to_start"
-        error = {
-            "kind": type(process_error).__name__,
-            "message": str(process_error),
-        }
+        else:
+            try:
+                timeout = timeout_seconds or None
+                exit_code = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                outcome = "timed_out"
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait()
+                error = {
+                    "kind": "timeout",
+                    "message": f"hostname exceeded {timeout_seconds} seconds",
+                }
+            except (OverflowError, ValueError) as wait_error:
+                exit_code = process.poll()
+                if exit_code is None:
+                    outcome = "timed_out"
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait()
+                    error = {
+                        "kind": "timeout",
+                        "message": f"cannot apply hostname timeout: {wait_error}",
+                    }
 
     finished_at = _utc_now()
-    (capture / "stdout").write_bytes(stdout)
-    (capture / "stderr").write_bytes(stderr)
     result = {
         "argv": ["hostname"],
         "started_at": started_at,
@@ -89,7 +99,7 @@ def _stream_archive(evidence_root: Path) -> None:
 
 
 def _parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--since-seconds", type=_canonical_seconds, required=True)
     parser.add_argument(
         "--probe-timeout-seconds", type=_canonical_seconds, required=True
@@ -105,6 +115,8 @@ def _parse_arguments() -> argparse.Namespace:
     arguments = parser.parse_args()
     if arguments.since_seconds <= 0:
         parser.error("since seconds must be positive")
+    if not _fits_process_wait_timeout(arguments.probe_timeout_seconds):
+        parser.error("probe timeout exceeds the supported range")
     return arguments
 
 
@@ -114,6 +126,13 @@ def _canonical_seconds(value: str) -> int:
             "control values must use canonical ASCII decimal seconds"
         )
     return int(value)
+
+
+def _fits_process_wait_timeout(seconds: int) -> bool:
+    try:
+        return math.isfinite(float(seconds))
+    except OverflowError:
+        return False
 
 
 def main() -> int:

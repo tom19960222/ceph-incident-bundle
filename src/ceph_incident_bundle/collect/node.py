@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import io
+import codecs
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
-import threading
 
 from .. import remote_collector
 from ..inventory import TargetNode
@@ -38,9 +37,9 @@ def collect_node(
         ]
 
     archive_path = staging_directory / "node-evidence.tar.gz"
+    diagnostics_path = staging_directory / "ssh-stderr"
     extraction_directory = staging_directory / "extracted"
     source_path = Path(remote_collector.__file__)
-    source = source_path.read_bytes()
     argv = _ssh_argv(
         node,
         ssh_user=ssh_user,
@@ -50,96 +49,45 @@ def collect_node(
         ceph_allowed=ceph_allowed,
     )
 
+    start_error: OSError | None = None
     try:
-        process = subprocess.Popen(
-            argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            start_new_session=True,
-        )
-    except OSError as error:
-        return [f"Target Node {node.inventory_name}: cannot start SSH: {error}"]
-
-    assert process.stdin is not None
-    assert process.stdout is not None
-    assert process.stderr is not None
-    received_stderr = io.BytesIO()
-    stream_errors: list[str] = []
-
-    def send_source() -> None:
-        try:
-            process.stdin.write(source)
-            process.stdin.close()
-        except (BrokenPipeError, OSError) as error:
-            stream_errors.append(f"cannot send Remote Node Collector: {error}")
-
-    def receive_archive() -> None:
-        archive_file = None
-        try:
-            archive_file = archive_path.open("xb")
-        except OSError as error:
-            stream_errors.append(f"cannot receive Node Evidence Archive: {error}")
-        while True:
+        # Regular files let OpenSSH read and write without pipe backpressure.  The
+        # lexical scope also proves stdin, the complete stdout archive, and stderr
+        # diagnostics all closed successfully before archive admission begins.
+        with source_path.open("rb") as source_file, archive_path.open(
+            "xb"
+        ) as archive_file, diagnostics_path.open("xb") as diagnostics_file:
             try:
-                chunk = process.stdout.read(1024 * 1024)
+                process = subprocess.Popen(
+                    argv,
+                    stdin=source_file,
+                    stdout=archive_file,
+                    stderr=diagnostics_file,
+                    shell=False,
+                    start_new_session=True,
+                )
             except OSError as error:
-                stream_errors.append(f"cannot receive Node Evidence Archive: {error}")
-                break
-            if not chunk:
-                break
-            if archive_file is not None:
+                start_error = error
+            else:
                 try:
-                    archive_file.write(chunk)
-                except OSError as error:
-                    stream_errors.append(
-                        f"cannot receive Node Evidence Archive: {error}"
-                    )
-                    try:
-                        archive_file.close()
-                    except OSError:
-                        pass
-                    archive_file = None
-        if archive_file is not None:
-            try:
-                archive_file.close()
-            except OSError as error:
-                stream_errors.append(f"cannot finish Node Evidence Archive: {error}")
+                    return_code = process.wait()
+                except KeyboardInterrupt:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait()
+                    raise
+    except OSError as error:
+        return [
+            f"Target Node {node.inventory_name}: "
+            f"cannot complete one-SSH stream files: {error}"
+        ]
 
-    def receive_diagnostics() -> None:
-        try:
-            while True:
-                chunk = process.stderr.read(64 * 1024)
-                if not chunk:
-                    break
-                received_stderr.write(chunk)
-        except OSError as error:
-            stream_errors.append(f"cannot receive SSH diagnostics: {error}")
+    if start_error is not None:
+        return [
+            f"Target Node {node.inventory_name}: cannot start SSH: {start_error}"
+        ]
 
-    threads = [
-        threading.Thread(target=send_source),
-        threading.Thread(target=receive_archive),
-        threading.Thread(target=receive_diagnostics),
-    ]
-    for thread in threads:
-        thread.start()
-    try:
-        return_code = process.wait()
-    except KeyboardInterrupt:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait()
-        raise
-    finally:
-        for thread in threads:
-            thread.join()
-        process.stdout.close()
-        process.stderr.close()
-
-    _print_diagnostics(node.inventory_name, received_stderr.getvalue())
-    problems = [
-        f"Target Node {node.inventory_name}: {problem}" for problem in stream_errors
-    ]
+    _print_diagnostics(node.inventory_name, diagnostics_path)
+    problems: list[str] = []
 
     try:
         admit_archive(
@@ -191,29 +139,52 @@ def _ssh_argv(
     return argv
 
 
-def _print_diagnostics(inventory_name: str, received: bytes) -> None:
-    if not received:
+def _print_diagnostics(inventory_name: str, diagnostics_path: Path) -> None:
+    try:
+        diagnostics = diagnostics_path.open("rb")
+    except FileNotFoundError:
         return
-    lines = received.split(b"\n")
-    if lines[-1] == b"":
-        lines.pop()
-    for line in lines:
-        print(f"[{inventory_name}] {_terminal_safe(line)}", file=sys.stderr)
+    prefix = f"[{inventory_name}] "
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="backslashreplace")
+    at_line_start = True
+
+    def render(text: str) -> None:
+        nonlocal at_line_start
+        position = 0
+        while position < len(text):
+            if at_line_start:
+                sys.stderr.write(prefix)
+                at_line_start = False
+            newline = text.find("\n", position)
+            end = len(text) if newline < 0 else newline
+            _write_terminal_safe(text[position:end])
+            if newline < 0:
+                return
+            sys.stderr.write("\n")
+            at_line_start = True
+            position = newline + 1
+
+    with diagnostics:
+        while True:
+            chunk = diagnostics.read(64 * 1024)
+            if not chunk:
+                break
+            render(decoder.decode(chunk))
+        render(decoder.decode(b"", final=True))
+    if not at_line_start:
+        sys.stderr.write("\n")
 
 
-def _terminal_safe(value: bytes) -> str:
-    """Decode and render untrusted SSH stderr without terminal controls.
-
-    This byte-oriented rule stays with SSH diagnostic rendering.  The top-level flow
-    separately renders local exception strings at its own output boundary.
-    """
-    decoded = value.decode("utf-8", errors="backslashreplace")
-    escaped: list[str] = []
-    for character in decoded:
+def _write_terminal_safe(value: str) -> None:
+    """Write one decoded diagnostic segment without terminal controls."""
+    run_start = 0
+    for index, character in enumerate(value):
         if character.isprintable():
-            escaped.append(character)
-        elif ord(character) <= 0xFF:
-            escaped.append(f"\\x{ord(character):02x}")
+            continue
+        sys.stderr.write(value[run_start:index])
+        if ord(character) <= 0xFF:
+            sys.stderr.write(f"\\x{ord(character):02x}")
         else:
-            escaped.append(character.encode("unicode_escape").decode("ascii"))
-    return "".join(escaped)
+            sys.stderr.write(character.encode("unicode_escape").decode("ascii"))
+        run_start = index + 1
+    sys.stderr.write(value[run_start:])

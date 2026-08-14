@@ -1,4 +1,5 @@
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 import io
 import json
 from pathlib import Path
@@ -8,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from ceph_incident_bundle.collect import run
+from ceph_incident_bundle.collect.bundle import BundlePublicationError
 
 
 INVENTORY = b"""\
@@ -82,6 +84,108 @@ class TopLevelCollectionTests(unittest.TestCase):
             stderr.getvalue().endswith("FAIL: no Incident Bundle delivered\n")
         )
 
+    def test_enormous_since_is_controlled_before_workspace_creation(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("ceph_incident_bundle.collect.tempfile.mkdtemp") as make_workspace,
+                patch("ceph_incident_bundle.collect.collect_node") as node_operation,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, f"{'9' * 5000}h", root)
+
+        self.assertNotEqual(status, 0)
+        make_workspace.assert_not_called()
+        node_operation.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("invalid evidence window", stderr.getvalue())
+        self.assertTrue(
+            stderr.getvalue().endswith("FAIL: no Incident Bundle delivered\n")
+        )
+
+    def test_exact_timestamp_collision_preserves_destination_before_collection(
+        self,
+    ) -> None:
+        started_at = datetime(2026, 8, 15, 1, 2, 3, tzinfo=timezone.utc)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            final_path = root / "ceph-incident-bundle-20260815T010203Z.tar.gz"
+            final_path.write_bytes(b"existing bundle bytes")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("ceph_incident_bundle.collect.datetime") as clock,
+                patch(
+                    "ceph_incident_bundle.collect.tempfile.mkdtemp"
+                ) as make_workspace,
+                patch("ceph_incident_bundle.collect.collect_node") as node_operation,
+                patch("ceph_incident_bundle.collect.publish_bundle") as publication,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                clock.now.return_value = started_at
+                status = run(inventory, "24h", root)
+
+            final_bytes = final_path.read_bytes()
+            candidates = list(root.glob(".*.candidate.*"))
+
+        self.assertNotEqual(status, 0)
+        self.assertEqual(final_bytes, b"existing bundle bytes")
+        make_workspace.assert_not_called()
+        node_operation.assert_not_called()
+        publication.assert_not_called()
+        self.assertEqual(candidates, [])
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("final destination already exists", stderr.getvalue())
+        self.assertTrue(
+            stderr.getvalue().endswith("FAIL: no Incident Bundle delivered\n")
+        )
+
+    def test_publication_failure_is_controlled_after_workspace_handoff(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            workspace = root / "owned-workspace"
+            workspace.mkdir()
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.tempfile.mkdtemp",
+                    return_value=str(workspace),
+                ),
+                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
+                patch(
+                    "ceph_incident_bundle.collect.publish_bundle",
+                    side_effect=BundlePublicationError(
+                        "injected archive write failure"
+                    ),
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            workspace_still_exists = workspace.exists()
+
+        self.assertNotEqual(status, 0)
+        self.assertTrue(workspace_still_exists)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "cannot publish Incident Bundle: injected archive write failure",
+            stderr.getvalue(),
+        )
+        self.assertTrue(
+            stderr.getvalue().endswith("FAIL: no Incident Bundle delivered\n")
+        )
 
 if __name__ == "__main__":
     unittest.main()
