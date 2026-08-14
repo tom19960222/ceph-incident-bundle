@@ -60,7 +60,7 @@ def draft_inventory(hosts_path: Path) -> tuple[bytes, tuple[str, ...]]:
     hostnames: list[str] = []
     seen_hostnames: set[str] = set()
 
-    path = Path(hosts_path)
+    path = Path(hosts_path).expanduser()
     try:
         hosts_text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:

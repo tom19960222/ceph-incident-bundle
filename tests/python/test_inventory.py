@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -12,6 +13,20 @@ from ceph_incident_bundle.inventory import (
 
 
 class DraftInventoryTests(unittest.TestCase):
+    def test_hosts_path_expands_literal_tilde_with_controlled_home(self) -> None:
+        with TemporaryDirectory() as directory:
+            controlled_home = Path(directory)
+            (controlled_home / "hosts").write_text(
+                "192.0.2.10 mon01.example.test\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"HOME": directory}):
+                generated, problems = draft_inventory(Path("~/hosts"))
+
+        self.assertIn(b"mon01 = mon01.example.test\n", generated)
+        self.assertEqual(problems, ())
+
     def test_hosts_are_converted_in_order_with_all_generated_defaults(self) -> None:
         hosts = b"""\
 # ignored
