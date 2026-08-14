@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import gzip
+from collections.abc import Iterator
 import os
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -10,6 +10,7 @@ import shutil
 import stat
 import tarfile
 import unicodedata
+import zlib
 
 
 class ArchiveRejected(Exception):
@@ -40,8 +41,9 @@ def admit_archive(
     try:
         with tarfile.open(archive_path, "r:gz") as archive:
             members = archive.getmembers()
-            _validate_trailing_tar_padding(archive_path, archive.offset)
             _validate_members(archive, members, ceph_allowed=ceph_allowed)
+            first_eof_offset = _first_tar_eof_offset(members)
+            _validate_trailing_tar_padding(archive_path, first_eof_offset)
             _extract_members(archive, members, extraction_directory)
     except ArchiveRejected:
         raise
@@ -111,42 +113,95 @@ def _path_exists(path: Path) -> bool:
 
 
 def _validate_complete_tar_stream(archive_path: Path) -> None:
-    """Require a complete gzip stream and the two terminal tar zero blocks."""
+    """Require exactly one complete gzip member and terminal tar zero blocks."""
     total = 0
     tail = b""
-    try:
-        with gzip.open(archive_path, "rb") as uncompressed:
-            while True:
-                chunk = uncompressed.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                tail = (tail + chunk)[-1024:]
-    except (OSError, EOFError, gzip.BadGzipFile) as error:
-        raise ArchiveRejected(f"invalid compressed archive: {error}") from error
+    for chunk in _one_gzip_member_chunks(archive_path):
+        total += len(chunk)
+        tail = (tail + chunk)[-1024:]
     if total < 1024 or total % 512 != 0 or tail != b"\0" * 1024:
         raise ArchiveRejected("Node Evidence Archive is truncated")
+
+
+def _one_gzip_member_chunks(archive_path: Path) -> Iterator[bytes]:
+    """Yield one gzip member while rejecting truncation and all trailing bytes.
+
+    ``zlib.decompressobj`` documents ``eof`` as the end-of-stream marker and
+    ``unused_data`` as bytes following that marker.  Unlike ``gzip.open``, this
+    lets admission reject a second gzip member even when it expands to no bytes
+    or only zero padding.
+    """
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        with archive_path.open("rb") as compressed:
+            while True:
+                raw_chunk = compressed.read(1024 * 1024)
+                if not raw_chunk:
+                    break
+                if decompressor.eof:
+                    raise ArchiveRejected(
+                        "Node Evidence Archive has bytes after its gzip member"
+                    )
+                uncompressed = decompressor.decompress(raw_chunk)
+                if decompressor.unused_data or decompressor.unconsumed_tail:
+                    raise ArchiveRejected(
+                        "Node Evidence Archive has bytes after its gzip member"
+                    )
+                if uncompressed:
+                    yield uncompressed
+            if not decompressor.eof:
+                raise ArchiveRejected(
+                    "Node Evidence Archive has an incomplete gzip member"
+                )
+            final_bytes = decompressor.flush()
+            if final_bytes:
+                yield final_bytes
+    except ArchiveRejected:
+        raise
+    except (OSError, zlib.error) as error:
+        raise ArchiveRejected(f"invalid compressed archive: {error}") from error
+
+
+def _first_tar_eof_offset(members: list[tarfile.TarInfo]) -> int:
+    """Derive the first tar EOF position from documented member attributes.
+
+    ``TarInfo.offset_data`` is the start of a member's data and ``size`` is its
+    byte count.  Admission has already limited members to ordinary directories
+    and nonsparse regular files, so rounding each payload to a 512-byte tar block
+    gives the next possible header position.  The greatest such position is where
+    the first required pair of tar EOF blocks must start.
+    """
+    member_end = 0
+    for member in members:
+        if member.offset_data < 512 or member.offset_data % 512 != 0:
+            raise ArchiveRejected(
+                f"invalid archive member data offset: {member.name}"
+            )
+        payload_size = member.size if member.isreg() else 0
+        payload_blocks, remainder = divmod(payload_size, 512)
+        if remainder:
+            payload_blocks += 1
+        candidate_end = member.offset_data + payload_blocks * 512
+        member_end = max(member_end, candidate_end)
+    return member_end
 
 
 def _validate_trailing_tar_padding(archive_path: Path, member_end: int) -> None:
     """Reject a second tar stream or any other data after the first tar EOF."""
     padding_bytes = 0
-    try:
-        with gzip.open(archive_path, "rb") as uncompressed:
-            uncompressed.seek(member_end)
-            while True:
-                chunk = uncompressed.read(1024 * 1024)
-                if not chunk:
-                    break
-                padding_bytes += len(chunk)
-                if chunk.strip(b"\0"):
-                    raise ArchiveRejected(
-                        "Node Evidence Archive has data after its first tar stream"
-                    )
-    except ArchiveRejected:
-        raise
-    except (OSError, EOFError, gzip.BadGzipFile) as error:
-        raise ArchiveRejected(f"invalid compressed archive: {error}") from error
+    uncompressed_offset = 0
+    for chunk in _one_gzip_member_chunks(archive_path):
+        next_offset = uncompressed_offset + len(chunk)
+        if next_offset > member_end:
+            padding = chunk[max(0, member_end - uncompressed_offset) :]
+            padding_bytes += len(padding)
+            if padding.strip(b"\0"):
+                raise ArchiveRejected(
+                    "Node Evidence Archive has data after its first tar stream"
+                )
+        uncompressed_offset = next_offset
+    if uncompressed_offset < member_end:
+        raise ArchiveRejected("Node Evidence Archive member data is incomplete")
     if padding_bytes < 1024:
         raise ArchiveRejected("Node Evidence Archive is missing its tar EOF blocks")
 
@@ -166,7 +221,7 @@ def _validate_members(
             raise ArchiveRejected(f"unknown archive root: {components[0]}")
         if components[0] == "ceph" and not ceph_allowed:
             raise ArchiveRejected("ceph evidence is not allowed for this Target Node")
-        if not member.isdir() and not member.isreg():
+        if (not member.isdir() and not member.isreg()) or member.issparse():
             raise ArchiveRejected(f"unsupported archive member type: {member.name}")
         if components in by_path:
             raise ArchiveRejected(f"duplicate archive member: {member.name}")

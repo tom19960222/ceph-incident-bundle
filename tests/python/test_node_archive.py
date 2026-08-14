@@ -1,3 +1,4 @@
+import gzip
 import io
 from pathlib import Path
 import tarfile
@@ -10,8 +11,13 @@ from ceph_incident_bundle.collect.node_archive import (
 )
 
 
-def write_archive(path: Path, members: list[tuple[str, bytes | None]]) -> None:
-    with tarfile.open(path, "w:gz") as archive:
+def write_archive(
+    path: Path,
+    members: list[tuple[str, bytes | None]],
+    *,
+    mode: str = "w:gz",
+) -> None:
+    with tarfile.open(path, mode) as archive:
         for name, contents in members:
             member = tarfile.TarInfo(name)
             if contents is None:
@@ -107,6 +113,7 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
             tarfile.CHRTYPE,
             tarfile.BLKTYPE,
             tarfile.FIFOTYPE,
+            tarfile.GNUTYPE_SPARSE,
             b"Z",
         )
         for member_type in special_types:
@@ -135,6 +142,154 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
 
                 self.assertFalse(extraction.exists())
                 self.assertFalse(contribution.exists())
+
+    def test_zero_payload_blocks_are_not_mistaken_for_tar_eof(self) -> None:
+        members = [
+            *BASE_MEMBERS,
+            ("node/files/zero-blocks", b"\0" * 1024),
+            ("node/files/after-zero-blocks", b"still evidence\n"),
+        ]
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            staging = workspace / "private" / "node-a"
+            staging.mkdir(parents=True)
+            archive = staging / "received.tar.gz"
+            extraction = staging / "extracted"
+            contribution = workspace / "admitted" / "node-a"
+            contribution.parent.mkdir()
+            write_archive(archive, members)
+
+            admit_archive(archive, extraction, contribution, ceph_allowed=False)
+
+            self.assertEqual(
+                (contribution / "node/files/zero-blocks").read_bytes(),
+                b"\0" * 1024,
+            )
+            self.assertEqual(
+                (contribution / "node/files/after-zero-blocks").read_bytes(),
+                b"still evidence\n",
+            )
+
+    def test_pax_and_payload_block_boundaries_find_the_first_tar_eof(self) -> None:
+        long_component = "e" * 120
+        members = [
+            *BASE_MEMBERS,
+            (f"node/files/{long_component}", b"evidence\n"),
+            ("node/files/one-byte", b"x"),
+            ("node/files/513-bytes", b"y" * 513),
+        ]
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            staging = workspace / "private" / "node-a"
+            staging.mkdir(parents=True)
+            archive = staging / "received.tar.gz"
+            extraction = staging / "extracted"
+            contribution = workspace / "admitted" / "node-a"
+            contribution.parent.mkdir()
+            write_archive(archive, members)
+
+            admit_archive(archive, extraction, contribution, ceph_allowed=False)
+
+            self.assertEqual(
+                (contribution / "node/files" / long_component).read_bytes(),
+                b"evidence\n",
+            )
+            self.assertEqual(
+                (contribution / "node/files/one-byte").read_bytes(), b"x"
+            )
+            self.assertEqual(
+                (contribution / "node/files/513-bytes").read_bytes(), b"y" * 513
+            )
+
+    def test_exact_tar_eof_and_extra_zero_padding_are_accepted(self) -> None:
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            uncompressed = workspace / "ordinary.tar"
+            write_archive(uncompressed, BASE_MEMBERS, mode="w")
+            ordinary_bytes = uncompressed.read_bytes()
+            first_eof_end = len(BASE_MEMBERS) * 512 + 1024
+            for label, tar_bytes in (
+                ("exact-eof", ordinary_bytes[:first_eof_end]),
+                (
+                    "extra-zero-padding",
+                    ordinary_bytes[:first_eof_end] + b"\0" * 512,
+                ),
+            ):
+                with self.subTest(label=label):
+                    staging = workspace / label
+                    staging.mkdir()
+                    archive = staging / "received.tar.gz"
+                    archive.write_bytes(gzip.compress(tar_bytes))
+                    extraction = staging / "extracted"
+                    contribution = workspace / "admitted" / label
+                    contribution.parent.mkdir(exist_ok=True)
+
+                    admit_archive(
+                        archive, extraction, contribution, ceph_allowed=False
+                    )
+
+                    self.assertTrue((contribution / "node/probes").is_dir())
+                    self.assertTrue((contribution / "node/files").is_dir())
+
+    def test_a_second_gzip_member_or_raw_trailing_bytes_are_rejected(self) -> None:
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            first = workspace / "first.tar.gz"
+            write_archive(first, BASE_MEMBERS)
+            for label, trailing_bytes in (
+                ("empty-member", gzip.compress(b"")),
+                ("zero-only-member", gzip.compress(b"\0" * 1024)),
+                ("raw-zero-tail", b"\0"),
+            ):
+                with self.subTest(label=label):
+                    staging = workspace / label
+                    staging.mkdir()
+                    archive = staging / "received.tar.gz"
+                    archive.write_bytes(
+                        first.read_bytes() + trailing_bytes
+                    )
+                    extraction = staging / "extracted"
+                    contribution = workspace / "admitted" / label
+                    contribution.parent.mkdir(exist_ok=True)
+
+                    with self.assertRaises(ArchiveRejected):
+                        admit_archive(
+                            archive, extraction, contribution, ceph_allowed=False
+                        )
+
+                    self.assertFalse(extraction.exists())
+                    self.assertFalse(contribution.exists())
+
+    def test_one_gzip_member_cannot_contain_a_second_tar_or_nonzero_tail(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            first = workspace / "first.tar"
+            second = workspace / "second.tar"
+            write_archive(first, BASE_MEMBERS, mode="w")
+            write_archive(second, BASE_MEMBERS, mode="w")
+            first_bytes = first.read_bytes()
+            for label, uncompressed in (
+                ("second-tar", first_bytes + second.read_bytes()),
+                ("nonzero-tail", first_bytes + b"not padding"),
+            ):
+                with self.subTest(label=label):
+                    staging = workspace / label
+                    staging.mkdir()
+                    archive = staging / "received.tar.gz"
+                    archive.write_bytes(gzip.compress(uncompressed))
+                    extraction = staging / "extracted"
+                    contribution = workspace / "admitted" / label
+                    contribution.parent.mkdir(exist_ok=True)
+
+                    with self.assertRaises(ArchiveRejected):
+                        admit_archive(
+                            archive, extraction, contribution, ceph_allowed=False
+                        )
+
+                    self.assertFalse(extraction.exists())
+                    self.assertFalse(contribution.exists())
 
     def test_required_shape_and_ceph_authorization_are_fail_closed(self) -> None:
         cases = (

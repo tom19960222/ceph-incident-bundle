@@ -21,6 +21,9 @@ from .node import collect_node
 
 
 _EVIDENCE_WINDOW = re.compile(r"([1-9][0-9]*)([mhdw])\Z", re.ASCII)
+# ``collect --since`` is a separate CLI boundary with a deliberately narrower
+# grammar and its own diagnostic: unlike Inventory durations it rejects seconds
+# and zero, then preserves the accepted spelling in final metadata.
 _SECONDS_PER_UNIT = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 

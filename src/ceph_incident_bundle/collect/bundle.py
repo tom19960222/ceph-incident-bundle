@@ -63,6 +63,9 @@ def publish_bundle(
                     else:
                         assert source is not None
                         _add_regular_file(archive, archive_name, source, started_at)
+                # Ordering is load-bearing: every workspace-backed member must be
+                # closed before cleanup.  Cleanup must then finish before the final
+                # metadata member because its residue decides complete vs partial.
                 cleanup_problem = _cleanup_workspace(workspace)
                 metadata = {
                     "collector_version": collector_version,
