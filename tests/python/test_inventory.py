@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import pwd
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -13,6 +14,30 @@ from ceph_incident_bundle.inventory import (
 
 
 class DraftInventoryTests(unittest.TestCase):
+    def test_unresolvable_user_hosts_path_uses_inventory_rejection(self) -> None:
+        hosts_path = None
+        for username in (
+            "cib_no_user_6f9e2d7c",
+            "cib_no_user_14a8c3b5",
+            "cib_no_user_f27d91e4",
+        ):
+            try:
+                pwd.getpwnam(username)
+            except KeyError:
+                candidate = Path(f"~{username}/hosts")
+                try:
+                    candidate.expanduser()
+                except RuntimeError:
+                    hosts_path = candidate
+                    break
+        if hosts_path is None:
+            self.fail("deterministic missing-user candidates unexpectedly exist")
+
+        with self.assertRaises(InventoryRejected) as caught:
+            draft_inventory(hosts_path)
+
+        self.assertIn(f"cannot read hosts file {hosts_path}", str(caught.exception))
+
     def test_maximum_length_hostname_with_root_dot_is_preserved(self) -> None:
         hostname = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 61)) + "."
         with TemporaryDirectory() as directory:
@@ -184,6 +209,33 @@ mon01 = mon01.second.example
 
 
 class LoadInventoryTests(unittest.TestCase):
+    def test_unresolvable_user_inventory_path_uses_inventory_rejection(self) -> None:
+        inventory_path = None
+        for username in (
+            "cib_no_user_6f9e2d7c",
+            "cib_no_user_14a8c3b5",
+            "cib_no_user_f27d91e4",
+        ):
+            try:
+                pwd.getpwnam(username)
+            except KeyError:
+                candidate = Path(f"~{username}/inventory.ini")
+                try:
+                    candidate.expanduser()
+                except RuntimeError:
+                    inventory_path = candidate
+                    break
+        if inventory_path is None:
+            self.fail("deterministic missing-user candidates unexpectedly exist")
+
+        with self.assertRaises(InventoryRejected) as caught:
+            load_inventory(inventory_path)
+
+        self.assertIn(
+            f"cannot read Inventory {inventory_path}",
+            str(caught.exception),
+        )
+
     def test_inventory_path_expands_literal_tilde_with_controlled_home(self) -> None:
         inventory_bytes = b"""\
 [common]

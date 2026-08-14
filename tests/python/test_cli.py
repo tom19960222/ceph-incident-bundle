@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import pwd
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -102,6 +103,64 @@ request_timeout = 5m
         self.assertEqual(completed.returncode, 1 if expected_problems else 0)
         self.assertEqual(completed.stdout, b"")
         self.assertEqual(completed.stderr, expected_stderr)
+
+    def test_unresolvable_user_paths_fail_without_traceback_or_residue(self) -> None:
+        missing_username = None
+        for username in (
+            "cib_no_user_6f9e2d7c",
+            "cib_no_user_14a8c3b5",
+            "cib_no_user_f27d91e4",
+        ):
+            try:
+                pwd.getpwnam(username)
+            except KeyError:
+                candidate = Path(f"~{username}/probe")
+                try:
+                    candidate.expanduser()
+                except RuntimeError:
+                    missing_username = username
+                    break
+        if missing_username is None:
+            self.fail("deterministic missing-user candidates unexpectedly exist")
+
+        unresolved_hosts = f"~{missing_username}/hosts"
+        unresolved_output = f"~{missing_username}/inventory.ini"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            hosts = cwd / "source-hosts"
+            hosts.write_text("192.0.2.10 node.example.test\n", encoding="utf-8")
+
+            hosts_failure = self.run_cli(
+                "generate-inventory",
+                "--hosts-file",
+                unresolved_hosts,
+                cwd=cwd,
+            )
+            residue_after_hosts_failure = tuple(item.name for item in cwd.iterdir())
+
+            output_failure = self.run_cli(
+                "generate-inventory",
+                "--hosts-file",
+                str(hosts),
+                "--output",
+                unresolved_output,
+                cwd=cwd,
+            )
+            residue_after_output_failure = tuple(item.name for item in cwd.iterdir())
+
+        for completed, path, boundary in (
+            (hosts_failure, unresolved_hosts, b"cannot read hosts file"),
+            (output_failure, unresolved_output, b"cannot resolve Inventory output"),
+        ):
+            with self.subTest(path=path):
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(completed.stdout, b"")
+                self.assertIn(boundary, completed.stderr)
+                self.assertIn(path.encode("utf-8"), completed.stderr)
+                self.assertNotIn(b"Traceback", completed.stderr)
+                self.assertEqual(completed.stderr.count(b"\n"), 1)
+        self.assertEqual(residue_after_hosts_failure, ("source-hosts",))
+        self.assertEqual(residue_after_output_failure, ("source-hosts",))
 
     def test_collect_without_implementation_has_controlled_nondelivery(self) -> None:
         with TemporaryDirectory() as directory:

@@ -10,7 +10,15 @@ from .inventory import InventoryRejected, draft_inventory
 
 def run(hosts_path: Path, output_path: Path, force: bool) -> int:
     """Draft and write one operator-reviewable Node Inventory."""
-    destination = Path(output_path).expanduser().resolve()
+    requested_destination = Path(output_path)
+    try:
+        destination = requested_destination.expanduser().resolve()
+    except (OSError, RuntimeError) as error:
+        print(
+            f"cannot resolve Inventory output {requested_destination}: {error}",
+            file=sys.stderr,
+        )
+        return 1
     output_exists_message = f"Inventory output already exists: {destination}"
     if not force and destination.exists():
         print(output_exists_message, file=sys.stderr)

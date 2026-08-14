@@ -60,10 +60,11 @@ def draft_inventory(hosts_path: Path) -> tuple[bytes, tuple[str, ...]]:
     hostnames: list[str] = []
     seen_hostnames: set[str] = set()
 
-    path = Path(hosts_path).expanduser()
+    path = Path(hosts_path)
     try:
-        hosts_text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
+        expanded_path = path.expanduser()
+        hosts_text = expanded_path.read_text(encoding="utf-8")
+    except (OSError, RuntimeError, UnicodeDecodeError) as error:
         raise InventoryRejected([f"cannot read hosts file {path}: {error}"]) from error
 
     for raw_line in hosts_text.splitlines():
@@ -156,10 +157,11 @@ def draft_inventory(hosts_path: Path) -> tuple[bytes, tuple[str, ...]]:
 
 def load_inventory(inventory_path: Path) -> Inventory:
     """Read and completely validate one Node Inventory."""
-    path = Path(inventory_path).expanduser()
+    path = Path(inventory_path)
     try:
-        snapshot = path.read_bytes()
-    except OSError as error:
+        expanded_path = path.expanduser()
+        snapshot = expanded_path.read_bytes()
+    except (OSError, RuntimeError) as error:
         raise InventoryRejected([f"cannot read Inventory {path}: {error}"]) from error
     try:
         text = snapshot.decode("utf-8")
