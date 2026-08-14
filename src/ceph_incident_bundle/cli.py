@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 from typing import Sequence
 
 from . import generate_inventory
@@ -33,6 +34,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.hosts_file, arguments.output, arguments.force
         )
 
-    from .collect import run as collect
+    try:
+        from .collect import run as collect
+    except ModuleNotFoundError as error:
+        if error.name != "ceph_incident_bundle.collect":
+            raise
+        print(
+            "collect is not available in this preparation-only build",
+            file=sys.stderr,
+        )
+        print("FAIL: no Incident Bundle delivered", file=sys.stderr)
+        return 1
 
     return collect(arguments.inventory, arguments.since, arguments.output_dir)

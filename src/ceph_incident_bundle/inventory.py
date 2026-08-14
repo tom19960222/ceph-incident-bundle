@@ -116,8 +116,8 @@ def draft_inventory(hosts_path: Path) -> tuple[bytes, tuple[str, ...]]:
                 )
     ceph_source = next(
         (
-            hostname.split(".", 1)[0]
-            for hostname in hostnames
+            name
+            for name, hostname in entries
             if any(marker in hostname.casefold() for marker in ("mon", "cp", "cm"))
         ),
         None,

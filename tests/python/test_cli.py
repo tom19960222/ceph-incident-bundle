@@ -10,7 +10,7 @@ COMMAND = os.environ.get("CEPH_INCIDENT_BUNDLE_COMMAND")
 
 
 @unittest.skipUnless(COMMAND, "installed CLI path not provided")
-class GenerateInventoryCliTests(unittest.TestCase):
+class InstalledCliTests(unittest.TestCase):
     def run_cli(
         self, *arguments: str, cwd: Path
     ) -> subprocess.CompletedProcess[bytes]:
@@ -28,17 +28,62 @@ class GenerateInventoryCliTests(unittest.TestCase):
         self.assertEqual(sys.implementation.name, "cpython")
         self.assertEqual(sys.version_info[:2], (3, 10))
 
-    def test_defaults_read_etc_hosts_and_write_inventory_in_current_directory(self) -> None:
+    def test_default_output_contains_exact_generated_defaults(self) -> None:
+        expected = b"""\
+[common]
+ssh_user = root
+probe_timeout = 30m
+ssh_connect_timeout = 15s
+
+[nodes]
+mon01 = mon01.example.test
+worker = worker.example.test
+
+[ceph]
+source = mon01
+
+[kubernetes]
+# context =
+consumer_namespace = rook-ceph-external
+operator_namespace = rook-ceph
+
+[prometheus]
+# url =
+metrics_filter_regex =
+query_step = 15s
+request_timeout = 5m
+"""
         with TemporaryDirectory() as directory:
             cwd = Path(directory)
+            hosts = cwd / "synthetic-hosts"
+            hosts.write_text(
+                "127.0.0.1 localhost\n"
+                "192.0.2.10 mon01.example.test alias\n"
+                "192.0.2.20 worker.example.test alias\n",
+                encoding="utf-8",
+            )
 
-            completed = self.run_cli("generate-inventory", cwd=cwd)
+            completed = self.run_cli(
+                "generate-inventory", "--hosts-file", str(hosts), cwd=cwd
+            )
 
             inventory = (cwd / "inventory.ini").read_bytes()
-        self.assertIn(completed.returncode, (0, 1))
+        self.assertEqual(completed.returncode, 0)
         self.assertEqual(completed.stdout, b"")
-        self.assertIn(b"[common]\nssh_user = root\n", inventory)
-        self.assertIn(b"[nodes]\n", inventory)
+        self.assertEqual(completed.stderr, b"")
+        self.assertEqual(inventory, expected)
+
+    def test_collect_without_implementation_has_controlled_nondelivery(self) -> None:
+        with TemporaryDirectory() as directory:
+            completed = self.run_cli("collect", cwd=Path(directory))
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, b"")
+        self.assertEqual(
+            completed.stderr,
+            b"collect is not available in this preparation-only build\n"
+            b"FAIL: no Incident Bundle delivered\n",
+        )
 
     def test_overrides_convert_hosts_and_force_only_controls_requested_output(self) -> None:
         with TemporaryDirectory() as directory:
