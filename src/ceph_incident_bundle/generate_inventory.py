@@ -20,9 +20,18 @@ def run(hosts_path: Path, output_path: Path, force: bool) -> int:
         )
         return 1
     output_exists_message = f"Inventory output already exists: {destination}"
-    if not force and destination.exists():
-        print(output_exists_message, file=sys.stderr)
-        return 1
+    if not force:
+        try:
+            output_exists = destination.exists()
+        except (OSError, RuntimeError) as error:
+            print(
+                f"cannot inspect Inventory output {destination}: {error}",
+                file=sys.stderr,
+            )
+            return 1
+        if output_exists:
+            print(output_exists_message, file=sys.stderr)
+            return 1
 
     try:
         generated, problems = draft_inventory(Path(hosts_path))

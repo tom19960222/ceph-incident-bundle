@@ -14,6 +14,21 @@ from ceph_incident_bundle.inventory import (
 
 
 class DraftInventoryTests(unittest.TestCase):
+    def test_zoned_ipv6_is_ignored_while_bare_ipv6_is_preserved(self) -> None:
+        hosts = b"""\
+fe80::1%eth0 zoned-v6.example.test
+2001:db8::10 bare-v6.example.test
+"""
+        with TemporaryDirectory() as directory:
+            hosts_path = Path(directory) / "hosts"
+            hosts_path.write_bytes(hosts)
+
+            generated, problems = draft_inventory(hosts_path)
+
+        self.assertNotIn(b"zoned-v6.example.test", generated)
+        self.assertIn(b"bare-v6 = bare-v6.example.test\n", generated)
+        self.assertEqual(problems, ())
+
     def test_unresolvable_user_hosts_path_uses_inventory_rejection(self) -> None:
         hosts_path = None
         for username in (
@@ -209,6 +224,22 @@ mon01 = mon01.second.example
 
 
 class LoadInventoryTests(unittest.TestCase):
+    def test_zoned_ipv6_ssh_address_is_rejected(self) -> None:
+        inventory_bytes = b"""\
+[common]
+ssh_user = root
+[nodes]
+node = fe80::1%eth0
+"""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertIn("invalid SSH Address 'fe80::1%eth0'", str(caught.exception))
+
     def test_unresolvable_user_inventory_path_uses_inventory_rejection(self) -> None:
         inventory_path = None
         for username in (

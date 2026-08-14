@@ -71,8 +71,11 @@ def draft_inventory(hosts_path: Path) -> tuple[bytes, tuple[str, ...]]:
         fields = raw_line.split("#", 1)[0].split()
         if len(fields) < 2:
             continue
+        address_text = fields[0]
+        if "%" in address_text:
+            continue
         try:
-            address = ipaddress.ip_address(fields[0])
+            address = ipaddress.ip_address(address_text)
         except ValueError:
             continue
         hostname = fields[1]
@@ -355,7 +358,12 @@ def _duration_seconds(
 
 
 def _is_ssh_address(value: str) -> bool:
-    if not value or "@" in value or any(character.isspace() for character in value):
+    if (
+        not value
+        or "@" in value
+        or "%" in value
+        or any(character.isspace() for character in value)
+    ):
         return False
     try:
         ipaddress.ip_address(value)
