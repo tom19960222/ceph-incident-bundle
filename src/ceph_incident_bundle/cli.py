@@ -34,6 +34,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.hosts_file, arguments.output, arguments.force
         )
 
+    # The collect implementation ships in #87. Until then, keep its required CLI
+    # surface but return a controlled nondelivery instead of an import traceback.
     try:
         from .collect import run as collect
     except ModuleNotFoundError as error:

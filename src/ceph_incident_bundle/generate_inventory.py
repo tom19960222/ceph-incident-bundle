@@ -11,8 +11,9 @@ from .inventory import InventoryRejected, draft_inventory
 def run(hosts_path: Path, output_path: Path, force: bool) -> int:
     """Draft and write one operator-reviewable Node Inventory."""
     destination = Path(output_path).expanduser().resolve()
+    output_exists_message = f"Inventory output already exists: {destination}"
     if not force and destination.exists():
-        print(f"Inventory output already exists: {destination}", file=sys.stderr)
+        print(output_exists_message, file=sys.stderr)
         return 1
 
     try:
@@ -27,7 +28,7 @@ def run(hosts_path: Path, output_path: Path, force: bool) -> int:
         with destination.open(mode) as output:
             output.write(generated)
     except FileExistsError:
-        print(f"Inventory output already exists: {destination}", file=sys.stderr)
+        print(output_exists_message, file=sys.stderr)
         return 1
     except OSError as error:
         print(f"cannot write Inventory {destination}: {error}", file=sys.stderr)
