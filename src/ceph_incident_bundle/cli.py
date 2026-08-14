@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import sys
 from typing import Sequence
 
 from . import generate_inventory
+from .collect import run as collect
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -33,19 +33,5 @@ def main(argv: Sequence[str] | None = None) -> int:
         return generate_inventory.run(
             arguments.hosts_file, arguments.output, arguments.force
         )
-
-    # The collect implementation ships in #87. Until then, keep its required CLI
-    # surface but return a controlled nondelivery instead of an import traceback.
-    try:
-        from .collect import run as collect
-    except ModuleNotFoundError as error:
-        if error.name != "ceph_incident_bundle.collect":
-            raise
-        print(
-            "collect is not available in this preparation-only build",
-            file=sys.stderr,
-        )
-        print("FAIL: no Incident Bundle delivered", file=sys.stderr)
-        return 1
 
     return collect(arguments.inventory, arguments.since, arguments.output_dir)
