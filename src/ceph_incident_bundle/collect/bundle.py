@@ -30,7 +30,20 @@ def publish_bundle(
     since: str,
     prior_partial: bool,
 ) -> str | None:
-    """Serialize admitted state, clean the workspace, and publish it."""
+    """Validate admitted state and publish one bundle without replacing a path.
+
+    ``workspace`` must contain its ownership marker plus this admitted layout::
+
+        admitted/inventory.ini
+        admitted/node-contributions/<inventory-name>/node/
+        admitted/node-contributions/<inventory-name>/ceph/  # optional
+        admitted/kubernetes/
+        admitted/prometheus/
+
+    The caller owns the workspace until this function is called.  At that handoff,
+    publication assumes responsibility for workspace cleanup and exact residue
+    reporting on every return or raised publication error.
+    """
     workspace = Path(workspace)
     final_path = Path(final_path)
     candidate: Path | None = None
@@ -265,6 +278,11 @@ def _require_safe_component(component: str) -> None:
 
 
 def _portable_component(component: str) -> str:
+    """Return the portable identity used only for final-tree collisions.
+
+    Archive admission repeats this small rule independently so each peer retains a
+    complete fail-closed validation boundary without importing the other.
+    """
     normalized = unicodedata.normalize("NFC", component)
     return unicodedata.normalize("NFC", normalized.casefold())
 
@@ -321,6 +339,11 @@ def _add_bytes(
 
 
 def _cleanup_workspace(workspace: Path) -> str | None:
+    """Clean the workspace after publication has accepted ownership.
+
+    The top-level flow deliberately keeps its pre-handoff cleanup local because it
+    still owns failures that happen before publication starts.
+    """
     if not workspace.exists():
         return None
     try:

@@ -172,6 +172,11 @@ def _nondelivery(problems: list[str], *, status: int) -> int:
 
 
 def _cleanup_owned_workspace(workspace: Path) -> str | None:
+    """Clean a workspace only while the top-level flow still owns it.
+
+    Publication deliberately proves ownership again after handoff because its cleanup
+    decisions and failure reporting belong to the publication capability.
+    """
     marker = workspace / OWNERSHIP_MARKER
     try:
         mode = marker.stat(follow_symlinks=False).st_mode
@@ -188,6 +193,11 @@ def _cleanup_owned_workspace(workspace: Path) -> str | None:
 
 
 def _terminal_safe(value: str) -> str:
+    """Render top-level exception text without terminal control characters.
+
+    SSH diagnostics perform their own byte decoding and node-prefixed rendering in
+    the node capability; the two output boundaries intentionally remain separate.
+    """
     escaped: list[str] = []
     for character in value:
         if character.isprintable():

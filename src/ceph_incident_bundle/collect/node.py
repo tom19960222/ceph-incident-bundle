@@ -202,6 +202,11 @@ def _print_diagnostics(inventory_name: str, received: bytes) -> None:
 
 
 def _terminal_safe(value: bytes) -> str:
+    """Decode and render untrusted SSH stderr without terminal controls.
+
+    This byte-oriented rule stays with SSH diagnostic rendering.  The top-level flow
+    separately renders local exception strings at its own output boundary.
+    """
     decoded = value.decode("utf-8", errors="backslashreplace")
     escaped: list[str] = []
     for character in decoded:

@@ -229,6 +229,11 @@ def _safe_components(name: str) -> tuple[str, ...]:
 
 
 def _portable_component(component: str) -> str:
+    """Return the portable identity used only for archive-admission collisions.
+
+    Final bundle validation repeats this small rule independently so the two safety
+    seams stay complete and neither peer capability depends on the other.
+    """
     normalized = unicodedata.normalize("NFC", component)
     return unicodedata.normalize("NFC", normalized.casefold())
 
