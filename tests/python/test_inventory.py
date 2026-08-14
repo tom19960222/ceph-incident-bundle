@@ -184,6 +184,26 @@ mon01 = mon01.second.example
 
 
 class LoadInventoryTests(unittest.TestCase):
+    def test_inventory_path_expands_literal_tilde_with_controlled_home(self) -> None:
+        inventory_bytes = b"""\
+[common]
+ssh_user = root
+[nodes]
+node = node.example.test
+"""
+        with TemporaryDirectory() as directory:
+            controlled_home = Path(directory)
+            (controlled_home / "inventory.ini").write_bytes(inventory_bytes)
+
+            with patch.dict(os.environ, {"HOME": directory}):
+                inventory = load_inventory(Path("~/inventory.ini"))
+
+        self.assertEqual(inventory.snapshot, inventory_bytes)
+        self.assertEqual(
+            inventory.nodes,
+            (TargetNode("node", "node.example.test"),),
+        )
+
     def test_maximum_length_hostname_with_root_dot_is_preserved(self) -> None:
         hostname = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 61)) + "."
         inventory_bytes = (
@@ -201,7 +221,7 @@ class LoadInventoryTests(unittest.TestCase):
         self.assertEqual(inventory.snapshot, inventory_bytes)
         self.assertEqual(inventory.nodes, (TargetNode("node", hostname),))
 
-    def test_hostname_longer_than_253_characters_without_root_dot_is_rejected(
+    def test_hostname_over_253_characters_after_removing_root_dot_is_rejected(
         self,
     ) -> None:
         hostname = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 62)) + "."

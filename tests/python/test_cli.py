@@ -5,6 +5,8 @@ import sys
 from tempfile import TemporaryDirectory
 import unittest
 
+from ceph_incident_bundle.inventory import draft_inventory
+
 
 COMMAND = os.environ.get("CEPH_INCIDENT_BUNDLE_COMMAND")
 
@@ -77,6 +79,29 @@ request_timeout = 5m
         self.assertEqual(completed.stdout, b"")
         self.assertEqual(completed.stderr, b"")
         self.assertEqual(inventory, expected)
+
+    def test_zero_options_use_etc_hosts_and_default_inventory_path(self) -> None:
+        system_hosts = Path("/etc/hosts")
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            hosts_snapshot = system_hosts.read_bytes()
+            fixture = cwd / "etc-hosts-snapshot"
+            fixture.write_bytes(hosts_snapshot)
+            expected_inventory, expected_problems = draft_inventory(fixture)
+
+            completed = self.run_cli("generate-inventory", cwd=cwd)
+
+            generated = (cwd / "inventory.ini").read_bytes()
+            hosts_after = system_hosts.read_bytes()
+
+        expected_stderr = "".join(
+            f"{problem}\n" for problem in expected_problems
+        ).encode("utf-8")
+        self.assertEqual(hosts_after, hosts_snapshot)
+        self.assertEqual(generated, expected_inventory)
+        self.assertEqual(completed.returncode, 1 if expected_problems else 0)
+        self.assertEqual(completed.stdout, b"")
+        self.assertEqual(completed.stderr, expected_stderr)
 
     def test_collect_without_implementation_has_controlled_nondelivery(self) -> None:
         with TemporaryDirectory() as directory:

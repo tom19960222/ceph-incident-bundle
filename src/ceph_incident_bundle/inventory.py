@@ -156,7 +156,7 @@ def draft_inventory(hosts_path: Path) -> tuple[bytes, tuple[str, ...]]:
 
 def load_inventory(inventory_path: Path) -> Inventory:
     """Read and completely validate one Node Inventory."""
-    path = Path(inventory_path)
+    path = Path(inventory_path).expanduser()
     try:
         snapshot = path.read_bytes()
     except OSError as error:
