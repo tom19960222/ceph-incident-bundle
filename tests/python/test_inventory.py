@@ -13,6 +13,20 @@ from ceph_incident_bundle.inventory import (
 
 
 class DraftInventoryTests(unittest.TestCase):
+    def test_maximum_length_hostname_with_root_dot_is_preserved(self) -> None:
+        hostname = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 61)) + "."
+        with TemporaryDirectory() as directory:
+            hosts_path = Path(directory) / "hosts"
+            hosts_path.write_text(
+                f"192.0.2.10 {hostname}\n",
+                encoding="utf-8",
+            )
+
+            generated, problems = draft_inventory(hosts_path)
+
+        self.assertIn(f"{'a' * 63} = {hostname}\n".encode("utf-8"), generated)
+        self.assertEqual(problems, ())
+
     def test_hosts_path_expands_literal_tilde_with_controlled_home(self) -> None:
         with TemporaryDirectory() as directory:
             controlled_home = Path(directory)
@@ -170,6 +184,42 @@ mon01 = mon01.second.example
 
 
 class LoadInventoryTests(unittest.TestCase):
+    def test_maximum_length_hostname_with_root_dot_is_preserved(self) -> None:
+        hostname = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 61)) + "."
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = root\n"
+            "[nodes]\n"
+            f"node = {hostname}\n"
+        ).encode("utf-8")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            inventory = load_inventory(path)
+
+        self.assertEqual(inventory.snapshot, inventory_bytes)
+        self.assertEqual(inventory.nodes, (TargetNode("node", hostname),))
+
+    def test_hostname_longer_than_253_characters_without_root_dot_is_rejected(
+        self,
+    ) -> None:
+        hostname = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 62)) + "."
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = root\n"
+            "[nodes]\n"
+            f"node = {hostname}\n"
+        ).encode("utf-8")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertIn(f"invalid SSH Address '{hostname}'", str(caught.exception))
+
     def test_valid_inventory_is_immutable_ordered_and_keeps_exact_bytes(self) -> None:
         inventory_bytes = b"""\
 [common]

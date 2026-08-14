@@ -365,7 +365,7 @@ def _is_ssh_address(value: str) -> bool:
 
 def _is_hostname(value: str) -> bool:
     hostname = value[:-1] if value.endswith(".") else value
-    if not hostname or len(value) > 253 or ":" in hostname:
+    if not hostname or len(hostname) > 253 or ":" in hostname:
         return False
     return all(
         len(label) <= 63 and _HOST_LABEL.fullmatch(label) is not None
