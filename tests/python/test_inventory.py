@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import pwd
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -13,6 +14,59 @@ from ceph_incident_bundle.inventory import (
 
 
 class DraftInventoryTests(unittest.TestCase):
+    def test_zoned_ipv6_is_ignored_while_bare_ipv6_is_preserved(self) -> None:
+        hosts = b"""\
+fe80::1%eth0 zoned-v6.example.test
+2001:db8::10 bare-v6.example.test
+"""
+        with TemporaryDirectory() as directory:
+            hosts_path = Path(directory) / "hosts"
+            hosts_path.write_bytes(hosts)
+
+            generated, problems = draft_inventory(hosts_path)
+
+        self.assertNotIn(b"zoned-v6.example.test", generated)
+        self.assertIn(b"bare-v6 = bare-v6.example.test\n", generated)
+        self.assertEqual(problems, ())
+
+    def test_unresolvable_user_hosts_path_uses_inventory_rejection(self) -> None:
+        hosts_path = None
+        for username in (
+            "cib_no_user_6f9e2d7c",
+            "cib_no_user_14a8c3b5",
+            "cib_no_user_f27d91e4",
+        ):
+            try:
+                pwd.getpwnam(username)
+            except KeyError:
+                candidate = Path(f"~{username}/hosts")
+                try:
+                    candidate.expanduser()
+                except RuntimeError:
+                    hosts_path = candidate
+                    break
+        if hosts_path is None:
+            self.fail("deterministic missing-user candidates unexpectedly exist")
+
+        with self.assertRaises(InventoryRejected) as caught:
+            draft_inventory(hosts_path)
+
+        self.assertIn(f"cannot read hosts file {hosts_path}", str(caught.exception))
+
+    def test_maximum_length_hostname_with_root_dot_is_preserved(self) -> None:
+        hostname = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 61)) + "."
+        with TemporaryDirectory() as directory:
+            hosts_path = Path(directory) / "hosts"
+            hosts_path.write_text(
+                f"192.0.2.10 {hostname}\n",
+                encoding="utf-8",
+            )
+
+            generated, problems = draft_inventory(hosts_path)
+
+        self.assertIn(f"{'a' * 63} = {hostname}\n".encode("utf-8"), generated)
+        self.assertEqual(problems, ())
+
     def test_hosts_path_expands_literal_tilde_with_controlled_home(self) -> None:
         with TemporaryDirectory() as directory:
             controlled_home = Path(directory)
@@ -170,6 +224,105 @@ mon01 = mon01.second.example
 
 
 class LoadInventoryTests(unittest.TestCase):
+    def test_zoned_ipv6_ssh_address_is_rejected(self) -> None:
+        inventory_bytes = b"""\
+[common]
+ssh_user = root
+[nodes]
+node = fe80::1%eth0
+"""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertIn("invalid SSH Address 'fe80::1%eth0'", str(caught.exception))
+
+    def test_unresolvable_user_inventory_path_uses_inventory_rejection(self) -> None:
+        inventory_path = None
+        for username in (
+            "cib_no_user_6f9e2d7c",
+            "cib_no_user_14a8c3b5",
+            "cib_no_user_f27d91e4",
+        ):
+            try:
+                pwd.getpwnam(username)
+            except KeyError:
+                candidate = Path(f"~{username}/inventory.ini")
+                try:
+                    candidate.expanduser()
+                except RuntimeError:
+                    inventory_path = candidate
+                    break
+        if inventory_path is None:
+            self.fail("deterministic missing-user candidates unexpectedly exist")
+
+        with self.assertRaises(InventoryRejected) as caught:
+            load_inventory(inventory_path)
+
+        self.assertIn(
+            f"cannot read Inventory {inventory_path}",
+            str(caught.exception),
+        )
+
+    def test_inventory_path_expands_literal_tilde_with_controlled_home(self) -> None:
+        inventory_bytes = b"""\
+[common]
+ssh_user = root
+[nodes]
+node = node.example.test
+"""
+        with TemporaryDirectory() as directory:
+            controlled_home = Path(directory)
+            (controlled_home / "inventory.ini").write_bytes(inventory_bytes)
+
+            with patch.dict(os.environ, {"HOME": directory}):
+                inventory = load_inventory(Path("~/inventory.ini"))
+
+        self.assertEqual(inventory.snapshot, inventory_bytes)
+        self.assertEqual(
+            inventory.nodes,
+            (TargetNode("node", "node.example.test"),),
+        )
+
+    def test_maximum_length_hostname_with_root_dot_is_preserved(self) -> None:
+        hostname = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 61)) + "."
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = root\n"
+            "[nodes]\n"
+            f"node = {hostname}\n"
+        ).encode("utf-8")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            inventory = load_inventory(path)
+
+        self.assertEqual(inventory.snapshot, inventory_bytes)
+        self.assertEqual(inventory.nodes, (TargetNode("node", hostname),))
+
+    def test_hostname_over_253_characters_after_removing_root_dot_is_rejected(
+        self,
+    ) -> None:
+        hostname = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 62)) + "."
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = root\n"
+            "[nodes]\n"
+            f"node = {hostname}\n"
+        ).encode("utf-8")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertIn(f"invalid SSH Address '{hostname}'", str(caught.exception))
+
     def test_valid_inventory_is_immutable_ordered_and_keeps_exact_bytes(self) -> None:
         inventory_bytes = b"""\
 [common]
