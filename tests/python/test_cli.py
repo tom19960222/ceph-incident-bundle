@@ -423,6 +423,65 @@ raise SystemExit(99)
         self.assertEqual(workspaces, [])
         self.assertEqual(bundles, [])
 
+    def test_unrenderable_normalized_since_is_rejected_before_activity(
+        self,
+    ) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        maximum_parseable_decimal = "9" * 4300
+        evidence_window = f"{maximum_parseable_decimal}w"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            inventory_path = cwd / "inventory.ini"
+            inventory_path.write_bytes(inventory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            ssh_marker = cwd / "ssh-started"
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(ssh_marker)!r}).write_text("started", encoding="ascii")
+raise SystemExit(99)
+""",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o755)
+            temporary_root = cwd / "temporary"
+            temporary_root.mkdir()
+            output = cwd / "output"
+            output.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+
+            completed = self.run_cli(
+                "collect",
+                "--inventory",
+                str(inventory_path),
+                "--since",
+                evidence_window,
+                "--output-dir",
+                str(output),
+                cwd=cwd,
+                env=environment,
+            )
+
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+            output_entries = list(output.iterdir())
+            ssh_started = ssh_marker.exists()
+
+        expected_diagnostic = (
+            f"invalid evidence window '{evidence_window}'; expected a positive "
+            "integer plus m, h, d, or w\n"
+            "FAIL: no Incident Bundle delivered\n"
+        ).encode("ascii")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, b"")
+        self.assertEqual(completed.stderr, expected_diagnostic)
+        self.assertFalse(ssh_started)
+        self.assertEqual(workspaces, [])
+        self.assertEqual(output_entries, [])
+
     def test_collect_uses_one_ssh_and_delivers_one_complete_bundle(self) -> None:
         inventory = b"""\
 [common]

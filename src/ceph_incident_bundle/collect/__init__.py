@@ -159,14 +159,19 @@ def _validate_startup(
         )
     else:
         try:
-            since_seconds = int(match.group(1)) * _SECONDS_PER_UNIT[match.group(2)]
+            normalized_seconds = (
+                int(match.group(1)) * _SECONDS_PER_UNIT[match.group(2)]
+            )
+            # SSH receives this CLI control as canonical decimal seconds.  Form
+            # that representation during startup so it cannot fail after work begins.
+            str(normalized_seconds)
         except ValueError:
-            # CPython protects decimal conversion from extremely long inputs.
-            # That interpreter limit is still a normal CLI validation failure.
             problems.append(
                 f"invalid evidence window '{since}'; expected a positive integer "
                 "plus m, h, d, or w"
             )
+        else:
+            since_seconds = normalized_seconds
 
     output: Path | None = None
     try:
