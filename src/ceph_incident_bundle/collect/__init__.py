@@ -106,7 +106,17 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
             problems.append(cleanup_problem)
             print(cleanup_problem, file=sys.stderr)
         outcome = "partial" if problems else "complete"
-        print(f"{final_path} ({outcome})")
+        try:
+            print(f"{final_path} ({outcome})")
+        except Exception as error:
+            # Publication has already made the final path visible.  Losing the
+            # result stream is a delivery warning, never bundle nondelivery.
+            print(
+                f"Incident Bundle delivered at {final_path} ({outcome}), but cannot "
+                "write the final standard-output result: "
+                f"{_terminal_safe(str(error))}",
+                file=sys.stderr,
+            )
         return 0
     except KeyboardInterrupt:
         cleanup_problem = None

@@ -448,6 +448,56 @@ node-a = node-a.example.test
         for top_level in ("nodes", "ceph", "kubernetes", "prometheus"):
             self.assertIn(f"{root}/{top_level}", names)
 
+    def test_delivered_bundle_remains_success_when_stdout_result_cannot_be_written(
+        self,
+    ) -> None:
+        inventory = b"""\
+[common]
+ssh_user = root
+[nodes]
+node-a = node-a.example.test
+"""
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+            environment["PYTHONUNBUFFERED"] = "1"
+            command = COMMAND
+            assert command is not None
+
+            read_descriptor, write_descriptor = os.pipe()
+            os.close(read_descriptor)
+            try:
+                completed = subprocess.run(
+                    [command, "collect"],
+                    cwd=cwd,
+                    env=environment,
+                    stdout=write_descriptor,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+            finally:
+                os.close(write_descriptor)
+
+            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            with tarfile.open(bundles[0], "r:gz") as archive:
+                root = bundles[0].name.removesuffix(".tar.gz")
+                metadata_file = archive.extractfile(f"{root}/collection.json")
+                assert metadata_file is not None
+                metadata = json.load(metadata_file)
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(metadata["outcome"], "complete")
+        self.assertIn(b"Incident Bundle delivered at", completed.stderr)
+        self.assertIn(b"cannot write the final standard-output result", completed.stderr)
+        self.assertNotIn(b"FAIL: no Incident Bundle delivered", completed.stderr)
+
     def test_ssh_diagnostics_are_incrementally_escaped_without_losing_delivery(
         self,
     ) -> None:
