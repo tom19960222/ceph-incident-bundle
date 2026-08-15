@@ -541,7 +541,7 @@ request_timeout = 0
             )
         )
 
-    def test_every_normalized_inventory_duration_must_be_renderable(self) -> None:
+    def test_every_converted_inventory_duration_must_be_renderable(self) -> None:
         maximum_parseable_decimal = "9" * 4300
         inventory_bytes = (
             "[common]\n"
@@ -550,7 +550,6 @@ request_timeout = 0
             "[nodes]\n"
             "node = node.example\n"
             "[prometheus]\n"
-            f"query_step = {maximum_parseable_decimal}w\n"
             f"request_timeout = {maximum_parseable_decimal}h\n"
         ).encode("ascii")
         with TemporaryDirectory() as directory:
@@ -560,7 +559,7 @@ request_timeout = 0
             with self.assertRaises(InventoryRejected) as caught:
                 load_inventory(path)
 
-        for key in ("probe_timeout", "query_step", "request_timeout"):
+        for key in ("probe_timeout", "request_timeout"):
             with self.subTest(key=key):
                 self.assertTrue(
                     any(
@@ -568,6 +567,43 @@ request_timeout = 0
                         for problem in caught.exception.problems
                     )
                 )
+
+    def test_query_step_is_preserved_without_normalizing_seconds(self) -> None:
+        maximum_parseable_decimal = "9" * 4300
+        query_step = f"{maximum_parseable_decimal}w"
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = root\n"
+            "[nodes]\n"
+            "node = node.example\n"
+            "[prometheus]\n"
+            f"query_step = {query_step}\n"
+        ).encode("ascii")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            inventory = load_inventory(path)
+
+        self.assertEqual(inventory.query_step, query_step)
+
+    def test_invalid_query_step_grammar_is_rejected(self) -> None:
+        inventory_bytes = b"""\
+[common]
+ssh_user = root
+[nodes]
+node = node.example
+[prometheus]
+query_step = 0
+"""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertIn("invalid query_step '0'", caught.exception.problems)
 
     def test_probe_timeout_must_fit_the_process_wait_boundary(self) -> None:
         float_overflowing_decimal = "9" * 1000

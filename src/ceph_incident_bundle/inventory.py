@@ -274,9 +274,8 @@ def load_inventory(inventory_path: Path) -> Inventory:
     except re.error as error:
         problems.append(f"invalid metrics_filter_regex: {error}")
     query_step = prometheus.get("query_step", "15s")
-    _duration_seconds(
-        "query_step", query_step, "smhdw", allow_zero=False, problems=problems
-    )
+    if re.fullmatch(r"[1-9][0-9]*[smhdw]", query_step, re.ASCII) is None:
+        problems.append(f"invalid query_step '{query_step}'")
     request_timeout = prometheus.get("request_timeout", "5m")
     request_timeout_seconds = _duration_seconds(
         "request_timeout",
