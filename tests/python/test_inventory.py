@@ -516,6 +516,81 @@ request_timeout = 0
         self.assertEqual(inventory.query_step, "1w")
         self.assertEqual(inventory.request_timeout_seconds, 0)
 
+    def test_normalized_ssh_connect_timeout_must_be_renderable(self) -> None:
+        maximum_parseable_decimal = "9" * 4300
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = admin\n"
+            f"ssh_connect_timeout = {maximum_parseable_decimal}m\n"
+            "[nodes]\n"
+            "node = node.example\n"
+        ).encode("ascii")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertIn("ssh_user must be exactly 'root'", caught.exception.problems)
+        self.assertTrue(
+            any(
+                problem.startswith("invalid ssh_connect_timeout")
+                for problem in caught.exception.problems
+            )
+        )
+
+    def test_every_normalized_inventory_duration_must_be_renderable(self) -> None:
+        maximum_parseable_decimal = "9" * 4300
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = root\n"
+            f"probe_timeout = {maximum_parseable_decimal}m\n"
+            "[nodes]\n"
+            "node = node.example\n"
+            "[prometheus]\n"
+            f"query_step = {maximum_parseable_decimal}w\n"
+            f"request_timeout = {maximum_parseable_decimal}h\n"
+        ).encode("ascii")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        for key in ("probe_timeout", "query_step", "request_timeout"):
+            with self.subTest(key=key):
+                self.assertTrue(
+                    any(
+                        problem.startswith(f"invalid {key}")
+                        for problem in caught.exception.problems
+                    )
+                )
+
+    def test_probe_timeout_must_fit_the_process_wait_boundary(self) -> None:
+        float_overflowing_decimal = "9" * 1000
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = root\n"
+            f"probe_timeout = {float_overflowing_decimal}m\n"
+            "[nodes]\n"
+            "node = node.example\n"
+        ).encode("ascii")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertTrue(
+            any(
+                problem.startswith("invalid probe_timeout")
+                for problem in caught.exception.problems
+            )
+        )
+
     def test_rejection_does_not_start_process_network_or_create_output(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
