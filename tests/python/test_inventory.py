@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import pwd
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -592,14 +593,14 @@ request_timeout = 0
         )
 
     def test_request_timeout_must_fit_the_url_request_boundary(self) -> None:
-        float_overflowing_decimal = "9" * 1000
+        first_unrepresentable_timeout = int(threading.TIMEOUT_MAX) + 1
         inventory_bytes = (
             "[common]\n"
             "ssh_user = admin\n"
             "[nodes]\n"
             "node = node.example\n"
             "[prometheus]\n"
-            f"request_timeout = {float_overflowing_decimal}s\n"
+            f"request_timeout = {first_unrepresentable_timeout}s\n"
         ).encode("ascii")
         with TemporaryDirectory() as directory:
             path = Path(directory) / "inventory.ini"
@@ -615,6 +616,24 @@ request_timeout = 0
                 for problem in caught.exception.problems
             )
         )
+
+    def test_request_timeout_accepts_the_runtime_boundary(self) -> None:
+        maximum_timeout = int(threading.TIMEOUT_MAX)
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = root\n"
+            "[nodes]\n"
+            "node = node.example\n"
+            "[prometheus]\n"
+            f"request_timeout = {maximum_timeout}s\n"
+        ).encode("ascii")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            inventory = load_inventory(path)
+
+        self.assertEqual(inventory.request_timeout_seconds, maximum_timeout)
 
     def test_rejection_does_not_start_process_network_or_create_output(self) -> None:
         with TemporaryDirectory() as directory:

@@ -7,6 +7,7 @@ import ipaddress
 import math
 from pathlib import Path
 import re
+import threading
 import unicodedata
 from urllib.parse import urlsplit
 
@@ -204,7 +205,9 @@ def load_inventory(inventory_path: Path) -> Inventory:
     probe_timeout_seconds = _duration_seconds(
         "probe_timeout", probe_timeout, "mhdw", allow_zero=True, problems=problems
     )
-    if probe_timeout_seconds and not _fits_runtime_timeout(probe_timeout_seconds):
+    if probe_timeout_seconds and not _fits_process_wait_timeout(
+        probe_timeout_seconds
+    ):
         problems.append(f"invalid probe_timeout '{probe_timeout}'")
     ssh_connect_timeout = common.get("ssh_connect_timeout", "15s")
     ssh_connect_timeout_seconds = _duration_seconds(
@@ -282,7 +285,7 @@ def load_inventory(inventory_path: Path) -> Inventory:
         allow_zero=True,
         problems=problems,
     )
-    if request_timeout_seconds and not _fits_runtime_timeout(
+    if request_timeout_seconds and not _fits_url_request_timeout(
         request_timeout_seconds
     ):
         problems.append(f"invalid request_timeout '{request_timeout}'")
@@ -373,12 +376,17 @@ def _duration_seconds(
     return seconds
 
 
-def _fits_runtime_timeout(seconds: int) -> bool:
-    """Return whether CPython's float-backed timeout APIs can use seconds."""
+def _fits_process_wait_timeout(seconds: int) -> bool:
+    """Return whether subprocess can represent this Inventory timeout."""
     try:
         return math.isfinite(float(seconds))
     except OverflowError:
         return False
+
+
+def _fits_url_request_timeout(seconds: int) -> bool:
+    """Return whether CPython's socket-backed timeout can use seconds."""
+    return seconds <= int(threading.TIMEOUT_MAX)
 
 
 def _is_ssh_address(value: str) -> bool:
