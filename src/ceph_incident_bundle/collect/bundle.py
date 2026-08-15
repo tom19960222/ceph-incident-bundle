@@ -80,66 +80,90 @@ def publish_bundle(
         descriptor, candidate_name, candidate = _create_private_candidate(
             output_descriptor, final_path
         )
-        with os.fdopen(descriptor, "wb") as candidate_file:
-            with tarfile.open(fileobj=candidate_file, mode="w:gz") as archive:
-                for archive_name, source, is_directory in entries:
-                    _add_validated_entry(
-                        archive,
+        candidate_anchor: int | None = None
+        try:
+            with os.fdopen(descriptor, "wb") as candidate_file:
+                with tarfile.open(fileobj=candidate_file, mode="w:gz") as archive:
+                    for archive_name, source, is_directory in entries:
+                        _add_validated_entry(
+                            archive,
+                            workspace_descriptor,
+                            archive_name,
+                            source,
+                            is_directory,
+                            started_at,
+                        )
+                    # Ordering is load-bearing: each workspace-backed member is closed
+                    # before cleanup.  The root descriptor remains only as the anchor
+                    # that confines deletion to this exact owned workspace.  Cleanup
+                    # and both anchor closes finish before final metadata because their
+                    # residue decides complete vs partial.
+                    assert workspace_parent_descriptor is not None
+                    assert workspace_marker_path is not None
+                    cleanup_problem = _cleanup_workspace(
+                        workspace,
+                        workspace_parent_descriptor,
                         workspace_descriptor,
-                        archive_name,
-                        source,
-                        is_directory,
+                        workspace_marker_path,
+                    )
+                    workspace_cleanup_attempted = True
+                    workspace_close_problem = _close_workspace_input(
+                        workspace_descriptor
+                    )
+                    workspace_descriptor = None
+                    if workspace_close_problem is not None:
+                        raise BundlePublicationError(workspace_close_problem)
+                    parent_close_problem = _close_workspace_parent(
+                        workspace_parent_descriptor
+                    )
+                    workspace_parent_descriptor = None
+                    if parent_close_problem is not None:
+                        raise BundlePublicationError(parent_close_problem)
+                    metadata = {
+                        "collector_version": collector_version,
+                        "started_at": _rfc3339(started_at),
+                        "finished_at": _rfc3339(datetime.now(timezone.utc)),
+                        "since": since,
+                        "outcome": "partial"
+                        if prior_partial or cleanup_problem is not None
+                        else "complete",
+                    }
+                    _add_bytes(
+                        archive,
+                        f"{bundle_root}/collection.json",
+                        (
+                            json.dumps(
+                                metadata, sort_keys=True, separators=(",", ":")
+                            )
+                            + "\n"
+                        ).encode("utf-8"),
                         started_at,
                     )
-                # Ordering is load-bearing: each workspace-backed member is closed
-                # before cleanup.  The root descriptor remains only as the anchor
-                # that confines deletion to this exact owned workspace.  Cleanup
-                # and both anchor closes finish before final metadata because their
-                # residue decides complete vs partial.
-                assert workspace_parent_descriptor is not None
-                assert workspace_marker_path is not None
-                cleanup_problem = _cleanup_workspace(
-                    workspace,
-                    workspace_parent_descriptor,
-                    workspace_descriptor,
-                    workspace_marker_path,
-                )
-                workspace_cleanup_attempted = True
-                workspace_close_problem = _close_workspace_input(
-                    workspace_descriptor
-                )
-                workspace_descriptor = None
-                if workspace_close_problem is not None:
-                    raise BundlePublicationError(workspace_close_problem)
-                parent_close_problem = _close_workspace_parent(
-                    workspace_parent_descriptor
-                )
-                workspace_parent_descriptor = None
-                if parent_close_problem is not None:
-                    raise BundlePublicationError(parent_close_problem)
-                metadata = {
-                    "collector_version": collector_version,
-                    "started_at": _rfc3339(started_at),
-                    "finished_at": _rfc3339(datetime.now(timezone.utc)),
-                    "since": since,
-                    "outcome": "partial"
-                    if prior_partial or cleanup_problem is not None
-                    else "complete",
-                }
-                _add_bytes(
-                    archive,
-                    f"{bundle_root}/collection.json",
-                    (
-                        json.dumps(metadata, sort_keys=True, separators=(",", ":"))
-                        + "\n"
-                    ).encode("utf-8"),
-                    started_at,
-                )
-            candidate_file.flush()
-            os.fsync(candidate_file.fileno())
-        _require_output_directory_unchanged(
-            output_descriptor, final_path.parent
-        )
+                candidate_file.flush()
+                os.fsync(candidate_file.fileno())
+                candidate_anchor = os.dup(candidate_file.fileno())
+            _require_output_directory_unchanged(
+                output_descriptor, final_path.parent
+            )
+            assert candidate_anchor is not None
+            # Python 3.10 has no read-only umask query.  Use the most restrictive
+            # value during this brief lookup, then restore the process setting even
+            # if the calculation is interrupted.
+            current_umask = os.umask(0o777)
+            try:
+                published_mode = 0o666 & ~current_umask
+            finally:
+                os.umask(current_umask)
+            # The candidate remains private while bytes are written.  Only this
+            # complete, closed stream receives its ordinary mode before the final
+            # no-replace hard link makes the inode visible under the published name.
+            os.fchmod(candidate_anchor, published_mode)
+            os.fsync(candidate_anchor)
+        finally:
+            if candidate_anchor is not None:
+                anchor_to_close = candidate_anchor
+                candidate_anchor = None
+                os.close(anchor_to_close)
         os.link(
             candidate_name,
             final_path.name,

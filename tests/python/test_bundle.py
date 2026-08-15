@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import stat
 import tarfile
 from tempfile import TemporaryDirectory
 import unittest
@@ -73,6 +74,36 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         for top_level in ("nodes", "ceph", "kubernetes", "prometheus"):
             self.assertIn(f"{bundle_root}/{top_level}", names)
         self.assertTrue(all(member.isdir() or member.isreg() for member in members))
+
+    def test_published_mode_respects_restrictive_process_umask(self) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+        previous_umask = os.umask(0o027)
+        try:
+            with TemporaryDirectory() as directory:
+                root = Path(directory)
+                workspace = root / "workspace"
+                self._write_workspace(workspace, inventory)
+                final_path = (
+                    root / "ceph-incident-bundle-20260814T120000Z.tar.gz"
+                )
+
+                publish_bundle(
+                    workspace,
+                    final_path,
+                    collector_version="0.1.0",
+                    started_at=started_at,
+                    since="24h",
+                    prior_partial=False,
+                )
+
+                bundle_mode = stat.S_IMODE(final_path.stat().st_mode)
+                observed_umask = os.umask(0o027)
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(bundle_mode, 0o640)
+        self.assertEqual(observed_umask, 0o027)
 
     def test_existing_final_destination_is_never_replaced(self) -> None:
         inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"

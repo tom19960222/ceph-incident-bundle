@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import stat
 import subprocess
 import sys
 import tarfile
@@ -386,12 +387,14 @@ node-a = node-a.example.test
                 env=environment,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                umask=0o022,
                 check=False,
             )
 
             bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
             self.assertEqual(len(bundles), 1)
             bundle = bundles[0]
+            bundle_mode = stat.S_IMODE(bundle.stat().st_mode)
             with tarfile.open(bundle, "r:gz") as archive:
                 members = archive.getmembers()
                 names = {member.name for member in members}
@@ -418,6 +421,7 @@ node-a = node-a.example.test
 
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(completed.stderr, b"")
+        self.assertEqual(bundle_mode, 0o644)
         self.assertEqual(
             completed.stdout,
             f"{bundle.resolve()} (complete)\n".encode("utf-8"),
