@@ -8,6 +8,7 @@ import sys
 from typing import Sequence
 
 from . import generate_inventory
+from .inventory import InventoryRejected, load_inventory
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -41,6 +42,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ModuleNotFoundError as error:
         if error.name != "ceph_incident_bundle.collect":
             raise
+        try:
+            load_inventory(arguments.inventory)
+        except InventoryRejected as rejection:
+            for problem in rejection.problems:
+                print(problem, file=sys.stderr)
+            print("FAIL: no Incident Bundle delivered", file=sys.stderr)
+            return 1
         print(
             "collect is not available in this preparation-only build",
             file=sys.stderr,

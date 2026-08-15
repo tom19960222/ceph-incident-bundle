@@ -220,9 +220,19 @@ request_timeout = 5m
         self.assertEqual(residue_after_hosts_failure, ("source-hosts",))
         self.assertEqual(residue_after_output_failure, ("source-hosts",))
 
-    def test_collect_without_implementation_has_controlled_nondelivery(self) -> None:
+    def test_valid_inventory_without_implementation_has_controlled_nondelivery(
+        self,
+    ) -> None:
         with TemporaryDirectory() as directory:
-            completed = self.run_cli("collect", cwd=Path(directory))
+            cwd = Path(directory)
+            inventory = cwd / "inventory.ini"
+            inventory.write_text(
+                "[common]\nssh_user = root\n[nodes]\nnode = node.example\n",
+                encoding="ascii",
+            )
+            completed = self.run_cli(
+                "collect", "--inventory", str(inventory), cwd=cwd
+            )
 
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(completed.stdout, b"")
@@ -251,6 +261,8 @@ request_timeout = 5m
             )
             fake_bin = cwd / "fake-bin"
             fake_bin.mkdir()
+            collector_tmp = cwd / "collector-tmp"
+            collector_tmp.mkdir()
             process_marker = cwd / "ssh-started"
             fake_ssh = fake_bin / "ssh"
             fake_ssh.write_text(
@@ -261,6 +273,7 @@ request_timeout = 5m
             environment = os.environ.copy()
             environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
             environment["CIB_PROCESS_MARKER"] = str(process_marker)
+            environment["TMPDIR"] = str(collector_tmp)
 
             completed = subprocess.run(
                 [command, "collect", "--inventory", str(inventory)],
@@ -272,16 +285,26 @@ request_timeout = 5m
             )
 
             residue = tuple(sorted(path.name for path in cwd.iterdir()))
+            workspace_residue = tuple(collector_tmp.iterdir())
 
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(completed.stdout, b"")
-        self.assertEqual(
+        self.assertTrue(
+            completed.stderr.startswith(b"invalid ssh_connect_timeout '")
+        )
+        self.assertTrue(
+            completed.stderr.endswith(b"FAIL: no Incident Bundle delivered\n")
+        )
+        self.assertNotIn(
+            b"collect is not available in this preparation-only build",
             completed.stderr,
-            b"collect is not available in this preparation-only build\n"
-            b"FAIL: no Incident Bundle delivered\n",
         )
         self.assertNotIn(b"Traceback", completed.stderr)
-        self.assertEqual(residue, ("duration-boundary.ini", "fake-bin"))
+        self.assertEqual(
+            residue,
+            ("collector-tmp", "duration-boundary.ini", "fake-bin"),
+        )
+        self.assertEqual(workspace_residue, ())
 
     def test_inaccessible_output_parent_fails_without_traceback_or_residue(
         self,

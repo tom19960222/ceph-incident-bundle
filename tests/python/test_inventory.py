@@ -591,6 +591,31 @@ request_timeout = 0
             )
         )
 
+    def test_request_timeout_must_fit_the_url_request_boundary(self) -> None:
+        float_overflowing_decimal = "9" * 1000
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = admin\n"
+            "[nodes]\n"
+            "node = node.example\n"
+            "[prometheus]\n"
+            f"request_timeout = {float_overflowing_decimal}s\n"
+        ).encode("ascii")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertIn("ssh_user must be exactly 'root'", caught.exception.problems)
+        self.assertTrue(
+            any(
+                problem.startswith("invalid request_timeout")
+                for problem in caught.exception.problems
+            )
+        )
+
     def test_rejection_does_not_start_process_network_or_create_output(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

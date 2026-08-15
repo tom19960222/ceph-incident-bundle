@@ -204,9 +204,7 @@ def load_inventory(inventory_path: Path) -> Inventory:
     probe_timeout_seconds = _duration_seconds(
         "probe_timeout", probe_timeout, "mhdw", allow_zero=True, problems=problems
     )
-    if probe_timeout_seconds and not _fits_process_wait_timeout(
-        probe_timeout_seconds
-    ):
+    if probe_timeout_seconds and not _fits_runtime_timeout(probe_timeout_seconds):
         problems.append(f"invalid probe_timeout '{probe_timeout}'")
     ssh_connect_timeout = common.get("ssh_connect_timeout", "15s")
     ssh_connect_timeout_seconds = _duration_seconds(
@@ -284,6 +282,10 @@ def load_inventory(inventory_path: Path) -> Inventory:
         allow_zero=True,
         problems=problems,
     )
+    if request_timeout_seconds and not _fits_runtime_timeout(
+        request_timeout_seconds
+    ):
+        problems.append(f"invalid request_timeout '{request_timeout}'")
 
     if problems:
         raise InventoryRejected(problems)
@@ -371,8 +373,8 @@ def _duration_seconds(
     return seconds
 
 
-def _fits_process_wait_timeout(seconds: int) -> bool:
-    """Return whether subprocess can represent this Inventory timeout."""
+def _fits_runtime_timeout(seconds: int) -> bool:
+    """Return whether CPython's float-backed timeout APIs can use seconds."""
     try:
         return math.isfinite(float(seconds))
     except OverflowError:
