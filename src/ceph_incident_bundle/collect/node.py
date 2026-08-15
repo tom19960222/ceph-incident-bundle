@@ -86,7 +86,12 @@ def collect_node(
             f"Target Node {node.inventory_name}: cannot start SSH: {start_error}"
         ]
 
-    _print_diagnostics(node.inventory_name, diagnostics_path)
+    try:
+        _print_diagnostics(node.inventory_name, diagnostics_path)
+    except Exception:
+        # SSH diagnostics are best-effort terminal output.  A broken diagnostic
+        # stream must not prevent admission of an otherwise complete archive.
+        pass
     problems: list[str] = []
 
     try:

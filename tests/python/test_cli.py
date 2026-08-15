@@ -694,6 +694,74 @@ node-a = node-a.example.test
         self.assertEqual(output_entries, [bundle])
         self.assertEqual(workspaces, [])
 
+    def test_complete_archive_is_admitted_when_ssh_diagnostics_cannot_be_written(
+        self,
+    ) -> None:
+        inventory = b"""\
+[common]
+ssh_user = root
+[nodes]
+node-a = node-a.example.test
+"""
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            output = cwd / "output"
+            output.mkdir()
+            temporary_root = cwd / "temporary"
+            temporary_root.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+            environment["FAKE_SSH_DIAGNOSTIC"] = "1"
+            environment["TMPDIR"] = str(temporary_root)
+            environment["PYTHONUNBUFFERED"] = "1"
+            command = COMMAND
+            assert command is not None
+
+            read_descriptor, write_descriptor = os.pipe()
+            os.close(read_descriptor)
+            try:
+                completed = subprocess.run(
+                    [command, "collect", "--output-dir", str(output)],
+                    cwd=cwd,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=write_descriptor,
+                    check=False,
+                )
+            finally:
+                os.close(write_descriptor)
+
+            bundles = list(output.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            bundle = bundles[0]
+            with tarfile.open(bundle, "r:gz") as archive:
+                root = bundle.name.removesuffix(".tar.gz")
+                metadata_file = archive.extractfile(f"{root}/collection.json")
+                hostname_file = archive.extractfile(
+                    f"{root}/nodes/node-a/probes/hostname/stdout"
+                )
+                assert metadata_file is not None
+                assert hostname_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+                hostname = hostname_file.read()
+            output_entries = list(output.iterdir())
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stdout,
+            f"{bundle.resolve()} (complete)\n".encode("utf-8"),
+        )
+        self.assertEqual(outcome, "complete")
+        self.assertTrue(hostname)
+        self.assertEqual(output_entries, [bundle])
+        self.assertEqual(workspaces, [])
+
     def test_ssh_diagnostics_are_incrementally_escaped_without_losing_delivery(
         self,
     ) -> None:
