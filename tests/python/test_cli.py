@@ -368,6 +368,78 @@ raise SystemExit(99)
             completed.stderr.endswith(b"FAIL: no Incident Bundle delivered\n")
         )
 
+    def test_collect_parser_escapes_hostile_unknown_argument_before_activity(
+        self,
+    ) -> None:
+        hostile_argument = (
+            "--unknown\x1b]8;;https://example.invalid\x07click\x1b]8;;\x07"
+        )
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            inventory = cwd / "inventory.ini"
+            inventory.write_text(
+                "[common]\n"
+                "ssh_user = root\n"
+                "probe_timeout = 30m\n"
+                "ssh_connect_timeout = 15s\n"
+                "[nodes]\n"
+                "node-a = node-a.example\n",
+                encoding="ascii",
+            )
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            process_marker = cwd / "ssh-started"
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(process_marker)!r}).write_text("started", encoding="ascii")
+raise SystemExit(99)
+""",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o755)
+            temporary_root = cwd / "temporary"
+            temporary_root.mkdir()
+            output = cwd / "output"
+            output.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+
+            completed = self.run_cli(
+                "collect",
+                "--inventory",
+                str(inventory),
+                "--output-dir",
+                str(output),
+                hostile_argument,
+                cwd=cwd,
+                env=environment,
+            )
+
+            process_started = process_marker.exists()
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+            output_entries = list(output.iterdir())
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, b"")
+        self.assertIn(b"usage: ceph-incident-bundle", completed.stderr)
+        self.assertIn(b"error: unrecognized arguments:", completed.stderr)
+        self.assertIn(
+            b"--unknown\\x1b]8;;https://example.invalid\\x07click"
+            b"\\x1b]8;;\\x07",
+            completed.stderr,
+        )
+        self.assertNotIn(b"\x1b", completed.stderr)
+        self.assertNotIn(b"\x07", completed.stderr)
+        self.assertTrue(
+            completed.stderr.endswith(b"FAIL: no Incident Bundle delivered\n")
+        )
+        self.assertFalse(process_started)
+        self.assertEqual(workspaces, [])
+        self.assertEqual(output_entries, [])
+
     def test_unusable_ssh_timeouts_have_no_collect_activity(self) -> None:
         command = COMMAND
         assert command is not None
