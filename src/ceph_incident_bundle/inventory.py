@@ -22,6 +22,8 @@ _FIXED_KEYS = {
     "prometheus": {"url", "metrics_filter_regex", "query_step", "request_timeout"},
 }
 _SECONDS_PER_UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+# OpenSSH parses ConnectTimeout into a signed C int.
+_OPENSSH_CONNECT_TIMEOUT_MAX_SECONDS = 2_147_483_647
 # This fixed naming heuristic drafts configuration; it never discovers a live capability.
 _CEPH_SOURCE_NAME_SUBSTRINGS = ("mon", "cp", "cm")
 
@@ -217,6 +219,8 @@ def load_inventory(inventory_path: Path) -> Inventory:
         allow_zero=True,
         problems=problems,
     )
+    if ssh_connect_timeout_seconds > _OPENSSH_CONNECT_TIMEOUT_MAX_SECONDS:
+        problems.append(f"invalid ssh_connect_timeout '{ssh_connect_timeout}'")
 
     node_entries = sections.get("nodes", [])
     if "nodes" not in sections:

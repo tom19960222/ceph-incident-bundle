@@ -541,6 +541,47 @@ request_timeout = 0
             )
         )
 
+    def test_ssh_connect_timeout_accepts_openssh_boundaries(self) -> None:
+        boundaries = (("0", 0), ("2147483647s", 2147483647))
+        for value, expected_seconds in boundaries:
+            with self.subTest(value=value), TemporaryDirectory() as directory:
+                path = Path(directory) / "inventory.ini"
+                path.write_text(
+                    "[common]\n"
+                    "ssh_user = root\n"
+                    f"ssh_connect_timeout = {value}\n"
+                    "[nodes]\n"
+                    "node = node.example\n",
+                    encoding="ascii",
+                )
+
+                inventory = load_inventory(path)
+
+            self.assertEqual(
+                inventory.ssh_connect_timeout_seconds, expected_seconds
+            )
+
+    def test_ssh_connect_timeout_must_fit_openssh_signed_int(self) -> None:
+        inventory_bytes = b"""\
+[common]
+ssh_user = admin
+ssh_connect_timeout = 2147483648s
+[nodes]
+node = node.example
+"""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertIn("ssh_user must be exactly 'root'", caught.exception.problems)
+        self.assertIn(
+            "invalid ssh_connect_timeout '2147483648s'",
+            caught.exception.problems,
+        )
+
     def test_every_converted_inventory_duration_must_be_renderable(self) -> None:
         maximum_parseable_decimal = "9" * 4300
         inventory_bytes = (

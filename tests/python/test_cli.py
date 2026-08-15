@@ -242,69 +242,76 @@ request_timeout = 5m
             b"FAIL: no Incident Bundle delivered\n",
         )
 
-    def test_unrenderable_inventory_duration_has_no_transitional_collect_activity(
+    def test_unusable_ssh_timeouts_have_no_transitional_collect_activity(
         self,
     ) -> None:
         command = COMMAND
         assert command is not None
         maximum_parseable_decimal = "9" * 4300
-        with TemporaryDirectory() as directory:
-            cwd = Path(directory)
-            inventory = cwd / "duration-boundary.ini"
-            inventory.write_text(
-                "[common]\n"
-                "ssh_user = root\n"
-                f"ssh_connect_timeout = {maximum_parseable_decimal}m\n"
-                "[nodes]\n"
-                "node = node.example\n",
-                encoding="ascii",
-            )
-            fake_bin = cwd / "fake-bin"
-            fake_bin.mkdir()
-            collector_tmp = cwd / "collector-tmp"
-            collector_tmp.mkdir()
-            process_marker = cwd / "ssh-started"
-            fake_ssh = fake_bin / "ssh"
-            fake_ssh.write_text(
-                "#!/bin/sh\n: > \"$CIB_PROCESS_MARKER\"\nexit 99\n",
-                encoding="ascii",
-            )
-            fake_ssh.chmod(0o755)
-            environment = os.environ.copy()
-            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
-            environment["CIB_PROCESS_MARKER"] = str(process_marker)
-            environment["TMPDIR"] = str(collector_tmp)
+        invalid_timeouts = (
+            ("unrenderable normalized seconds", f"{maximum_parseable_decimal}m"),
+            ("OpenSSH signed-int overflow", "2147483648s"),
+        )
+        for case_name, timeout in invalid_timeouts:
+            with self.subTest(case=case_name), TemporaryDirectory() as directory:
+                cwd = Path(directory)
+                inventory = cwd / "duration-boundary.ini"
+                inventory.write_text(
+                    "[common]\n"
+                    "ssh_user = root\n"
+                    f"ssh_connect_timeout = {timeout}\n"
+                    "[nodes]\n"
+                    "node = node.example\n",
+                    encoding="ascii",
+                )
+                fake_bin = cwd / "fake-bin"
+                fake_bin.mkdir()
+                collector_tmp = cwd / "collector-tmp"
+                collector_tmp.mkdir()
+                process_marker = cwd / "ssh-started"
+                fake_ssh = fake_bin / "ssh"
+                fake_ssh.write_text(
+                    "#!/bin/sh\n: > \"$CIB_PROCESS_MARKER\"\nexit 99\n",
+                    encoding="ascii",
+                )
+                fake_ssh.chmod(0o755)
+                environment = os.environ.copy()
+                environment["PATH"] = (
+                    f"{fake_bin}{os.pathsep}{environment['PATH']}"
+                )
+                environment["CIB_PROCESS_MARKER"] = str(process_marker)
+                environment["TMPDIR"] = str(collector_tmp)
 
-            completed = subprocess.run(
-                [command, "collect", "--inventory", str(inventory)],
-                cwd=cwd,
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
+                completed = subprocess.run(
+                    [command, "collect", "--inventory", str(inventory)],
+                    cwd=cwd,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+
+                residue = tuple(sorted(path.name for path in cwd.iterdir()))
+                workspace_residue = tuple(collector_tmp.iterdir())
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout, b"")
+            self.assertTrue(
+                completed.stderr.startswith(b"invalid ssh_connect_timeout '")
             )
-
-            residue = tuple(sorted(path.name for path in cwd.iterdir()))
-            workspace_residue = tuple(collector_tmp.iterdir())
-
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertEqual(completed.stdout, b"")
-        self.assertTrue(
-            completed.stderr.startswith(b"invalid ssh_connect_timeout '")
-        )
-        self.assertTrue(
-            completed.stderr.endswith(b"FAIL: no Incident Bundle delivered\n")
-        )
-        self.assertNotIn(
-            b"collect is not available in this preparation-only build",
-            completed.stderr,
-        )
-        self.assertNotIn(b"Traceback", completed.stderr)
-        self.assertEqual(
-            residue,
-            ("collector-tmp", "duration-boundary.ini", "fake-bin"),
-        )
-        self.assertEqual(workspace_residue, ())
+            self.assertTrue(
+                completed.stderr.endswith(b"FAIL: no Incident Bundle delivered\n")
+            )
+            self.assertNotIn(
+                b"collect is not available in this preparation-only build",
+                completed.stderr,
+            )
+            self.assertNotIn(b"Traceback", completed.stderr)
+            self.assertEqual(
+                residue,
+                ("collector-tmp", "duration-boundary.ini", "fake-bin"),
+            )
+            self.assertEqual(workspace_residue, ())
 
     def test_inaccessible_output_parent_fails_without_traceback_or_residue(
         self,
