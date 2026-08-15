@@ -90,8 +90,13 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
                 f"Target Node {node.inventory_name}: unexpected collection failure: "
                 f"{_terminal_safe(str(error))}"
             )
-        for problem in problems:
-            print(problem, file=sys.stderr)
+        try:
+            for problem in problems:
+                print(problem, file=sys.stderr)
+        except Exception:
+            # Returned problems still determine the bundle outcome when the
+            # diagnostic stream itself is no longer writable.
+            pass
 
         publication_has_ownership = True
         cleanup_problem = publish_bundle(
