@@ -197,7 +197,7 @@ def _validate_startup(
 
 def _nondelivery(problems: list[str], *, status: int) -> int:
     for problem in problems:
-        print(problem, file=sys.stderr)
+        print(_terminal_safe(problem), file=sys.stderr)
     print("FAIL: no Incident Bundle delivered", file=sys.stderr)
     return status
 

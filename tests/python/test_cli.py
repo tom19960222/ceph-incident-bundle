@@ -240,6 +240,66 @@ request_timeout = 5m
             completed.stderr.endswith(b"FAIL: no Incident Bundle delivered\n")
         )
 
+    def test_startup_nondelivery_escapes_inventory_controls_before_activity(
+        self,
+    ) -> None:
+        hostile_timeout = "evil\x1b]2;spoofed\x07"
+        inventory = (
+            "[common]\n"
+            "ssh_user = root\n"
+            f"probe_timeout = {hostile_timeout}\n"
+            "[nodes]\n"
+            "node-a = node-a.example\n"
+        )
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            (cwd / "inventory.ini").write_text(inventory, encoding="utf-8")
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            process_marker = cwd / "ssh-started"
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(process_marker)!r}).write_text("started", encoding="ascii")
+raise SystemExit(99)
+""",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o755)
+            temporary_root = cwd / "temporary"
+            temporary_root.mkdir()
+            output = cwd / "output"
+            output.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+
+            completed = self.run_cli(
+                "collect",
+                "--output-dir",
+                str(output),
+                cwd=cwd,
+                env=environment,
+            )
+
+            process_started = process_marker.exists()
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+            output_entries = list(output.iterdir())
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, b"")
+        self.assertEqual(
+            completed.stderr,
+            b"invalid probe_timeout 'evil\\x1b]2;spoofed\\x07'\n"
+            b"FAIL: no Incident Bundle delivered\n",
+        )
+        self.assertNotIn(b"\x1b", completed.stderr)
+        self.assertNotIn(b"\x07", completed.stderr)
+        self.assertFalse(process_started)
+        self.assertEqual(workspaces, [])
+        self.assertEqual(output_entries, [])
+
     def test_collect_unresolvable_inventory_user_rejects_before_activity(
         self,
     ) -> None:
