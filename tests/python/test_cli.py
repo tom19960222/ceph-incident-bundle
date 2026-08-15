@@ -984,7 +984,7 @@ node-a = node-a.example.test
             environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
             environment["TMPDIR"] = str(temporary_root)
             environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
-            environment["FAKE_SSH_ABSOLUTE_MEMBER"] = str(
+            environment["FAKE_SSH_HOSTILE_MEMBER"] = str(
                 outside_sentinel.resolve()
             )
 
@@ -1049,6 +1049,63 @@ node-a = node-a.example.test
         self.assertNotIn(
             b"fake-ssh private archive payload\n", b"".join(regular_payloads)
         )
+        self.assertEqual(workspaces, [])
+
+    def test_hostile_archive_member_controls_are_escaped_on_standard_error(
+        self,
+    ) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        hostile_root = "evil\x1b]2;spoofed\x07"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            outside_sentinel = cwd / "outside-sentinel"
+            outside_sentinel.write_bytes(b"unchanged\n")
+            temporary_root = cwd / "temporary"
+            temporary_root.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+            environment["FAKE_SSH_HOSTILE_MEMBER"] = f"{hostile_root}/member"
+
+            completed = self.run_cli(
+                "collect", cwd=cwd, env=environment, timeout=20
+            )
+
+            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            bundle = bundles[0]
+            with tarfile.open(bundle, "r:gz") as archive:
+                root = bundle.name.removesuffix(".tar.gz")
+                names = {member.name for member in archive.getmembers()}
+                metadata_file = archive.extractfile(f"{root}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+            sentinel_bytes = outside_sentinel.read_bytes()
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stdout,
+            f"{bundle.resolve()} (partial)\n".encode("utf-8"),
+        )
+        self.assertEqual(
+            completed.stderr,
+            b"Target Node node-a: Node Evidence Archive rejected: "
+            b"unknown archive root: evil\\x1b]2;spoofed\\x07\n",
+        )
+        self.assertNotIn(b"\x1b", completed.stderr)
+        self.assertNotIn(b"\x07", completed.stderr)
+        self.assertEqual(outcome, "partial")
+        self.assertFalse(
+            any(name.startswith(f"{root}/nodes/node-a") for name in names)
+        )
+        self.assertFalse(any("private" in name for name in names))
+        self.assertEqual(sentinel_bytes, b"unchanged\n")
         self.assertEqual(workspaces, [])
 
     def test_publication_failure_has_controlled_installed_cli_nondelivery(self) -> None:
@@ -1232,8 +1289,8 @@ if remove_output:
 if os.environ.get("FAKE_SSH_CORRUPT"):
     sys.stdout.buffer.write(b"not-an-archive")
     raise SystemExit(0)
-absolute_member = os.environ.get("FAKE_SSH_ABSOLUTE_MEMBER")
-if absolute_member:
+hostile_member = os.environ.get("FAKE_SSH_HOSTILE_MEMBER")
+if hostile_member:
     private_payload = b"fake-ssh private archive payload\\n"
     hostile_archive = io.BytesIO()
     with tarfile.open(fileobj=hostile_archive, mode="w:gz") as archive:
@@ -1242,7 +1299,7 @@ if absolute_member:
             member.type = tarfile.DIRTYPE
             member.mode = 0o700
             archive.addfile(member)
-        hostile = tarfile.TarInfo(absolute_member)
+        hostile = tarfile.TarInfo(hostile_member)
         hostile.mode = 0o600
         hostile.size = len(private_payload)
         archive.addfile(hostile, io.BytesIO(private_payload))

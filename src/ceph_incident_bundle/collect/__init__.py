@@ -92,7 +92,7 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
             )
         try:
             for problem in problems:
-                print(problem, file=sys.stderr)
+                print(_terminal_safe(problem), file=sys.stderr)
         except Exception:
             # Returned problems still determine the bundle outcome when the
             # diagnostic stream itself is no longer writable.
