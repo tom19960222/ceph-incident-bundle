@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import pwd
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -540,12 +541,12 @@ request_timeout = 0
             )
         )
 
-    def test_probe_timeout_must_fit_the_process_wait_boundary(self) -> None:
-        timeout = "9" * 1000
+    def test_normalized_ssh_connect_timeout_must_be_renderable(self) -> None:
+        maximum_parseable_decimal = "9" * 4300
         inventory_bytes = (
             "[common]\n"
             "ssh_user = admin\n"
-            f"probe_timeout = {timeout}m\n"
+            f"ssh_connect_timeout = {maximum_parseable_decimal}m\n"
             "[nodes]\n"
             "node = node.example\n"
         ).encode("ascii")
@@ -559,10 +560,181 @@ request_timeout = 0
         self.assertIn("ssh_user must be exactly 'root'", caught.exception.problems)
         self.assertTrue(
             any(
+                problem.startswith("invalid ssh_connect_timeout")
+                for problem in caught.exception.problems
+            )
+        )
+
+    def test_ssh_connect_timeout_accepts_openssh_boundaries(self) -> None:
+        boundaries = (("0", 0), ("2147483647s", 2147483647))
+        for value, expected_seconds in boundaries:
+            with self.subTest(value=value), TemporaryDirectory() as directory:
+                path = Path(directory) / "inventory.ini"
+                path.write_text(
+                    "[common]\n"
+                    "ssh_user = root\n"
+                    f"ssh_connect_timeout = {value}\n"
+                    "[nodes]\n"
+                    "node = node.example\n",
+                    encoding="ascii",
+                )
+
+                inventory = load_inventory(path)
+
+            self.assertEqual(
+                inventory.ssh_connect_timeout_seconds, expected_seconds
+            )
+
+    def test_ssh_connect_timeout_must_fit_openssh_signed_int(self) -> None:
+        inventory_bytes = b"""\
+[common]
+ssh_user = admin
+ssh_connect_timeout = 2147483648s
+[nodes]
+node = node.example
+"""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertIn("ssh_user must be exactly 'root'", caught.exception.problems)
+        self.assertIn(
+            "invalid ssh_connect_timeout '2147483648s'",
+            caught.exception.problems,
+        )
+
+    def test_every_converted_inventory_duration_must_be_renderable(self) -> None:
+        maximum_parseable_decimal = "9" * 4300
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = root\n"
+            f"probe_timeout = {maximum_parseable_decimal}m\n"
+            "[nodes]\n"
+            "node = node.example\n"
+            "[prometheus]\n"
+            f"request_timeout = {maximum_parseable_decimal}h\n"
+        ).encode("ascii")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        for key in ("probe_timeout", "request_timeout"):
+            with self.subTest(key=key):
+                self.assertTrue(
+                    any(
+                        problem.startswith(f"invalid {key}")
+                        for problem in caught.exception.problems
+                    )
+                )
+
+    def test_query_step_is_preserved_without_normalizing_seconds(self) -> None:
+        maximum_parseable_decimal = "9" * 4300
+        query_step = f"{maximum_parseable_decimal}w"
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = root\n"
+            "[nodes]\n"
+            "node = node.example\n"
+            "[prometheus]\n"
+            f"query_step = {query_step}\n"
+        ).encode("ascii")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            inventory = load_inventory(path)
+
+        self.assertEqual(inventory.query_step, query_step)
+
+    def test_invalid_query_step_grammar_is_rejected(self) -> None:
+        inventory_bytes = b"""\
+[common]
+ssh_user = root
+[nodes]
+node = node.example
+[prometheus]
+query_step = 0
+"""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertIn("invalid query_step '0'", caught.exception.problems)
+
+    def test_probe_timeout_must_fit_the_process_wait_boundary(self) -> None:
+        float_overflowing_decimal = "9" * 1000
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = root\n"
+            f"probe_timeout = {float_overflowing_decimal}m\n"
+            "[nodes]\n"
+            "node = node.example\n"
+        ).encode("ascii")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertTrue(
+            any(
                 problem.startswith("invalid probe_timeout")
                 for problem in caught.exception.problems
             )
         )
+
+    def test_request_timeout_must_fit_the_url_request_boundary(self) -> None:
+        first_unrepresentable_timeout = int(threading.TIMEOUT_MAX) + 1
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = admin\n"
+            "[nodes]\n"
+            "node = node.example\n"
+            "[prometheus]\n"
+            f"request_timeout = {first_unrepresentable_timeout}s\n"
+        ).encode("ascii")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertIn("ssh_user must be exactly 'root'", caught.exception.problems)
+        self.assertTrue(
+            any(
+                problem.startswith("invalid request_timeout")
+                for problem in caught.exception.problems
+            )
+        )
+
+    def test_request_timeout_accepts_the_runtime_boundary(self) -> None:
+        maximum_timeout = int(threading.TIMEOUT_MAX)
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = root\n"
+            "[nodes]\n"
+            "node = node.example\n"
+            "[prometheus]\n"
+            f"request_timeout = {maximum_timeout}s\n"
+        ).encode("ascii")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            inventory = load_inventory(path)
+
+        self.assertEqual(inventory.request_timeout_seconds, maximum_timeout)
 
     def test_rejection_does_not_start_process_network_or_create_output(self) -> None:
         with TemporaryDirectory() as directory:

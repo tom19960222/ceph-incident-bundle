@@ -7,6 +7,7 @@ import ipaddress
 import math
 from pathlib import Path
 import re
+import threading
 import unicodedata
 from urllib.parse import urlsplit
 
@@ -21,6 +22,8 @@ _FIXED_KEYS = {
     "prometheus": {"url", "metrics_filter_regex", "query_step", "request_timeout"},
 }
 _SECONDS_PER_UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+# OpenSSH parses ConnectTimeout into a signed C int.
+_OPENSSH_CONNECT_TIMEOUT_MAX_SECONDS = 2_147_483_647
 # This fixed naming heuristic drafts configuration; it never discovers a live capability.
 _CEPH_SOURCE_NAME_SUBSTRINGS = ("mon", "cp", "cm")
 
@@ -216,6 +219,8 @@ def load_inventory(inventory_path: Path) -> Inventory:
         allow_zero=True,
         problems=problems,
     )
+    if ssh_connect_timeout_seconds > _OPENSSH_CONNECT_TIMEOUT_MAX_SECONDS:
+        problems.append(f"invalid ssh_connect_timeout '{ssh_connect_timeout}'")
 
     node_entries = sections.get("nodes", [])
     if "nodes" not in sections:
@@ -273,9 +278,8 @@ def load_inventory(inventory_path: Path) -> Inventory:
     except re.error as error:
         problems.append(f"invalid metrics_filter_regex: {error}")
     query_step = prometheus.get("query_step", "15s")
-    _duration_seconds(
-        "query_step", query_step, "smhdw", allow_zero=False, problems=problems
-    )
+    if re.fullmatch(r"[1-9][0-9]*[smhdw]", query_step, re.ASCII) is None:
+        problems.append(f"invalid query_step '{query_step}'")
     request_timeout = prometheus.get("request_timeout", "5m")
     request_timeout_seconds = _duration_seconds(
         "request_timeout",
@@ -284,6 +288,10 @@ def load_inventory(inventory_path: Path) -> Inventory:
         allow_zero=True,
         problems=problems,
     )
+    if request_timeout_seconds and not _fits_url_request_timeout(
+        request_timeout_seconds
+    ):
+        problems.append(f"invalid request_timeout '{request_timeout}'")
 
     if problems:
         raise InventoryRejected(problems)
@@ -361,12 +369,14 @@ def _duration_seconds(
         return 0
     try:
         magnitude = int(match.group(1))
+        seconds = magnitude * _SECONDS_PER_UNIT[match.group(2)]
+        # Downstream controls use canonical decimal seconds.  Form that value
+        # here so CPython's integer digit limit cannot fail after startup.
+        str(seconds)
     except ValueError:
-        # A decimal rejected by CPython's digit-limit is invalid Inventory input,
-        # not an interpreter failure that should escape complete validation.
         problems.append(f"invalid {key} '{value}'")
         return 0
-    return magnitude * _SECONDS_PER_UNIT[match.group(2)]
+    return seconds
 
 
 def _fits_process_wait_timeout(seconds: int) -> bool:
@@ -375,6 +385,11 @@ def _fits_process_wait_timeout(seconds: int) -> bool:
         return math.isfinite(float(seconds))
     except OverflowError:
         return False
+
+
+def _fits_url_request_timeout(seconds: int) -> bool:
+    """Return whether CPython's socket-backed timeout can use seconds."""
+    return seconds <= int(threading.TIMEOUT_MAX)
 
 
 def _is_ssh_address(value: str) -> bool:
