@@ -236,6 +236,27 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
             self.assertTrue((contribution / "node/files").is_dir())
             self.assertTrue((contribution / "ceph/probes").is_dir())
 
+    def test_ceph_directory_is_permitted_not_required_when_allowed(self) -> None:
+        # Even when the workstation allows ceph evidence, a Target Node that
+        # offers only ordinary node evidence must still be admitted in full:
+        # ``ceph/`` is a permission, not a requirement.
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            staging = workspace / "private" / "node-a"
+            staging.mkdir(parents=True)
+            archive = staging / "received.tar.gz"
+            extraction = staging / "extracted"
+            contribution = workspace / "admitted" / "node-a"
+            contribution.parent.mkdir()
+            write_archive(archive, BASE_MEMBERS)
+
+            admit_archive(archive, extraction, contribution, ceph_allowed=True)
+
+            self.assertFalse(extraction.exists())
+            self.assertTrue((contribution / "node/files").is_dir())
+            self.assertTrue((contribution / "node/probes").is_dir())
+            self.assertFalse((contribution / "ceph").exists())
+
     def test_every_unsafe_archive_is_rejected_before_extraction(self) -> None:
         hostile_members = {
             "absolute": [("/escape", b"x")],
@@ -617,7 +638,10 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
         cases = (
             ([("node", None), ("node/probes", None)], False),
             ([*BASE_MEMBERS, ("ceph", None), ("ceph/probes", None)], False),
-            (BASE_MEMBERS, True),
+            # ``ceph/`` present without its required ``ceph/probes`` is still
+            # rejected even though the workstation allows ceph evidence: once
+            # offered, ``ceph/`` must be structurally complete.
+            ([*BASE_MEMBERS, ("ceph", None)], True),
         )
         for members, ceph_allowed in cases:
             with self.subTest(ceph_allowed=ceph_allowed, members=members), TemporaryDirectory() as directory:

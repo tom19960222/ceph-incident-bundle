@@ -291,14 +291,24 @@ def _validate_members(
         ("node", "probes"),
         ("node", "files"),
     }
-    if ceph_allowed:
-        required_directories.update({("ceph",), ("ceph", "probes")})
     for required in required_directories:
         member = by_path.get(required)
         if member is None or not member.isdir():
             raise ArchiveRejected(
                 f"missing required archive directory: {'/'.join(required)}"
             )
+
+    # ``ceph/`` is permitted when the workstation allows it, never required: a
+    # Target Node may still contribute only ordinary ``node/`` evidence.  When
+    # ``ceph/`` is present, its own structure is validated exactly like any
+    # other required directory so a partial or malformed ``ceph/`` is rejected.
+    if ("ceph",) in by_path:
+        for required in (("ceph",), ("ceph", "probes")):
+            member = by_path.get(required)
+            if member is None or not member.isdir():
+                raise ArchiveRejected(
+                    f"missing required archive directory: {'/'.join(required)}"
+                )
 
     for components, member in by_path.items():
         for length in range(1, len(components)):
