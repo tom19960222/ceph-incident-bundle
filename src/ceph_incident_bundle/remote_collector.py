@@ -15,13 +15,34 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from typing import NamedTuple
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _run_hostname(capture: Path, timeout_seconds: int) -> bool:
+class Probe(NamedTuple):
+    """One built-in Evidence Probe: a stable name, area, and fixed argv.
+
+    The Remote Node Collector is a self-contained payload streamed unchanged
+    over SSH, so this catalog is declared here rather than imported from the
+    workstation package.
+    """
+
+    name: str
+    area: str
+    argv: tuple[str, ...]
+
+
+# Fixed Target Node Probe catalog. See docs/python-rewrite-spec.md's "Fixed
+# Target Node Probe catalog" table for the built-in name/argv contract.
+NODE_PROBE_CATALOG: tuple[Probe, ...] = (
+    Probe(name="hostname", area="node", argv=("hostname",)),
+)
+
+
+def _run_probe(probe: Probe, capture: Path, timeout_seconds: int) -> bool:
     capture.mkdir(parents=True)
     started_at = _utc_now()
     outcome = "exited"
@@ -33,7 +54,7 @@ def _run_hostname(capture: Path, timeout_seconds: int) -> bool:
     ).open("xb") as stderr_file:
         try:
             process = subprocess.Popen(
-                ["hostname"],
+                list(probe.argv),
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
                 stderr=stderr_file,
@@ -55,7 +76,7 @@ def _run_hostname(capture: Path, timeout_seconds: int) -> bool:
                 process.wait()
                 error = {
                     "kind": "timeout",
-                    "message": f"hostname exceeded {timeout_seconds} seconds",
+                    "message": f"{probe.name} exceeded {timeout_seconds} seconds",
                 }
             except (OverflowError, ValueError) as wait_error:
                 exit_code = process.poll()
@@ -65,12 +86,14 @@ def _run_hostname(capture: Path, timeout_seconds: int) -> bool:
                     process.wait()
                     error = {
                         "kind": "timeout",
-                        "message": f"cannot apply hostname timeout: {wait_error}",
+                        "message": (
+                            f"cannot apply {probe.name} timeout: {wait_error}"
+                        ),
                     }
 
     finished_at = _utc_now()
     result = {
-        "argv": ["hostname"],
+        "argv": list(probe.argv),
         "started_at": started_at,
         "finished_at": finished_at,
         "outcome": outcome,
@@ -84,7 +107,7 @@ def _run_hostname(capture: Path, timeout_seconds: int) -> bool:
     succeeded = outcome == "exited" and exit_code == 0
     if not succeeded:
         print(
-            f"hostname Probe failed: outcome={outcome} exit_code={exit_code}",
+            f"{probe.name} Probe failed: outcome={outcome} exit_code={exit_code}",
             file=sys.stderr,
         )
     return succeeded
@@ -153,16 +176,20 @@ def main() -> int:
         if arguments.collect_ceph:
             (workspace / "ceph" / "probes").mkdir(parents=True)
 
-        try:
-            succeeded = _run_hostname(
-                node / "probes" / "hostname", arguments.probe_timeout_seconds
-            )
-        except OSError as capture_error:
-            print(
-                f"cannot preserve hostname Probe Capture: {capture_error}",
-                file=sys.stderr,
-            )
-            succeeded = False
+        for probe in NODE_PROBE_CATALOG:
+            try:
+                probe_succeeded = _run_probe(
+                    probe,
+                    node / "probes" / probe.name,
+                    arguments.probe_timeout_seconds,
+                )
+            except OSError as capture_error:
+                print(
+                    f"cannot preserve {probe.name} Probe Capture: {capture_error}",
+                    file=sys.stderr,
+                )
+                probe_succeeded = False
+            succeeded = succeeded and probe_succeeded
         try:
             _stream_archive(workspace)
         except (OSError, tarfile.TarError) as archive_error:

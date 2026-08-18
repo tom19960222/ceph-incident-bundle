@@ -7,6 +7,8 @@ import tarfile
 from tempfile import TemporaryDirectory
 import unittest
 
+from ceph_incident_bundle.remote_collector import NODE_PROBE_CATALOG
+
 
 REMOTE_COLLECTOR = (
     Path(__file__).parents[2]
@@ -17,6 +19,15 @@ REMOTE_COLLECTOR = (
 
 
 class RemoteCollectorTests(unittest.TestCase):
+    def test_node_probe_catalog_is_exactly_the_hostname_tracer(self) -> None:
+        # Expected (name, area, argv) is enumerated by hand here, independent
+        # of the production catalog's own definition, so this fails if the
+        # catalog silently drifts (extra Probes, renamed area, changed argv).
+        expected = (
+            ("hostname", "node", ("hostname",)),
+        )
+        self.assertEqual(NODE_PROBE_CATALOG, expected)
+
     def test_hostname_probe_is_streamed_as_a_complete_node_archive(self) -> None:
         completed = subprocess.run(
             [
