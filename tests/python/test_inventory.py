@@ -517,6 +517,30 @@ request_timeout = 0
         self.assertEqual(inventory.query_step, "1w")
         self.assertEqual(inventory.request_timeout_seconds, 0)
 
+    def test_enormous_duration_is_a_focused_inventory_rejection(self) -> None:
+        enormous = "9" * 5000
+        inventory_bytes = (
+            "[common]\n"
+            "ssh_user = admin\n"
+            f"probe_timeout = {enormous}m\n"
+            "[nodes]\n"
+            "node = node.example\n"
+        ).encode("ascii")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertIn("ssh_user must be exactly 'root'", caught.exception.problems)
+        self.assertTrue(
+            any(
+                problem.startswith("invalid probe_timeout")
+                for problem in caught.exception.problems
+            )
+        )
+
     def test_normalized_ssh_connect_timeout_must_be_renderable(self) -> None:
         maximum_parseable_decimal = "9" * 4300
         inventory_bytes = (
