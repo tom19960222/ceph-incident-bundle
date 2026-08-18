@@ -826,6 +826,75 @@ node-a = node-a.example.test
         self.assertEqual(output_entries, [bundle])
         self.assertEqual(workspaces, [])
 
+    def test_delivered_bundle_stays_delivered_when_cleanup_problem_stderr_write_fails(
+        self,
+    ) -> None:
+        inventory = b"""\
+[common]
+ssh_user = root
+[nodes]
+node-a = node-a.example.test
+"""
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            output = cwd / "output"
+            output.mkdir()
+            temporary_root = cwd / "temporary"
+            temporary_root.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+            environment["FAKE_SSH_LOCK_WORKSPACE_PARENT"] = "1"
+            environment["TMPDIR"] = str(temporary_root)
+            environment["PYTHONUNBUFFERED"] = "1"
+            command = COMMAND
+            assert command is not None
+
+            read_descriptor, write_descriptor = os.pipe()
+            os.close(read_descriptor)
+            try:
+                completed = subprocess.run(
+                    [command, "collect", "--output-dir", str(output)],
+                    cwd=cwd,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=write_descriptor,
+                    check=False,
+                )
+            finally:
+                os.close(write_descriptor)
+                # Publication left the workstation workspace's parent
+                # non-writable on purpose; restore it or the surrounding
+                # ``TemporaryDirectory`` cleanup (and later tests) would break.
+                temporary_root.chmod(0o755)
+
+            bundles = list(output.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            bundle = bundles[0]
+            with tarfile.open(bundle, "r:gz") as archive:
+                root = bundle.name.removesuffix(".tar.gz")
+                metadata_file = archive.extractfile(f"{root}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+            output_entries = list(output.iterdir())
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stdout,
+            f"{bundle.resolve()} (partial)\n".encode("utf-8"),
+        )
+        self.assertEqual(outcome, "partial")
+        self.assertEqual(output_entries, [bundle])
+        # The locked parent really did leave a residual, unremovable
+        # workspace behind; this is the genuine cleanup problem the bundle
+        # must survive, not merely a no-op hook.
+        self.assertEqual(len(workspaces), 1)
+
     def test_complete_archive_is_admitted_when_ssh_diagnostics_cannot_be_written(
         self,
     ) -> None:
@@ -1418,6 +1487,16 @@ if precreate_extraction:
 remove_output = os.environ.get("FAKE_REMOVE_OUTPUT_DIR")
 if remove_output:
     Path(remove_output).rmdir()
+lock_workspace_parent = os.environ.get("FAKE_SSH_LOCK_WORKSPACE_PARENT")
+if lock_workspace_parent:
+    temporary_root = Path(os.environ["TMPDIR"])
+    workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+    if len(workspaces) != 1:
+        raise RuntimeError("expected one workstation workspace")
+    # Removing write permission on the workspace's parent leaves the workspace's
+    # own contents removable but makes the final ``rmdir`` of the now-empty
+    # workspace fail, reproducing a genuine post-publication cleanup problem.
+    temporary_root.chmod(0o555)
 if os.environ.get("FAKE_SSH_CORRUPT"):
     sys.stdout.buffer.write(b"not-an-archive")
     raise SystemExit(0)

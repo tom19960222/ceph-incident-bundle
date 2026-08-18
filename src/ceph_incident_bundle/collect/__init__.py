@@ -34,9 +34,15 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
     )
     if startup_problems:
         return _nondelivery(startup_problems, status=1)
-    assert inventory is not None
-    assert since_seconds is not None
-    assert output is not None
+    if inventory is None or since_seconds is None or output is None:
+        # ``_validate_startup`` guarantees these once it reports no problems.
+        # This stays an explicit raise (rather than ``assert``) so it still
+        # fails loudly under ``python -O``, where ``assert`` is stripped and
+        # the ``None`` case would otherwise proceed silently.
+        raise RuntimeError(
+            "internal error: startup validation reported success without "
+            "an Inventory, evidence window, or output directory"
+        )
 
     started_at = datetime.now(timezone.utc).replace(microsecond=0)
     final_path = output / (
@@ -109,7 +115,12 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
         )
         if cleanup_problem is not None:
             problems.append(cleanup_problem)
-            print(cleanup_problem, file=sys.stderr)
+            try:
+                print(_terminal_safe(cleanup_problem), file=sys.stderr)
+            except Exception:
+                # Returned problems still determine the bundle outcome when the
+                # diagnostic stream itself is no longer writable.
+                pass
         outcome = "partial" if problems else "complete"
         try:
             print(f"{final_path} ({outcome})")
