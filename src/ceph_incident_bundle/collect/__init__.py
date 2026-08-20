@@ -17,6 +17,7 @@ from .bundle import (
     OWNERSHIP_MARKER,
     publish_bundle,
 )
+from .kubernetes import collect_kubernetes
 from .node import collect_node
 
 
@@ -72,8 +73,6 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
         contributions = workspace / "admitted" / "node-contributions"
         private_nodes.mkdir(parents=True)
         contributions.mkdir(parents=True)
-        (workspace / "admitted" / "kubernetes").mkdir()
-        (workspace / "admitted" / "prometheus").mkdir()
         (workspace / "admitted" / "inventory.ini").write_bytes(inventory.snapshot)
 
         problems: list[str] = []
@@ -96,6 +95,29 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
                     f"Target Node {node.inventory_name}: unexpected collection failure: "
                     f"{_terminal_safe(str(error))}"
                 )
+
+        kubernetes_contribution = workspace / "admitted" / "kubernetes"
+        if inventory.kubernetes_context is not None:
+            try:
+                problems.extend(
+                    collect_kubernetes(
+                        context=inventory.kubernetes_context,
+                        consumer_namespace=inventory.consumer_namespace,
+                        operator_namespace=inventory.operator_namespace,
+                        probe_timeout_seconds=inventory.probe_timeout_seconds,
+                        staging_directory=workspace / "private" / "kubernetes",
+                        contribution_directory=kubernetes_contribution,
+                    )
+                )
+            except Exception as error:
+                problems.append(
+                    "Kubernetes: unexpected collection failure: "
+                    f"{_terminal_safe(str(error))}"
+                )
+        if not kubernetes_contribution.exists():
+            kubernetes_contribution.mkdir()
+        (workspace / "admitted" / "prometheus").mkdir()
+
         try:
             for problem in problems:
                 print(_terminal_safe(problem), file=sys.stderr)
