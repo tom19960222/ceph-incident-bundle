@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import errno
 import json
 import math
@@ -22,6 +22,15 @@ from typing import NamedTuple
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _epoch_nanoseconds(moment: datetime) -> int:
+    """Convert an aware UTC instant without float rounding at mtime boundaries."""
+    since_epoch = moment - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (
+        (since_epoch.days * 86_400 + since_epoch.seconds) * 1_000_000_000
+        + since_epoch.microseconds * 1_000
+    )
 
 
 class Probe(NamedTuple):
@@ -116,6 +125,7 @@ FIXED_CONFIGURATION_FILES: tuple[str, ...] = (
     "/etc/systemd/timesyncd.conf",
 )
 TIMESYNCD_DROP_IN_DIRECTORY = "/etc/systemd/timesyncd.conf.d"
+VAR_LOG_DIRECTORY = "/var/log"
 
 
 def _open_directory_without_links(path: str) -> int | None:
@@ -166,7 +176,10 @@ def _open_directory_without_links(path: str) -> int | None:
 
 
 def _copy_selected_file(
-    source: str, files_directory: Path, was_selected: bool = False
+    source: str,
+    files_directory: Path,
+    was_selected: bool = False,
+    minimum_mtime_ns: int | None = None,
 ) -> bool:
     """Copy one selected source only when both checks see a regular file.
 
@@ -251,7 +264,17 @@ def _copy_selected_file(
                     return True
             print(f"cannot open selected file {source}: {open_error}", file=sys.stderr)
             return False
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        try:
+            opened = os.fstat(descriptor)
+        except OSError as inspect_error:
+            print(
+                f"cannot inspect opened selected file {source}: {inspect_error}",
+                file=sys.stderr,
+            )
+            return False
+        if not stat.S_ISREG(opened.st_mode):
+            return True
+        if minimum_mtime_ns is not None and opened.st_mtime_ns < minimum_mtime_ns:
             return True
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -326,6 +349,143 @@ def _copy_configuration_files(files_directory: Path) -> bool:
             source, files_directory, was_selected=True
         )
         succeeded = file_succeeded and succeeded
+    return succeeded
+
+
+def _copy_log_files(files_directory: Path, cutoff_epoch_ns: int) -> bool:
+    """Copy every regular /var/log file selected by one node-local cutoff."""
+    try:
+        directory_descriptor = _open_directory_without_links(VAR_LOG_DIRECTORY)
+    except OSError as inspect_error:
+        print(
+            f"cannot inspect log directory {VAR_LOG_DIRECTORY}: {inspect_error}",
+            file=sys.stderr,
+        )
+        return False
+    if directory_descriptor is None:
+        return True
+    try:
+        return _copy_log_directory(
+            directory_descriptor,
+            VAR_LOG_DIRECTORY,
+            files_directory,
+            cutoff_epoch_ns,
+        )
+    finally:
+        try:
+            os.close(directory_descriptor)
+        except OSError:
+            pass
+
+
+def _directory_became_an_omitted_object(
+    parent_descriptor: int, entry_name: str
+) -> bool:
+    """Return whether a selected directory is now a link or non-directory."""
+    try:
+        inspected = os.stat(
+            entry_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    except OSError:
+        try:
+            os.readlink(entry_name, dir_fd=parent_descriptor)
+        except OSError:
+            return False
+        return True
+    return not stat.S_ISDIR(inspected.st_mode)
+
+
+def _copy_log_directory(
+    directory_descriptor: int,
+    source_directory: str,
+    files_directory: Path,
+    cutoff_epoch_ns: int,
+) -> bool:
+    succeeded = True
+    try:
+        with os.scandir(directory_descriptor) as scanner:
+            entries = tuple(sorted(scanner, key=lambda entry: entry.name))
+    except OSError as inspect_error:
+        print(
+            f"cannot inspect log directory {source_directory}: {inspect_error}",
+            file=sys.stderr,
+        )
+        return False
+
+    for entry in entries:
+        source = f"{source_directory}/{entry.name}"
+        try:
+            inspected = entry.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as inspect_error:
+            print(
+                f"cannot inspect log source {source}: {inspect_error}",
+                file=sys.stderr,
+            )
+            succeeded = False
+            continue
+
+        if stat.S_ISREG(inspected.st_mode):
+            if inspected.st_mtime_ns >= cutoff_epoch_ns:
+                copied = _copy_selected_file(
+                    source,
+                    files_directory,
+                    was_selected=True,
+                    minimum_mtime_ns=cutoff_epoch_ns,
+                )
+                succeeded = copied and succeeded
+            continue
+        if not stat.S_ISDIR(inspected.st_mode):
+            continue
+
+        try:
+            child_descriptor = os.open(
+                entry.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_descriptor,
+            )
+        except (FileNotFoundError, NotADirectoryError) as open_error:
+            if _directory_became_an_omitted_object(
+                directory_descriptor, entry.name
+            ):
+                continue
+            print(
+                f"cannot open log directory {source}: {open_error}",
+                file=sys.stderr,
+            )
+            succeeded = False
+            continue
+        except OSError as open_error:
+            if open_error.errno in (errno.ELOOP, errno.EPERM) and (
+                _directory_became_an_omitted_object(
+                    directory_descriptor, entry.name
+                )
+            ):
+                continue
+            print(
+                f"cannot open log directory {source}: {open_error}",
+                file=sys.stderr,
+            )
+            succeeded = False
+            continue
+        try:
+            copied = _copy_log_directory(
+                child_descriptor,
+                source,
+                files_directory,
+                cutoff_epoch_ns,
+            )
+            succeeded = copied and succeeded
+        finally:
+            try:
+                os.close(child_descriptor)
+            except OSError:
+                pass
     return succeeded
 
 
@@ -493,6 +653,39 @@ def main() -> int:
                 probe_succeeded = False
             succeeded = succeeded and probe_succeeded
         succeeded = _copy_configuration_files(files) and succeeded
+        log_cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=arguments.since_seconds
+        )
+        journal_probe = Probe(
+            name="journal-system",
+            area="node",
+            argv=(
+                "journalctl",
+                "--since",
+                log_cutoff.isoformat().replace("+00:00", "Z"),
+                "--no-pager",
+                "--utc",
+                "--output=short-iso-precise",
+            ),
+        )
+        try:
+            journal_succeeded = _run_probe(
+                journal_probe,
+                node / "probes" / journal_probe.name,
+                arguments.probe_timeout_seconds,
+            )
+        except OSError as capture_error:
+            print(
+                "cannot preserve journal-system Probe Capture: "
+                f"{capture_error}",
+                file=sys.stderr,
+            )
+            journal_succeeded = False
+        succeeded = succeeded and journal_succeeded
+        succeeded = _copy_log_files(
+            files,
+            _epoch_nanoseconds(log_cutoff),
+        ) and succeeded
         try:
             _stream_archive(workspace)
         except (OSError, tarfile.TarError) as archive_error:
