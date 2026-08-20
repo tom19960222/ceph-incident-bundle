@@ -41,8 +41,166 @@ consumer_namespace = rook-consumer
 operator_namespace = rook-operator
 """
 
+PROMETHEUS_INVENTORY = b"""\
+[common]
+ssh_user = root
+[nodes]
+node-a = node-a.example.test
+[kubernetes]
+context = lab-blue
+[prometheus]
+url = http://127.0.0.1:19090/prometheus
+request_timeout = 7s
+"""
+
 
 class TopLevelCollectionTests(unittest.TestCase):
+    def test_absent_prometheus_url_skips_capability_cleanly(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
+                patch(
+                    "ceph_incident_bundle.collect.collect_prometheus"
+                ) as prometheus_operation,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            bundle = next(root.glob("ceph-incident-bundle-*.tar.gz"))
+            with tarfile.open(bundle, "r:gz") as archive:
+                root_name = bundle.name.removesuffix(".tar.gz")
+                prometheus_members = [
+                    member.name
+                    for member in archive.getmembers()
+                    if member.name.startswith(f"{root_name}/prometheus")
+                ]
+
+        self.assertEqual(status, 0)
+        prometheus_operation.assert_not_called()
+        self.assertEqual(prometheus_members, [f"{root_name}/prometheus"])
+        self.assertTrue(stdout.getvalue().endswith(" (complete)\n"))
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_prometheus_runs_after_kubernetes_with_shared_window_controls(self) -> None:
+        events: list[str] = []
+
+        def node_operation(*args: object, **kwargs: object) -> list[str]:
+            events.append("node")
+            return []
+
+        def kubernetes_operation(*args: object, **kwargs: object) -> list[str]:
+            events.append("kubernetes")
+            contribution = Path(str(kwargs["contribution_directory"]))
+            (contribution / "probes").mkdir(parents=True)
+            return []
+
+        def prometheus_operation(*args: object, **kwargs: object) -> list[str]:
+            events.append("prometheus")
+            contribution = Path(str(kwargs["contribution_directory"]))
+            (contribution / "buildinfo").mkdir(parents=True)
+            return ["Prometheus buildinfo request failed: timeout: stalled"]
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(PROMETHEUS_INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.collect_node",
+                    side_effect=node_operation,
+                ),
+                patch(
+                    "ceph_incident_bundle.collect.collect_kubernetes",
+                    side_effect=kubernetes_operation,
+                ),
+                patch(
+                    "ceph_incident_bundle.collect.collect_prometheus",
+                    side_effect=prometheus_operation,
+                ) as prometheus,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "2d", root)
+
+            call = prometheus.call_args
+
+        self.assertEqual(status, 0)
+        self.assertEqual(events, ["node", "kubernetes", "prometheus"])
+        self.assertEqual(call.kwargs["url"], "http://127.0.0.1:19090/prometheus")
+        self.assertEqual(call.kwargs["since_seconds"], 172800)
+        self.assertEqual(call.kwargs["request_timeout_seconds"], 7)
+        self.assertEqual(call.kwargs["staging_directory"].name, "prometheus")
+        self.assertEqual(call.kwargs["contribution_directory"].name, "prometheus")
+        self.assertTrue(stdout.getvalue().endswith(" (partial)\n"))
+        self.assertIn("Prometheus buildinfo request failed", stderr.getvalue())
+
+    def test_unexpected_prometheus_exception_keeps_private_staging_out_of_bundle(
+        self,
+    ) -> None:
+        def failed_prometheus(*args: object, **kwargs: object) -> list[str]:
+            staging = Path(str(kwargs["staging_directory"]))
+            capture = staging / "incomplete" / "buildinfo"
+            capture.mkdir(parents=True)
+            (capture / "response").write_bytes(b"must stay private")
+            raise RuntimeError("HTTP boundary failed\nsecond line")
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(PROMETHEUS_INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
+                patch("ceph_incident_bundle.collect.collect_kubernetes", return_value=[]),
+                patch(
+                    "ceph_incident_bundle.collect.collect_prometheus",
+                    side_effect=failed_prometheus,
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            bundle = next(root.glob("ceph-incident-bundle-*.tar.gz"))
+            with tarfile.open(bundle, "r:gz") as archive:
+                root_name = bundle.name.removesuffix(".tar.gz")
+                metadata_file = archive.extractfile(f"{root_name}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+                prometheus_members = [
+                    member.name
+                    for member in archive.getmembers()
+                    if member.name.startswith(f"{root_name}/prometheus")
+                ]
+                private_members = [
+                    member.name
+                    for member in archive.getmembers()
+                    if "incomplete" in member.name or "/private/" in member.name
+                ]
+
+        self.assertEqual(status, 0)
+        self.assertEqual(outcome, "partial")
+        self.assertEqual(prometheus_members, [f"{root_name}/prometheus"])
+        self.assertEqual(private_members, [])
+        self.assertTrue(stdout.getvalue().endswith(" (partial)\n"))
+        self.assertIn(
+            "Prometheus: unexpected collection failure: "
+            "HTTP boundary failed\\x0asecond line",
+            stderr.getvalue(),
+        )
+
     def test_absent_kubernetes_context_skips_capability_cleanly(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

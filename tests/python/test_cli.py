@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -7,7 +9,9 @@ import subprocess
 import sys
 import tarfile
 from tempfile import TemporaryDirectory
+import threading
 import unittest
+from urllib.parse import urlsplit
 
 from ceph_incident_bundle.inventory import draft_inventory
 
@@ -33,6 +37,49 @@ KUBERNETES_PODS = {
         }
     ],
 }
+
+
+class _InstalledPrometheusHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self) -> None:
+        server = self.server
+        assert isinstance(server, _InstalledPrometheusServer)
+        server.requests.append((self.command, self.path))
+        path = urlsplit(self.path).path
+        bodies = {
+            "/api/v1/status/buildinfo": b'{"status":"success","data":{"version":"3.0"}}',
+            "/api/v1/targets": b'{"status":"success","data":{"activeTargets":[]}}',
+            "/api/v1/label/job/values": b'{"status":"success","data":["other","node-exporter"]}',
+            "/api/v1/label/__name__/values": b'{"status":"success","data":["node_cpu_seconds_total"]}',
+        }
+        body = bodies[path]
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+class _InstalledPrometheusServer(ThreadingHTTPServer):
+    requests: list[tuple[str, str]]
+
+
+@contextmanager
+def _installed_prometheus_server():
+    server = _InstalledPrometheusServer(("127.0.0.1", 0), _InstalledPrometheusHandler)
+    server.requests = []
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield server, f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def missing_username_without_a_home() -> str:
@@ -757,6 +804,77 @@ node-a = node-a.example.test
         self.assertTrue(all(member.isdir() or member.isreg() for member in members))
         for top_level in ("nodes", "ceph", "kubernetes", "prometheus"):
             self.assertIn(f"{root}/{top_level}", names)
+
+    def test_installed_collect_preserves_prometheus_controls_from_loopback(self) -> None:
+        with _installed_prometheus_server() as (
+            server,
+            prometheus_url,
+        ), TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            inventory = (
+                "[common]\n"
+                "ssh_user = root\n"
+                "[nodes]\n"
+                "node-a = node-a.example.test\n"
+                "[prometheus]\n"
+                f"url = {prometheus_url}\n"
+                "request_timeout = 1s\n"
+            ).encode("ascii")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+
+            completed = self.run_cli(
+                "collect", cwd=cwd, env=environment, timeout=30
+            )
+
+            requests = list(server.requests)
+            bundle = next(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            root_name = bundle.name.removesuffix(".tar.gz")
+            with tarfile.open(bundle, "r:gz") as archive:
+                names = {member.name for member in archive.getmembers()}
+                job_values_file = archive.extractfile(
+                    f"{root_name}/prometheus/job-values/response"
+                )
+                metric_result_file = archive.extractfile(
+                    f"{root_name}/prometheus/metric-names/000001/result.json"
+                )
+                metadata_file = archive.extractfile(f"{root_name}/collection.json")
+                assert job_values_file is not None
+                assert metric_result_file is not None
+                assert metadata_file is not None
+                job_values = job_values_file.read()
+                metric_result = json.load(metric_result_file)
+                outcome = json.load(metadata_file)["outcome"]
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stderr, b"")
+        self.assertEqual(
+            completed.stdout,
+            f"{bundle.resolve()} (complete)\n".encode("utf-8"),
+        )
+        self.assertEqual([method for method, _ in requests], ["GET"] * 4)
+        self.assertEqual(
+            [urlsplit(request).path for _, request in requests],
+            [
+                "/api/v1/status/buildinfo",
+                "/api/v1/targets",
+                "/api/v1/label/job/values",
+                "/api/v1/label/__name__/values",
+            ],
+        )
+        self.assertEqual(
+            job_values,
+            b'{"status":"success","data":["other","node-exporter"]}',
+        )
+        self.assertEqual(metric_result["job_name"], "node-exporter")
+        self.assertEqual(metric_result["outcome"], "received")
+        self.assertEqual(outcome, "complete")
+        self.assertIn(f"{root_name}/prometheus/buildinfo/response", names)
 
     def test_installed_collect_captures_configured_kubernetes_get_snapshot(self) -> None:
         inventory = b"""\

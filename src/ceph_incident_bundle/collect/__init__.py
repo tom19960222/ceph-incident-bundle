@@ -19,6 +19,7 @@ from .bundle import (
 )
 from .kubernetes import collect_kubernetes
 from .node import collect_node
+from .prometheus import collect_prometheus
 
 
 _EVIDENCE_WINDOW = re.compile(r"([1-9][0-9]*)([mhdw])\Z", re.ASCII)
@@ -117,7 +118,25 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
                 )
         if not kubernetes_contribution.exists():
             kubernetes_contribution.mkdir()
-        (workspace / "admitted" / "prometheus").mkdir()
+        prometheus_contribution = workspace / "admitted" / "prometheus"
+        if inventory.prometheus_url is not None:
+            try:
+                problems.extend(
+                    collect_prometheus(
+                        url=inventory.prometheus_url,
+                        since_seconds=since_seconds,
+                        request_timeout_seconds=inventory.request_timeout_seconds,
+                        staging_directory=workspace / "private" / "prometheus",
+                        contribution_directory=prometheus_contribution,
+                    )
+                )
+            except Exception as error:
+                problems.append(
+                    "Prometheus: unexpected collection failure: "
+                    f"{_terminal_safe(str(error))}"
+                )
+        if not prometheus_contribution.exists():
+            prometheus_contribution.mkdir()
 
         try:
             for problem in problems:
