@@ -698,6 +698,302 @@ os.write(1, b"2026-08-21T00:00:00Z\\n")
         self.assertEqual(current_utc_result["exit_code"], 0)
         self.assertIn(b"hostname Probe failed", completed.stderr)
 
+    def test_fixed_configuration_files_are_copied_as_raw_regular_bytes(self) -> None:
+        payloads = {
+            "/etc/os-release": b'NAME="test"\n',
+            "/etc/hosts": b"127.0.0.1 localhost\x00\xff\n",
+            "/etc/resolv.conf": b"nameserver 192.0.2.53\n",
+            "/etc/chrony.conf": b"keyfile /etc/chrony.keys\n",
+            "/etc/chrony/chrony.conf": b"pool example.test\n",
+            "/etc/systemd/timesyncd.conf": b"[Time]\n",
+            "/etc/systemd/timesyncd.conf.d/direct.conf": (
+                b"[Time]\nNTP=198.51.100.1\x00credential=secret\xff\n"
+            ),
+        }
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            source_root = root / "sources"
+            for source, payload in payloads.items():
+                fixture = source_root / source.removeprefix("/")
+                fixture.parent.mkdir(parents=True, exist_ok=True)
+                fixture.write_bytes(payload)
+            hard_link_target = source_root / "hard-link-target"
+            hard_link_target.write_bytes(payloads["/etc/hosts"])
+            hosts_fixture = source_root / "etc/hosts"
+            hosts_fixture.unlink()
+            os.link(hard_link_target, hosts_fixture)
+            drop_in_directory = source_root / "etc/systemd/timesyncd.conf.d"
+            (drop_in_directory / "ignored.txt").write_bytes(b"out of selection")
+            (drop_in_directory / "nested.conf").mkdir()
+            os.mkfifo(drop_in_directory / "special.conf")
+            os.symlink("direct.conf", drop_in_directory / "linked.conf")
+            sitecustomize = root / "sitecustomize.py"
+            sitecustomize.write_text(
+                """import os
+from pathlib import Path
+
+_source_root = os.environ[\"REMOTE_COLLECTOR_FILE_FIXTURES\"]
+_original_open = os.open
+_original_stat = os.stat
+_original_fdopen = os.fdopen
+_original_path_open = Path.open
+_fail_lstat = os.environ.get(\"REMOTE_COLLECTOR_FAIL_LSTAT\")
+_fail_open = os.environ.get(\"REMOTE_COLLECTOR_FAIL_OPEN\")
+_fail_read = os.environ.get(\"REMOTE_COLLECTOR_FAIL_READ\")
+_fail_write_suffix = os.environ.get(\"REMOTE_COLLECTOR_FAIL_WRITE_SUFFIX\")
+_race_open = os.environ.get(\"REMOTE_COLLECTOR_RACE_OPEN\")
+_drop_in_disappears = os.environ.get(
+    \"REMOTE_COLLECTOR_DROP_IN_DISAPPEARS_AFTER_SELECTION\"
+)
+_raced = False
+_drop_in_open_count = 0
+_read_descriptor = None
+
+def _name(path):
+    return os.fspath(path).rsplit(\"/\", 1)[-1]
+
+def stat(path, *args, **kwargs):
+    if _fail_lstat and _name(path) == _name(_fail_lstat):
+        raise PermissionError(\"fixture inspection failure\")
+    return _original_stat(path, *args, **kwargs)
+
+def open(path, flags, *args, **kwargs):
+    global _raced, _drop_in_open_count, _read_descriptor
+    source = os.fspath(path)
+    if source == \"/\" and flags & os.O_DIRECTORY:
+        return _original_open(_source_root, flags, *args, **kwargs)
+    if _fail_open and _name(source) == _name(_fail_open):
+        raise PermissionError(\"fixture open failure\")
+    if _race_open and _name(source) == _name(_race_open) and not _raced:
+        _raced = True
+        fixture = os.path.join(_source_root, _race_open.lstrip(\"/\"))
+        target = fixture + \"-after-race\"
+        os.rename(fixture, target)
+        os.symlink(os.path.basename(target), fixture)
+    if _drop_in_disappears and source == \"timesyncd.conf.d\":
+        _drop_in_open_count += 1
+        if _drop_in_open_count == 2:
+            fixture = os.path.join(_source_root, \"etc/systemd/timesyncd.conf.d\")
+            os.rename(fixture, fixture + \"-after-selection\")
+    descriptor = _original_open(path, flags, *args, **kwargs)
+    if _fail_read and _name(source) == _name(_fail_read):
+        _read_descriptor = descriptor
+    return descriptor
+
+class _BrokenRead:
+    def __init__(self, opened):
+        self._opened = opened
+    def __enter__(self):
+        return self
+    def __exit__(self, *unused):
+        self._opened.close()
+    def read(self, *unused):
+        raise OSError(\"fixture read failure\")
+
+def fdopen(descriptor, *args, **kwargs):
+    opened = _original_fdopen(descriptor, *args, **kwargs)
+    if descriptor == _read_descriptor:
+        return _BrokenRead(opened)
+    return opened
+
+def path_open(self, *args, **kwargs):
+    if _fail_write_suffix and str(self).endswith(_fail_write_suffix):
+        raise OSError(\"fixture workspace write failure\")
+    return _original_path_open(self, *args, **kwargs)
+
+os.stat = stat
+os.open = open
+os.fdopen = fdopen
+Path.open = path_open
+""",
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["PYTHONPATH"] = str(root)
+            environment["REMOTE_COLLECTOR_FILE_FIXTURES"] = str(source_root)
+
+            completed = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "30",
+                environment=environment,
+            )
+            self.assertTrue(
+                completed.stdout,
+                completed.stderr.decode("utf-8", errors="backslashreplace"),
+            )
+            archive = root / "node.tar.gz"
+            archive.write_bytes(completed.stdout)
+            with tarfile.open(archive, "r:gz") as opened:
+                members = {member.name: member for member in opened.getmembers()}
+                archived_payloads = {}
+                copied_members = []
+                for source in payloads:
+                    member_name = f"node/files/{source.removeprefix('/')}"
+                    member = members[member_name]
+                    copied_members.append(member)
+                    payload = opened.extractfile(member)
+                    assert payload is not None
+                    archived_payloads[source] = payload.read()
+
+            environment["REMOTE_COLLECTOR_RACE_OPEN"] = "/etc/hosts"
+            raced = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "30",
+                environment=environment,
+            )
+            race_archive = root / "race.tar.gz"
+            race_archive.write_bytes(raced.stdout)
+            with tarfile.open(race_archive, "r:gz") as opened:
+                raced_names = {member.name for member in opened.getmembers()}
+
+            hosts_fixture.unlink()
+            hosts_fixture.write_bytes(payloads["/etc/hosts"])
+            environment.pop("REMOTE_COLLECTOR_RACE_OPEN")
+            environment["REMOTE_COLLECTOR_FAIL_OPEN"] = "/etc/hosts"
+            failed = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "30",
+                environment=environment,
+            )
+            failed_archive = root / "failed.tar.gz"
+            failed_archive.write_bytes(failed.stdout)
+            with tarfile.open(failed_archive, "r:gz") as opened:
+                failed_names = {member.name for member in opened.getmembers()}
+
+            failed_file_cases = (
+                ("REMOTE_COLLECTOR_FAIL_LSTAT", "cannot inspect selected file"),
+                ("REMOTE_COLLECTOR_FAIL_READ", "cannot copy selected file"),
+                (
+                    "REMOTE_COLLECTOR_FAIL_WRITE_SUFFIX",
+                    "cannot copy selected file",
+                ),
+            )
+            failed_file_results = []
+            environment.pop("REMOTE_COLLECTOR_FAIL_OPEN")
+            for setting, diagnostic in failed_file_cases:
+                value = "/etc/hosts"
+                if setting == "REMOTE_COLLECTOR_FAIL_WRITE_SUFFIX":
+                    value = "node/files/etc/hosts"
+                environment[setting] = value
+                failed_case = self.run_remote_collector(
+                    "--since-seconds",
+                    "60",
+                    "--probe-timeout-seconds",
+                    "30",
+                    environment=environment,
+                )
+                failed_case_archive = root / f"{setting}.tar.gz"
+                failed_case_archive.write_bytes(failed_case.stdout)
+                with tarfile.open(failed_case_archive, "r:gz") as opened:
+                    failed_case_names = {member.name for member in opened.getmembers()}
+                failed_file_results.append(
+                    (failed_case, failed_case_names, diagnostic)
+                )
+                environment.pop(setting)
+
+            environment[
+                "REMOTE_COLLECTOR_DROP_IN_DISAPPEARS_AFTER_SELECTION"
+            ] = "1"
+            selected_drop_in_failed = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "30",
+                environment=environment,
+            )
+            selected_drop_in_archive = root / "selected-drop-in-failed.tar.gz"
+            selected_drop_in_archive.write_bytes(selected_drop_in_failed.stdout)
+            with tarfile.open(selected_drop_in_archive, "r:gz") as opened:
+                selected_drop_in_names = {member.name for member in opened.getmembers()}
+            os.rename(
+                drop_in_directory.with_name("timesyncd.conf.d-after-selection"),
+                drop_in_directory,
+            )
+            environment.pop("REMOTE_COLLECTOR_DROP_IN_DISAPPEARS_AFTER_SELECTION")
+
+            environment["REMOTE_COLLECTOR_RACE_OPEN"] = (
+                "/etc/systemd/timesyncd.conf.d"
+            )
+            drop_in_raced = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "30",
+                environment=environment,
+            )
+            drop_in_race_archive = root / "drop-in-race.tar.gz"
+            drop_in_race_archive.write_bytes(drop_in_raced.stdout)
+            with tarfile.open(drop_in_race_archive, "r:gz") as opened:
+                drop_in_race_names = {member.name for member in opened.getmembers()}
+
+            environment["REMOTE_COLLECTOR_RACE_OPEN"] = "/etc"
+            parent_raced = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "30",
+                environment=environment,
+            )
+            parent_race_archive = root / "parent-race.tar.gz"
+            parent_race_archive.write_bytes(parent_raced.stdout)
+            with tarfile.open(parent_race_archive, "r:gz") as opened:
+                parent_race_names = {member.name for member in opened.getmembers()}
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stderr, b"")
+        self.assertEqual(archived_payloads, payloads)
+        self.assertTrue(all(member.isreg() for member in copied_members))
+        self.assertNotIn("node/files/etc/ntp.conf", members)
+        self.assertNotIn("node/files/etc/systemd/timesyncd.conf.d/ignored.txt", members)
+        self.assertNotIn("node/files/etc/systemd/timesyncd.conf.d/linked.conf", members)
+        self.assertNotIn("node/files/etc/systemd/timesyncd.conf.d/nested.conf", members)
+        self.assertNotIn("node/files/etc/systemd/timesyncd.conf.d/special.conf", members)
+        self.assertEqual(raced.returncode, 0)
+        self.assertEqual(raced.stderr, b"")
+        self.assertNotIn("node/files/etc/hosts", raced_names)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(b"cannot open selected file /etc/hosts", failed.stderr)
+        self.assertNotIn("node/files/etc/hosts", failed_names)
+        self.assertIn("node/files/etc/chrony.conf", failed_names)
+        for failed_case, failed_case_names, diagnostic in failed_file_results:
+            self.assertNotEqual(failed_case.returncode, 0)
+            self.assertIn(diagnostic.encode("utf-8"), failed_case.stderr)
+            self.assertIn(b"/etc/hosts", failed_case.stderr)
+            self.assertNotIn("node/files/etc/hosts", failed_case_names)
+            self.assertIn("node/probes/hostname/result.json", failed_case_names)
+        self.assertNotEqual(selected_drop_in_failed.returncode, 0)
+        self.assertIn(
+            b"cannot open selected file /etc/systemd/timesyncd.conf.d/direct.conf",
+            selected_drop_in_failed.stderr,
+        )
+        self.assertNotIn(
+            "node/files/etc/systemd/timesyncd.conf.d/direct.conf",
+            selected_drop_in_names,
+        )
+        self.assertEqual(
+            drop_in_raced.returncode,
+            0,
+            drop_in_raced.stderr.decode("utf-8", errors="backslashreplace"),
+        )
+        self.assertNotIn(
+            "node/files/etc/systemd/timesyncd.conf.d/direct.conf",
+            drop_in_race_names,
+        )
+        self.assertEqual(parent_raced.returncode, 0)
+        self.assertFalse(
+            any(name.startswith("node/files/etc/") for name in parent_race_names)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
