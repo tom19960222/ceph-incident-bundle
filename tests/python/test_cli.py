@@ -1163,6 +1163,43 @@ raise SystemExit(7)
         self.assertEqual(outcome, "partial")
         self.assertFalse(any("diagnostic" in member for member in member_names))
 
+    def test_complete_archive_with_selected_file_failure_is_admitted_as_partial(
+        self,
+    ) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+            environment["FAKE_SSH_SELECTED_FILE_FAILURE"] = "1"
+
+            completed = self.run_cli("collect", cwd=cwd, env=environment, timeout=20)
+
+            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            bundle = bundles[0]
+            with tarfile.open(bundle, "r:gz") as archive:
+                root = bundle.name.removesuffix(".tar.gz")
+                member_names = {member.name for member in archive.getmembers()}
+                metadata_file = archive.extractfile(f"{root}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(completed.stdout.endswith(b" (partial)\n"))
+        self.assertIn(b"[node-a] cannot copy selected file /etc/hosts", completed.stderr)
+        self.assertIn(b"Remote Node Collector exited with status 1", completed.stderr)
+        self.assertEqual(outcome, "partial")
+        self.assertIn(f"{root}/nodes/node-a", member_names)
+        self.assertIn(f"{root}/nodes/node-a/files", member_names)
+        self.assertNotIn(f"{root}/nodes/node-a/files/etc/hosts", member_names)
+        self.assertFalse(any("diagnostic" in name for name in member_names))
+
     def test_corrupt_ssh_stdout_publishes_partial_without_a_node_contribution(
         self,
     ) -> None:
@@ -1646,6 +1683,17 @@ if lock_workspace_parent:
     # own contents removable but makes the final ``rmdir`` of the now-empty
     # workspace fail, reproducing a genuine post-publication cleanup problem.
     temporary_root.chmod(0o555)
+if os.environ.get("FAKE_SSH_SELECTED_FILE_FAILURE"):
+    selected_file_archive = io.BytesIO()
+    with tarfile.open(fileobj=selected_file_archive, mode="w:gz") as archive:
+        for name in ("node", "node/probes", "node/files"):
+            member = tarfile.TarInfo(name)
+            member.type = tarfile.DIRTYPE
+            member.mode = 0o700
+            archive.addfile(member)
+    sys.stdout.buffer.write(selected_file_archive.getvalue())
+    sys.stderr.write("cannot copy selected file /etc/hosts: fixture failure\\n")
+    raise SystemExit(1)
 if os.environ.get("FAKE_SSH_CORRUPT"):
     sys.stdout.buffer.write(b"not-an-archive")
     raise SystemExit(0)

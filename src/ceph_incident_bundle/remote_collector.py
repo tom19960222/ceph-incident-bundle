@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import errno
 import json
 import math
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -99,6 +101,232 @@ NODE_PROBE_CATALOG: tuple[Probe, ...] = (
         ),
     ),
 )
+
+
+# Fixed regular-file evidence.  Each path is mirrored below node/files after
+# its leading slash, so the archive records where the bytes were observed
+# without preserving source filesystem metadata.
+FIXED_CONFIGURATION_FILES: tuple[str, ...] = (
+    "/etc/os-release",
+    "/etc/hosts",
+    "/etc/resolv.conf",
+    "/etc/chrony.conf",
+    "/etc/chrony/chrony.conf",
+    "/etc/ntp.conf",
+    "/etc/systemd/timesyncd.conf",
+)
+TIMESYNCD_DROP_IN_DIRECTORY = "/etc/systemd/timesyncd.conf.d"
+
+
+def _open_directory_without_links(path: str) -> int | None:
+    """Return an owned directory descriptor or omit an unsafe/missing path."""
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in path.split("/")[1:]:
+            try:
+                next_descriptor = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+            except (FileNotFoundError, NotADirectoryError):
+                os.close(descriptor)
+                return None
+            except OSError as open_error:
+                if open_error.errno == errno.ELOOP:
+                    os.close(descriptor)
+                    return None
+                if open_error.errno == errno.EPERM:
+                    try:
+                        os.readlink(component, dir_fd=descriptor)
+                    except OSError:
+                        pass
+                    else:
+                        os.close(descriptor)
+                        return None
+                try:
+                    inspected = os.stat(
+                        component,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    pass
+                else:
+                    if not stat.S_ISDIR(inspected.st_mode):
+                        os.close(descriptor)
+                        return None
+                raise
+            os.close(descriptor)
+            descriptor = next_descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _copy_selected_file(
+    source: str, files_directory: Path, was_selected: bool = False
+) -> bool:
+    """Copy one selected source only when both checks see a regular file.
+
+    A disappeared source, link, or special object is an ordinary omission.  A
+    selected regular file that cannot be safely opened or copied is an
+    attempted evidence failure, but does not stop later sources.
+    """
+    parent_path, source_name = source.rsplit("/", 1)
+    descriptor = None
+    destination = files_directory / source.lstrip("/")
+    try:
+        parent_descriptor = _open_directory_without_links(parent_path)
+    except OSError as inspect_error:
+        print(
+            f"cannot inspect selected file {source}: {inspect_error}",
+            file=sys.stderr,
+        )
+        return False
+    if parent_descriptor is None:
+        if was_selected:
+            print(
+                f"cannot open selected file {source}: source disappeared after inspection",
+                file=sys.stderr,
+            )
+            return False
+        return True
+    try:
+        try:
+            inspected = os.stat(
+                source_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if was_selected:
+                print(
+                    f"cannot open selected file {source}: source disappeared after inspection",
+                    file=sys.stderr,
+                )
+                return False
+            return True
+        except OSError as inspect_error:
+            print(
+                f"cannot inspect selected file {source}: {inspect_error}",
+                file=sys.stderr,
+            )
+            return False
+        if not stat.S_ISREG(inspected.st_mode):
+            return True
+        try:
+            descriptor = os.open(
+                source_name,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=parent_descriptor,
+            )
+        except (FileNotFoundError, NotADirectoryError):
+            print(
+                f"cannot open selected file {source}: source disappeared after inspection",
+                file=sys.stderr,
+            )
+            return False
+        except OSError as open_error:
+            if open_error.errno == errno.ELOOP:
+                return True
+            if open_error.errno == errno.EPERM:
+                try:
+                    os.readlink(source_name, dir_fd=parent_descriptor)
+                except OSError:
+                    pass
+                else:
+                    return True
+            try:
+                inspected = os.stat(
+                    source_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                pass
+            else:
+                if not stat.S_ISREG(inspected.st_mode):
+                    return True
+            print(f"cannot open selected file {source}: {open_error}", file=sys.stderr)
+            return False
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return True
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with os.fdopen(
+                descriptor, "rb", closefd=True
+            ) as source_file, destination.open("xb") as destination_file:
+                descriptor = None
+                shutil.copyfileobj(source_file, destination_file)
+        except OSError as copy_error:
+            try:
+                destination.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            print(
+                f"cannot copy selected file {source}: {copy_error}",
+                file=sys.stderr,
+            )
+            return False
+    finally:
+        os.close(parent_descriptor)
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    return True
+
+
+def _copy_configuration_files(files_directory: Path) -> bool:
+    succeeded = True
+    for source in FIXED_CONFIGURATION_FILES:
+        succeeded = _copy_selected_file(source, files_directory) and succeeded
+
+    try:
+        directory_descriptor = _open_directory_without_links(
+            TIMESYNCD_DROP_IN_DIRECTORY
+        )
+    except OSError as inspect_error:
+        print(
+            "cannot inspect selected file directory "
+            f"{TIMESYNCD_DROP_IN_DIRECTORY}: {inspect_error}",
+            file=sys.stderr,
+        )
+        return False
+    if directory_descriptor is None:
+        return succeeded
+    try:
+        with os.scandir(directory_descriptor) as entries:
+            drop_ins = tuple(
+                sorted(
+                    os.path.join(TIMESYNCD_DROP_IN_DIRECTORY, entry.name)
+                    for entry in entries
+                    if entry.name.endswith(".conf")
+                )
+            )
+    except OSError as inspect_error:
+        print(
+            "cannot inspect selected file directory "
+            f"{TIMESYNCD_DROP_IN_DIRECTORY}: {inspect_error}",
+            file=sys.stderr,
+        )
+        return False
+    finally:
+        try:
+            os.close(directory_descriptor)
+        except OSError:
+            pass
+    for source in drop_ins:
+        file_succeeded = _copy_selected_file(
+            source, files_directory, was_selected=True
+        )
+        succeeded = file_succeeded and succeeded
+    return succeeded
 
 
 def _run_probe(probe: Probe, capture: Path, timeout_seconds: int) -> bool:
@@ -245,7 +473,8 @@ def main() -> int:
     try:
         node = workspace / "node"
         (node / "probes").mkdir(parents=True)
-        (node / "files").mkdir()
+        files = node / "files"
+        files.mkdir()
         if arguments.collect_ceph:
             (workspace / "ceph" / "probes").mkdir(parents=True)
 
@@ -263,6 +492,7 @@ def main() -> int:
                 )
                 probe_succeeded = False
             succeeded = succeeded and probe_succeeded
+        succeeded = _copy_configuration_files(files) and succeeded
         try:
             _stream_archive(workspace)
         except (OSError, tarfile.TarError) as archive_error:
