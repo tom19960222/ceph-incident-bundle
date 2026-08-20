@@ -738,6 +738,77 @@ node-a = node-a.example.test
         for top_level in ("nodes", "ceph", "kubernetes", "prometheus"):
             self.assertIn(f"{root}/{top_level}", names)
 
+    def test_installed_collect_captures_configured_kubernetes_get_snapshot(self) -> None:
+        inventory = b"""\
+[common]
+ssh_user = root
+probe_timeout = 30m
+ssh_connect_timeout = 15s
+[nodes]
+node-a = node-a.example.test
+[kubernetes]
+context = lab-context
+consumer_namespace = rook-shared
+operator_namespace = rook-shared
+"""
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            self._write_fake_kubectl(fake_bin / "kubectl")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            record = cwd / "ssh-record"
+            kubectl_record = cwd / "kubectl.jsonl"
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_SSH_RECORD"] = str(record)
+            environment["FAKE_SSH_CORRUPT"] = "1"
+            environment["FAKE_KUBECTL_RECORD"] = str(kubectl_record)
+
+            completed = self.run_cli(
+                "collect", cwd=cwd, env=environment, timeout=30
+            )
+
+            bundle = next(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            root_name = bundle.name.removesuffix(".tar.gz")
+            with tarfile.open(bundle, "r:gz") as archive:
+                names = {member.name for member in archive.getmembers()}
+                events_file = archive.extractfile(
+                    f"{root_name}/kubernetes/probes/consumer-events/stdout"
+                )
+                assert events_file is not None
+                events_bytes = events_file.read()
+            kubectl_argv = [
+                json.loads(line)
+                for line in kubectl_record.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn(b"Node Evidence Archive rejected", completed.stderr)
+        self.assertEqual(
+            completed.stdout,
+            f"{bundle.resolve()} (partial)\n".encode("utf-8"),
+        )
+        self.assertEqual(len(kubectl_argv), 4)
+        self.assertEqual(
+            kubectl_argv[0],
+            [
+                "--context=lab-context",
+                "--namespace=rook-shared",
+                "get",
+                "pods",
+                "--output=wide",
+            ],
+        )
+        self.assertTrue(
+            all(argv[2] == "get" for argv in kubectl_argv), kubectl_argv
+        )
+        self.assertEqual(events_bytes, b"events raw bytes\x00")
+        self.assertIn(
+            f"{root_name}/kubernetes/probes/consumer-pods-json/result.json", names
+        )
+
     def test_multi_node_failure_keeps_later_admitted_evidence_in_inventory_order(
         self,
     ) -> None:
@@ -1754,6 +1825,29 @@ elif os.environ.get("FAKE_SSH_DIAGNOSTIC"):
     os.write(2, b"remote\\x00\\xff\\n")
 sys.stderr.buffer.write(completed.stderr)
 raise SystemExit(int(os.environ.get("FAKE_SSH_EXIT", completed.returncode)))
+""",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+    @staticmethod
+    def _write_fake_kubectl(path: Path) -> None:
+        path.write_text(
+            f"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+import sys
+
+record = Path(os.environ["FAKE_KUBECTL_RECORD"])
+with record.open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[-2:] == ["pods", "--output=json"]:
+    sys.stdout.write('{{"apiVersion":"v1","items":[]}}')
+elif "events" in sys.argv:
+    sys.stdout.buffer.write(b"events raw bytes\\x00")
+else:
+    sys.stdout.write("snapshot")
 """,
             encoding="utf-8",
         )

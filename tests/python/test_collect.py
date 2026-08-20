@@ -29,8 +29,161 @@ node-b = node-b.example.test
 source = node-a
 """
 
+KUBERNETES_INVENTORY = b"""\
+[common]
+ssh_user = root
+probe_timeout = 7m
+[nodes]
+node-a = node-a.example.test
+[kubernetes]
+context = lab-blue
+consumer_namespace = rook-consumer
+operator_namespace = rook-operator
+"""
+
 
 class TopLevelCollectionTests(unittest.TestCase):
+    def test_absent_kubernetes_context_skips_capability_cleanly(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
+                patch(
+                    "ceph_incident_bundle.collect.collect_kubernetes"
+                ) as kubernetes_operation,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            bundle = next(root.glob("ceph-incident-bundle-*.tar.gz"))
+            with tarfile.open(bundle, "r:gz") as archive:
+                root_name = bundle.name.removesuffix(".tar.gz")
+                kubernetes_members = [
+                    member.name
+                    for member in archive.getmembers()
+                    if member.name.startswith(f"{root_name}/kubernetes")
+                ]
+
+        self.assertEqual(status, 0)
+        kubernetes_operation.assert_not_called()
+        self.assertEqual(kubernetes_members, [f"{root_name}/kubernetes"])
+        self.assertTrue(stdout.getvalue().endswith(" (complete)\n"))
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_configured_kubernetes_runs_after_nodes_and_returns_partial_problems(
+        self,
+    ) -> None:
+        events: list[str] = []
+
+        def node_operation(*args: object, **kwargs: object) -> list[str]:
+            events.append("node")
+            return []
+
+        def kubernetes_operation(*args: object, **kwargs: object) -> list[str]:
+            events.append("kubernetes")
+            contribution = Path(str(kwargs["contribution_directory"]))
+            (contribution / "probes").mkdir(parents=True)
+            return ["Kubernetes consumer-events Probe failed: outcome=exited exit_code=7"]
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(KUBERNETES_INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.collect_node",
+                    side_effect=node_operation,
+                ),
+                patch(
+                    "ceph_incident_bundle.collect.collect_kubernetes",
+                    side_effect=kubernetes_operation,
+                ) as kubernetes,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            bundle = next(root.glob("ceph-incident-bundle-*.tar.gz"))
+            call = kubernetes.call_args
+
+        self.assertEqual(status, 0)
+        self.assertEqual(events, ["node", "kubernetes"])
+        self.assertEqual(call.kwargs["context"], "lab-blue")
+        self.assertEqual(call.kwargs["consumer_namespace"], "rook-consumer")
+        self.assertEqual(call.kwargs["operator_namespace"], "rook-operator")
+        self.assertEqual(call.kwargs["probe_timeout_seconds"], 420)
+        self.assertEqual(call.kwargs["staging_directory"].name, "kubernetes")
+        self.assertEqual(call.kwargs["contribution_directory"].name, "kubernetes")
+        self.assertTrue(stdout.getvalue().endswith(" (partial)\n"))
+        self.assertIn("consumer-events Probe failed", stderr.getvalue())
+        self.assertNotIn("FAIL: no Incident Bundle delivered", stderr.getvalue())
+
+    def test_unexpected_kubernetes_exception_keeps_publication_isolated(self) -> None:
+        def failed_kubernetes(*args: object, **kwargs: object) -> list[str]:
+            staging = Path(str(kwargs["staging_directory"]))
+            (staging / "incomplete" / "probes" / "private-capture").mkdir(
+                parents=True
+            )
+            (staging / "incomplete" / "probes" / "private-capture" / "stdout").write_bytes(
+                b"must stay private"
+            )
+            raise RuntimeError("kubectl boundary failed\nsecond line")
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(KUBERNETES_INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
+                patch(
+                    "ceph_incident_bundle.collect.collect_kubernetes",
+                    side_effect=failed_kubernetes,
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            bundle = next(root.glob("ceph-incident-bundle-*.tar.gz"))
+            with tarfile.open(bundle, "r:gz") as archive:
+                root_name = bundle.name.removesuffix(".tar.gz")
+                metadata_file = archive.extractfile(f"{root_name}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+                kubernetes_members = [
+                    member.name
+                    for member in archive.getmembers()
+                    if member.name.startswith(f"{root_name}/kubernetes")
+                ]
+                private_members = [
+                    member.name
+                    for member in archive.getmembers()
+                    if "private-capture" in member.name or "/private/" in member.name
+                ]
+
+        self.assertEqual(status, 0)
+        self.assertEqual(outcome, "partial")
+        self.assertEqual(kubernetes_members, [f"{root_name}/kubernetes"])
+        self.assertEqual(private_members, [])
+        self.assertTrue(stdout.getvalue().endswith(" (partial)\n"))
+        self.assertIn(
+            "Kubernetes: unexpected collection failure: "
+            "kubectl boundary failed\\x0asecond line",
+            stderr.getvalue(),
+        )
+
     def test_node_problems_are_accumulated_in_inventory_order_after_an_exception(
         self,
     ) -> None:
