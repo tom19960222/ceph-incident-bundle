@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 
 def _utc_now() -> str:
@@ -126,6 +126,8 @@ FIXED_CONFIGURATION_FILES: tuple[str, ...] = (
 )
 TIMESYNCD_DROP_IN_DIRECTORY = "/etc/systemd/timesyncd.conf.d"
 VAR_LOG_DIRECTORY = "/var/log"
+ETC_CEPH_DIRECTORY = "/etc/ceph"
+VAR_LIB_CEPH_DIRECTORY = "/var/lib/ceph"
 
 
 def _open_directory_without_links(path: str) -> int | None:
@@ -320,35 +322,172 @@ def _copy_configuration_files(files_directory: Path) -> bool:
             f"{TIMESYNCD_DROP_IN_DIRECTORY}: {inspect_error}",
             file=sys.stderr,
         )
-        return False
-    if directory_descriptor is None:
-        return succeeded
-    try:
-        with os.scandir(directory_descriptor) as entries:
-            drop_ins = tuple(
-                sorted(
-                    os.path.join(TIMESYNCD_DROP_IN_DIRECTORY, entry.name)
-                    for entry in entries
-                    if entry.name.endswith(".conf")
+        directory_descriptor = None
+        succeeded = False
+    if directory_descriptor is not None:
+        try:
+            with os.scandir(directory_descriptor) as entries:
+                drop_ins = tuple(
+                    sorted(
+                        os.path.join(TIMESYNCD_DROP_IN_DIRECTORY, entry.name)
+                        for entry in entries
+                        if entry.name.endswith(".conf")
+                    )
                 )
+        except OSError as inspect_error:
+            print(
+                "cannot inspect selected file directory "
+                f"{TIMESYNCD_DROP_IN_DIRECTORY}: {inspect_error}",
+                file=sys.stderr,
             )
+            drop_ins = ()
+            succeeded = False
+        finally:
+            try:
+                os.close(directory_descriptor)
+            except OSError:
+                pass
+        for source in drop_ins:
+            file_succeeded = _copy_selected_file(
+                source, files_directory, was_selected=True
+            )
+            succeeded = file_succeeded and succeeded
+    succeeded = _copy_regular_file_tree(
+        ETC_CEPH_DIRECTORY,
+        files_directory,
+        lambda unused_name: True,
+    ) and succeeded
+    succeeded = _copy_regular_file_tree(
+        VAR_LIB_CEPH_DIRECTORY,
+        files_directory,
+        _is_ceph_state_configuration_name,
+    ) and succeeded
+    return succeeded
+
+
+def _is_ceph_state_configuration_name(name: str) -> bool:
+    return name in ("ceph.conf", "config") or name.endswith((".conf", ".config"))
+
+
+def _copy_regular_file_tree(
+    source_root: str,
+    files_directory: Path,
+    includes_basename: Callable[[str], bool],
+) -> bool:
+    """Copy selected regular files below one fixed root without following links."""
+    try:
+        directory_descriptor = _open_directory_without_links(source_root)
     except OSError as inspect_error:
         print(
-            "cannot inspect selected file directory "
-            f"{TIMESYNCD_DROP_IN_DIRECTORY}: {inspect_error}",
+            f"cannot inspect node-local Ceph directory {source_root}: "
+            f"{inspect_error}",
             file=sys.stderr,
         )
         return False
+    if directory_descriptor is None:
+        return True
+    try:
+        return _copy_regular_file_directory(
+            directory_descriptor,
+            source_root,
+            files_directory,
+            includes_basename,
+        )
     finally:
         try:
             os.close(directory_descriptor)
         except OSError:
             pass
-    for source in drop_ins:
-        file_succeeded = _copy_selected_file(
-            source, files_directory, was_selected=True
+
+
+def _copy_regular_file_directory(
+    directory_descriptor: int,
+    source_directory: str,
+    files_directory: Path,
+    includes_basename: Callable[[str], bool],
+) -> bool:
+    succeeded = True
+    try:
+        with os.scandir(directory_descriptor) as scanner:
+            entries = tuple(sorted(scanner, key=lambda entry: entry.name))
+    except OSError as inspect_error:
+        print(
+            f"cannot inspect node-local Ceph directory {source_directory}: "
+            f"{inspect_error}",
+            file=sys.stderr,
         )
-        succeeded = file_succeeded and succeeded
+        return False
+
+    for entry in entries:
+        source = f"{source_directory}/{entry.name}"
+        try:
+            inspected = entry.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as inspect_error:
+            print(
+                f"cannot inspect node-local Ceph source {source}: "
+                f"{inspect_error}",
+                file=sys.stderr,
+            )
+            succeeded = False
+            continue
+
+        if stat.S_ISREG(inspected.st_mode):
+            if includes_basename(entry.name):
+                copied = _copy_selected_file(
+                    source,
+                    files_directory,
+                    was_selected=True,
+                )
+                succeeded = copied and succeeded
+            continue
+        if not stat.S_ISDIR(inspected.st_mode):
+            continue
+
+        try:
+            child_descriptor = os.open(
+                entry.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_descriptor,
+            )
+        except (FileNotFoundError, NotADirectoryError) as open_error:
+            if _directory_became_an_omitted_object(
+                directory_descriptor, entry.name
+            ):
+                continue
+            print(
+                f"cannot open node-local Ceph directory {source}: {open_error}",
+                file=sys.stderr,
+            )
+            succeeded = False
+            continue
+        except OSError as open_error:
+            if open_error.errno in (errno.ELOOP, errno.EPERM) and (
+                _directory_became_an_omitted_object(
+                    directory_descriptor, entry.name
+                )
+            ):
+                continue
+            print(
+                f"cannot open node-local Ceph directory {source}: {open_error}",
+                file=sys.stderr,
+            )
+            succeeded = False
+            continue
+        try:
+            copied = _copy_regular_file_directory(
+                child_descriptor,
+                source,
+                files_directory,
+                includes_basename,
+            )
+            succeeded = copied and succeeded
+        finally:
+            try:
+                os.close(child_descriptor)
+            except OSError:
+                pass
     return succeeded
 
 

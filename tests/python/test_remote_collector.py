@@ -235,6 +235,102 @@ Path.open = path_open
             encoding="utf-8",
         )
 
+    @staticmethod
+    def write_source_root_sitecustomize(path: Path) -> None:
+        path.write_text(
+            """import os
+from pathlib import Path
+
+_source_root = os.environ["REMOTE_COLLECTOR_FILE_FIXTURES"]
+_original_open = os.open
+_original_fdopen = os.fdopen
+_original_path_open = Path.open
+_original_scandir = os.scandir
+_fail_stat = os.environ.get("REMOTE_COLLECTOR_FAIL_CEPH_STAT")
+_fail_open = os.environ.get("REMOTE_COLLECTOR_FAIL_CEPH_OPEN")
+_fail_read = os.environ.get("REMOTE_COLLECTOR_FAIL_CEPH_READ")
+_fail_write_suffix = os.environ.get("REMOTE_COLLECTOR_FAIL_WRITE_SUFFIX")
+_race_open = os.environ.get("REMOTE_COLLECTOR_RACE_CEPH_OPEN")
+_read_descriptor = None
+_raced = False
+
+def _name(path):
+    return os.fspath(path).rsplit("/", 1)[-1]
+
+class _Entry:
+    def __init__(self, entry):
+        self._entry = entry
+        self.name = entry.name
+    def __getattr__(self, name):
+        return getattr(self._entry, name)
+    def stat(self, *args, **kwargs):
+        if _fail_stat and self.name == _name(_fail_stat):
+            raise PermissionError("fixture Ceph inspection failure")
+        return self._entry.stat(*args, **kwargs)
+
+class _Scanner:
+    def __init__(self, scanner):
+        self._scanner = scanner
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        return self._scanner.__exit__(*args)
+    def __iter__(self):
+        return (_Entry(entry) for entry in self._scanner)
+
+def scandir(path):
+    return _Scanner(_original_scandir(path))
+
+def open(path, flags, *args, **kwargs):
+    global _raced, _read_descriptor
+    if os.fspath(path) == "/" and flags & os.O_DIRECTORY:
+        return _original_open(_source_root, flags, *args, **kwargs)
+    source = os.fspath(path)
+    if not flags & os.O_DIRECTORY:
+        if _fail_open and _name(source) == _name(_fail_open):
+            raise PermissionError("fixture Ceph open failure")
+        if _race_open and _name(source) == _name(_race_open) and not _raced:
+            _raced = True
+            fixture = os.path.join(_source_root, _race_open.lstrip("/"))
+            target = fixture + "-after-race"
+            os.rename(fixture, target)
+            os.symlink(os.path.basename(target), fixture)
+    descriptor = _original_open(path, flags, *args, **kwargs)
+    if _fail_read and _name(source) == _name(_fail_read):
+        _read_descriptor = descriptor
+    return descriptor
+
+class _BrokenRead:
+    def __init__(self, opened):
+        self._opened = opened
+    def __enter__(self):
+        return self
+    def __exit__(self, *unused):
+        self._opened.close()
+    def read(self, *unused):
+        raise OSError("fixture Ceph read failure")
+
+def fdopen(descriptor, *args, **kwargs):
+    global _read_descriptor
+    opened = _original_fdopen(descriptor, *args, **kwargs)
+    if descriptor == _read_descriptor:
+        _read_descriptor = None
+        return _BrokenRead(opened)
+    return opened
+
+def path_open(self, *args, **kwargs):
+    if _fail_write_suffix and str(self).endswith(_fail_write_suffix):
+        raise OSError("fixture Ceph workspace write failure")
+    return _original_path_open(self, *args, **kwargs)
+
+os.open = open
+os.fdopen = fdopen
+os.scandir = scandir
+Path.open = path_open
+""",
+            encoding="utf-8",
+        )
+
     def run_remote_collector(
         self, *arguments: str, environment: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[bytes]:
@@ -1640,6 +1736,236 @@ Path.open = path_open
         self.assertEqual(parent_raced.returncode, 0)
         self.assertFalse(
             any(name.startswith("node/files/etc/") for name in parent_race_names)
+        )
+
+    def test_node_local_ceph_configuration_is_selected_without_daemon_data(self) -> None:
+        included = {
+            "etc/ceph/ceph.conf": b"[global]\nfsid = fixture\n",
+            "etc/ceph/client.admin.keyring": b"[client.admin]\nkey = secret\x00\xff\n",
+            "etc/ceph/nested/arbitrary-name": b"raw nested bytes\x00\xfe",
+            "var/lib/ceph/mon/ceph-a/ceph.conf": b"monitor config\n",
+            "var/lib/ceph/osd/ceph-0/config": b"osd config\n",
+            "var/lib/ceph/osd/ceph-0/override.conf": b"override\n",
+            "var/lib/ceph/mgr/ceph-a/module.config": b"module config\n",
+        }
+        excluded = {
+            "var/lib/ceph/mon/ceph-a/keyring": b"must not copy daemon keyring\n",
+            "var/lib/ceph/osd/ceph-0/block": b"must not copy block content\n",
+            "var/lib/ceph/osd/ceph-0/store.db": b"must not copy daemon database\n",
+            "var/lib/ceph/osd/ceph-0/override.conf.bak": b"must not copy backup\n",
+        }
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            source_root = root / "sources"
+            for relative, payload in {**included, **excluded}.items():
+                source = source_root / relative
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_bytes(payload)
+            os.symlink(
+                "ceph.conf",
+                source_root / "etc/ceph/linked.conf",
+            )
+            os.mkfifo(source_root / "etc/ceph/special.keyring")
+            os.symlink(
+                "ceph.conf",
+                source_root / "var/lib/ceph/mon/ceph-a/linked.conf",
+            )
+            os.mkfifo(source_root / "var/lib/ceph/osd/ceph-0/special.config")
+            outside = source_root / "outside"
+            outside.mkdir()
+            (outside / "escaped.keyring").write_bytes(b"must not traverse")
+            os.symlink(outside, source_root / "etc/ceph/linked-directory")
+            self.write_source_root_sitecustomize(root / "sitecustomize.py")
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            environment["PYTHONPATH"] = str(root)
+            environment["REMOTE_COLLECTOR_FILE_FIXTURES"] = str(source_root)
+
+            completed = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "30",
+                environment=environment,
+            )
+            archive = root / "node.tar.gz"
+            archive.write_bytes(completed.stdout)
+            with tarfile.open(archive, "r:gz") as opened:
+                names = {member.name for member in opened.getmembers()}
+                payloads = {}
+                for relative in included:
+                    archived = opened.extractfile(f"node/files/{relative}")
+                    assert archived is not None
+                    payloads[relative] = archived.read()
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8", errors="backslashreplace"),
+        )
+        self.assertEqual(completed.stderr, b"")
+        self.assertEqual(payloads, included)
+        for relative in excluded:
+            self.assertNotIn(f"node/files/{relative}", names)
+        self.assertNotIn("node/files/etc/ceph/linked.conf", names)
+        self.assertNotIn("node/files/etc/ceph/special.keyring", names)
+        self.assertFalse(
+            any(
+                name.startswith("node/files/etc/ceph/linked-directory")
+                for name in names
+            )
+        )
+        self.assertNotIn(
+            "node/files/var/lib/ceph/mon/ceph-a/linked.conf",
+            names,
+        )
+        self.assertNotIn(
+            "node/files/var/lib/ceph/osd/ceph-0/special.config",
+            names,
+        )
+        self.assertFalse(any("listing" in name.lower() for name in names))
+
+    def test_node_local_ceph_failures_are_partial_and_later_files_continue(self) -> None:
+        selected = {
+            "etc/ceph/fail-stat.keyring": b"stat failure fixture\n",
+            "etc/ceph/fail-read.keyring": b"read failure fixture\n",
+            "etc/ceph/fail-write.keyring": b"write failure fixture\n",
+            "etc/ceph/raced.keyring": b"race fixture\n",
+            "etc/ceph/z-later.keyring": b"later etc evidence\n",
+            "var/lib/ceph/mon/ceph-a/fail-open.conf": b"open failure fixture\n",
+            "var/lib/ceph/osd/ceph-0/z-later.config": b"later state config\n",
+        }
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            source_root = root / "sources"
+            for relative, payload in selected.items():
+                source = source_root / relative
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_bytes(payload)
+            self.write_source_root_sitecustomize(root / "sitecustomize.py")
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            environment["PYTHONPATH"] = str(root)
+            environment["REMOTE_COLLECTOR_FILE_FIXTURES"] = str(source_root)
+
+            cases = (
+                (
+                    "REMOTE_COLLECTOR_FAIL_CEPH_STAT",
+                    "/etc/ceph/fail-stat.keyring",
+                    b"cannot inspect node-local Ceph source "
+                    b"/etc/ceph/fail-stat.keyring",
+                    "etc/ceph/fail-stat.keyring",
+                ),
+                (
+                    "REMOTE_COLLECTOR_FAIL_CEPH_OPEN",
+                    "/var/lib/ceph/mon/ceph-a/fail-open.conf",
+                    b"cannot open selected file "
+                    b"/var/lib/ceph/mon/ceph-a/fail-open.conf",
+                    "var/lib/ceph/mon/ceph-a/fail-open.conf",
+                ),
+                (
+                    "REMOTE_COLLECTOR_FAIL_CEPH_READ",
+                    "/etc/ceph/fail-read.keyring",
+                    b"cannot copy selected file /etc/ceph/fail-read.keyring",
+                    "etc/ceph/fail-read.keyring",
+                ),
+                (
+                    "REMOTE_COLLECTOR_FAIL_WRITE_SUFFIX",
+                    "node/files/etc/ceph/fail-write.keyring",
+                    b"cannot copy selected file /etc/ceph/fail-write.keyring",
+                    "etc/ceph/fail-write.keyring",
+                ),
+            )
+            results = []
+            for setting, value, diagnostic, omitted in cases:
+                environment[setting] = value
+                completed = self.run_remote_collector(
+                    "--since-seconds",
+                    "60",
+                    "--probe-timeout-seconds",
+                    "30",
+                    environment=environment,
+                )
+                archive = root / f"{setting}.tar.gz"
+                archive.write_bytes(completed.stdout)
+                with tarfile.open(archive, "r:gz") as opened:
+                    names = {member.name for member in opened.getmembers()}
+                results.append((completed, names, diagnostic, omitted))
+                environment.pop(setting)
+
+            environment["REMOTE_COLLECTOR_RACE_CEPH_OPEN"] = (
+                "/etc/ceph/raced.keyring"
+            )
+            raced = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "30",
+                environment=environment,
+            )
+            raced_archive = root / "raced.tar.gz"
+            raced_archive.write_bytes(raced.stdout)
+            with tarfile.open(raced_archive, "r:gz") as opened:
+                raced_names = {member.name for member in opened.getmembers()}
+
+        for completed, names, diagnostic, omitted in results:
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(diagnostic, completed.stderr)
+            self.assertNotIn(f"node/files/{omitted}", names)
+            self.assertIn("node/files/etc/ceph/z-later.keyring", names)
+            self.assertIn(
+                "node/files/var/lib/ceph/osd/ceph-0/z-later.config",
+                names,
+            )
+            self.assertIn("node/probes/journal-system/result.json", names)
+        self.assertEqual(
+            raced.returncode,
+            0,
+            raced.stderr.decode("utf-8", errors="backslashreplace"),
+        )
+        self.assertEqual(raced.stderr, b"")
+        self.assertNotIn("node/files/etc/ceph/raced.keyring", raced_names)
+        self.assertIn("node/files/etc/ceph/z-later.keyring", raced_names)
+
+    def test_missing_node_local_ceph_roots_are_normal_omissions(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            source_root = root / "sources"
+            source_root.mkdir()
+            self.write_source_root_sitecustomize(root / "sitecustomize.py")
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            environment["PYTHONPATH"] = str(root)
+            environment["REMOTE_COLLECTOR_FILE_FIXTURES"] = str(source_root)
+
+            completed = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "30",
+                environment=environment,
+            )
+            archive = root / "node.tar.gz"
+            archive.write_bytes(completed.stdout)
+            with tarfile.open(archive, "r:gz") as opened:
+                names = {member.name for member in opened.getmembers()}
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stderr, b"")
+        self.assertFalse(
+            any(name.startswith("node/files/etc/ceph") for name in names)
+        )
+        self.assertFalse(
+            any(name.startswith("node/files/var/lib/ceph") for name in names)
         )
 
 
