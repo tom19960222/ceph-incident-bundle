@@ -126,6 +126,8 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
                         url=inventory.prometheus_url,
                         since_seconds=since_seconds,
                         request_timeout_seconds=inventory.request_timeout_seconds,
+                        metrics_filter_regex=inventory.metrics_filter_regex,
+                        query_step=inventory.query_step,
                         staging_directory=workspace / "private" / "prometheus",
                         contribution_directory=prometheus_contribution,
                     )

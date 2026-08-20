@@ -50,6 +50,8 @@ node-a = node-a.example.test
 context = lab-blue
 [prometheus]
 url = http://127.0.0.1:19090/prometheus
+metrics_filter_regex = ^node_.+_total$
+query_step = 45s
 request_timeout = 7s
 """
 
@@ -139,6 +141,8 @@ class TopLevelCollectionTests(unittest.TestCase):
         self.assertEqual(call.kwargs["url"], "http://127.0.0.1:19090/prometheus")
         self.assertEqual(call.kwargs["since_seconds"], 172800)
         self.assertEqual(call.kwargs["request_timeout_seconds"], 7)
+        self.assertEqual(call.kwargs["metrics_filter_regex"], "^node_.+_total$")
+        self.assertEqual(call.kwargs["query_step"], "45s")
         self.assertEqual(call.kwargs["staging_directory"].name, "prometheus")
         self.assertEqual(call.kwargs["contribution_directory"].name, "prometheus")
         self.assertTrue(stdout.getvalue().endswith(" (partial)\n"))

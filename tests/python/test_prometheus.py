@@ -78,6 +78,8 @@ def _successful_controls(
         ).encode("utf-8")
     elif path == "/api/v1/label/__name__/values":
         body = b'{"status":"success","data":["metric_a","metric_a","metric_b"]}'
+    elif path == "/api/v1/query_range":
+        body = b'{"status":"success","data":{"resultType":"matrix","result":[]}}'
     else:
         body = b'{"status":"error","errorType":"bad_data","error":"unexpected"}'
     return 200, [(0, body)], len(body), False
@@ -129,6 +131,8 @@ class PrometheusCollectionTests(unittest.TestCase):
                 url=url + "/prometheus/",
                 since_seconds=86400,
                 request_timeout_seconds=5,
+                metrics_filter_regex=r"^metric_[ab]$",
+                query_step="31s",
                 staging_directory=staging,
                 contribution_directory=admitted,
             )
@@ -145,10 +149,15 @@ class PrometheusCollectionTests(unittest.TestCase):
                 )
             )
             raw_job_values = (admitted / "job-values" / "response").read_bytes()
+            range_result = json.loads(
+                (admitted / "query-range" / "000001" / "result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
             staging_exists = staging.exists()
 
         self.assertEqual(problems, [])
-        self.assertEqual([method for method, _ in requests], ["GET"] * 5)
+        self.assertEqual([method for method, _ in requests], ["GET"] * 9)
         self.assertEqual(
             [urlsplit(request).path for _, request in requests],
             [
@@ -157,10 +166,14 @@ class PrometheusCollectionTests(unittest.TestCase):
                 "/prometheus/api/v1/label/job/values",
                 "/prometheus/api/v1/label/__name__/values",
                 "/prometheus/api/v1/label/__name__/values",
+                "/prometheus/api/v1/query_range",
+                "/prometheus/api/v1/query_range",
+                "/prometheus/api/v1/query_range",
+                "/prometheus/api/v1/query_range",
             ],
         )
         metric_queries = [
-            parse_qs(urlsplit(request).query) for _, request in requests[3:]
+            parse_qs(urlsplit(request).query) for _, request in requests[3:5]
         ]
         self.assertEqual(
             [query["match[]"] for query in metric_queries],
@@ -174,6 +187,27 @@ class PrometheusCollectionTests(unittest.TestCase):
         self.assertEqual(len(set(starts)), 1)
         self.assertEqual(len(set(ends)), 1)
         self.assertEqual(float(ends[0]) - float(starts[0]), 86400)
+        range_queries = [
+            parse_qs(urlsplit(request).query) for _, request in requests[5:]
+        ]
+        self.assertEqual(
+            [query["query"] for query in range_queries],
+            [
+                [
+                    r'{job="NoDe/../../bad\"\\\n\r\t\x00\b\f\v\u0085name",'
+                    r'__name__="metric_a"}'
+                ],
+                [
+                    r'{job="NoDe/../../bad\"\\\n\r\t\x00\b\f\v\u0085name",'
+                    r'__name__="metric_b"}'
+                ],
+                [r'{job="ceph-exporter",__name__="metric_a"}'],
+                [r'{job="ceph-exporter",__name__="metric_b"}'],
+            ],
+        )
+        self.assertEqual([query["start"] for query in range_queries], [[starts[0]]] * 4)
+        self.assertEqual([query["end"] for query in range_queries], [[ends[0]]] * 4)
+        self.assertEqual([query["step"] for query in range_queries], [["31s"]] * 4)
         self.assertEqual(
             captures,
             [
@@ -185,6 +219,14 @@ class PrometheusCollectionTests(unittest.TestCase):
                 "metric-names/000001/result.json",
                 "metric-names/000002/response",
                 "metric-names/000002/result.json",
+                "query-range/000001/response",
+                "query-range/000001/result.json",
+                "query-range/000002/response",
+                "query-range/000002/result.json",
+                "query-range/000003/response",
+                "query-range/000003/result.json",
+                "query-range/000004/response",
+                "query-range/000004/result.json",
                 "targets/response",
                 "targets/result.json",
             ],
@@ -205,6 +247,21 @@ class PrometheusCollectionTests(unittest.TestCase):
         self.assertEqual(job_result["outcome"], "received")
         self.assertEqual(job_result["http_status"], 200)
         self.assertIsNone(job_result["error"])
+        self.assertEqual(
+            set(range_result),
+            {
+                "url",
+                "started_at",
+                "finished_at",
+                "outcome",
+                "http_status",
+                "error",
+                "job_name",
+                "metric_name",
+            },
+        )
+        self.assertEqual(range_result["job_name"], hostile_job)
+        self.assertEqual(range_result["metric_name"], "metric_a")
         self.assertIn(b'NoDe/../../bad', raw_job_values)
         self.assertFalse(any(hostile_job in path for path in captures))
         self.assertFalse(staging_exists)
@@ -269,8 +326,11 @@ class PrometheusCollectionTests(unittest.TestCase):
             third_metric_exists = (
                 admitted / "metric-names" / "000003" / "response"
             ).is_file()
+            third_range_exists = (
+                admitted / "query-range" / "000001" / "response"
+            ).is_file()
 
-        self.assertEqual(len(requests), 6)
+        self.assertEqual(len(requests), 7)
         self.assertEqual(len(problems), 4)
         self.assertIn(
             "buildinfo request failed: http_status: HTTP status 503", problems[0]
@@ -287,6 +347,161 @@ class PrometheusCollectionTests(unittest.TestCase):
         self.assertEqual(second_metric_result["outcome"], "failed")
         self.assertEqual(second_metric_result["error"]["kind"], "invalid_response")
         self.assertTrue(third_metric_exists)
+        self.assertTrue(third_range_exists)
+
+    def test_filtered_ranges_keep_pair_order_raw_failures_and_complete_admission(
+        self,
+    ) -> None:
+        hostile_metric = 'hostile/../../metric"\\\n\r\t\x00\b\f\v\u0085name'
+        large_body = json.dumps(
+            {
+                "status": "success",
+                "data": {"resultType": "matrix", "padding": "x" * 1048576},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        def range_responses(
+            request_path: str,
+        ) -> tuple[int, list[tuple[float, bytes]], int | None, bool]:
+            path = urlsplit(request_path).path
+            query = parse_qs(urlsplit(request_path).query)
+            if path == "/api/v1/label/job/values":
+                body = b'{"status":"success","data":["node-a","ceph-b"]}'
+                return 200, [(0, body)], len(body), False
+            if path == "/api/v1/label/__name__/values":
+                if query["match[]"] == ['{job="node-a"}']:
+                    body = json.dumps(
+                        {
+                            "status": "success",
+                            "data": [
+                                "drop",
+                                "same",
+                                "same",
+                                hostile_metric,
+                                "large",
+                                "drop",
+                            ],
+                        },
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                else:
+                    body = b'{"status":"success","data":["same","later"]}'
+                return 200, [(0, body)], len(body), False
+            if path == "/api/v1/query_range":
+                selector = query["query"][0]
+                if selector == '{job="node-a",__name__="same"}':
+                    body = b"range unavailable\x00\xff"
+                    return 503, [(0, body)], len(body), False
+                if "hostile/../../metric" in selector:
+                    body = b'{"status":"success",'
+                    return 200, [(0, body)], len(body) + 17, True
+                if selector == '{job="node-a",__name__="large"}':
+                    return 200, [(0, large_body)], len(large_body), False
+                body = b'{"status":"success","data":{"resultType":"matrix"}}'
+                return 200, [(0, body)], len(body), False
+            body = b'{"status":"success","data":{}}'
+            return 200, [(0, body)], len(body), False
+
+        with _loopback_prometheus(range_responses) as (
+            server,
+            url,
+        ), TemporaryDirectory() as directory:
+            root = Path(directory)
+            staging = root / "private" / "prometheus"
+            staging.parent.mkdir()
+            admitted = root / "admitted" / "prometheus"
+            admitted.parent.mkdir()
+
+            problems = collect_prometheus(
+                url=url,
+                since_seconds=300,
+                request_timeout_seconds=5,
+                metrics_filter_regex=r"^(?:same|hostile/|large|later)",
+                query_step="17s",
+                staging_directory=staging,
+                contribution_directory=admitted,
+            )
+
+            range_requests = [
+                request
+                for _, request in server.requests
+                if urlsplit(request).path == "/api/v1/query_range"
+            ]
+            selectors = [
+                parse_qs(urlsplit(request).query)["query"][0]
+                for request in range_requests
+            ]
+            range_directories = sorted(
+                path.name for path in (admitted / "query-range").iterdir()
+            )
+            results = [
+                json.loads(
+                    (admitted / "query-range" / f"{sequence:06d}" / "result.json")
+                    .read_text(encoding="utf-8")
+                )
+                for sequence in range(1, 6)
+            ]
+            raw_responses = [
+                (admitted / "query-range" / f"{sequence:06d}" / "response").read_bytes()
+                for sequence in range(1, 6)
+            ]
+            staging_exists = staging.exists()
+
+        self.assertEqual(
+            selectors,
+            [
+                '{job="node-a",__name__="same"}',
+                r'{job="node-a",__name__="hostile/../../metric\"\\\n\r\t'
+                r'\x00\b\f\v\u0085name"}',
+                '{job="node-a",__name__="large"}',
+                '{job="ceph-b",__name__="same"}',
+                '{job="ceph-b",__name__="later"}',
+            ],
+        )
+        self.assertIn("%2F..%2F..%2F", range_requests[1])
+        self.assertIn("%5C%22", range_requests[1])
+        self.assertNotIn(hostile_metric, range_requests[1])
+        self.assertEqual(
+            [(result["job_name"], result["metric_name"]) for result in results],
+            [
+                ("node-a", "same"),
+                ("node-a", hostile_metric),
+                ("node-a", "large"),
+                ("ceph-b", "same"),
+                ("ceph-b", "later"),
+            ],
+        )
+        self.assertEqual(
+            range_directories,
+            ["000001", "000002", "000003", "000004", "000005"],
+        )
+        self.assertEqual(len(problems), 2)
+        self.assertIn("job 'node-a' metric 'same' failed: http_status", problems[0])
+        self.assertIn("metric 'hostile/../../metric", problems[1])
+        self.assertEqual(raw_responses[0], b"range unavailable\x00\xff")
+        self.assertEqual(raw_responses[1], b'{"status":"success",')
+        self.assertEqual(results[0]["error"]["kind"], "http_status")
+        self.assertEqual(results[1]["error"]["kind"], "IncompleteRead")
+        self.assertTrue(
+            all(
+                set(result)
+                == {
+                    "url",
+                    "started_at",
+                    "finished_at",
+                    "outcome",
+                    "http_status",
+                    "error",
+                    "job_name",
+                    "metric_name",
+                }
+                for result in results
+            )
+        )
+        self.assertEqual(raw_responses[2], large_body)
+        self.assertEqual(results[2]["outcome"], "received")
+        self.assertFalse(staging_exists)
 
     def test_timeout_is_per_blocking_progress_and_preserves_partial_bytes(self) -> None:
         progressing_body = (

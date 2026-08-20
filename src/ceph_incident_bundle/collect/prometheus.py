@@ -25,8 +25,10 @@ def collect_prometheus(
     request_timeout_seconds: int,
     staging_directory: Path,
     contribution_directory: Path,
+    metrics_filter_regex: str = "",
+    query_step: str = "15s",
 ) -> list[str]:
-    """Collect fixed controls and atomically admit one Prometheus contribution."""
+    """Collect control and range HTTP evidence as one atomic contribution."""
     staging_directory = Path(staging_directory)
     contribution_directory = Path(contribution_directory)
     boundary_problem = _boundary_problem(staging_directory, contribution_directory)
@@ -96,9 +98,8 @@ def collect_prometheus(
             else:
                 job_names = [name for name in values if _SELECTED_JOB.search(name)]
 
-    # #97's control-only artifact contract has no field for parsed metric names.
-    # Keep the ordered, deduplicated handoff explicit so #98 can consume it when
-    # it adds range scheduling without reparsing or changing the raw captures.
+    # Parsed metric names schedule ranges only; raw discovery bytes stay unchanged.
+    # Keep the job association explicit because the same metric may occur in many jobs.
     metric_names_by_job: list[tuple[str, tuple[str, ...]]] = []
     for sequence, job_name in enumerate(job_names, 1):
         matcher = f'{{job="{_promql_string(job_name)}"}}'
@@ -147,6 +148,51 @@ def collect_prometheus(
             )
             continue
         metric_names_by_job.append((job_name, _deduplicate_metric_names(values)))
+
+    metric_filter = re.compile(metrics_filter_regex)
+    sequence = 0
+    for job_name, metric_names in metric_names_by_job:
+        for metric_name in metric_names:
+            if metric_filter.search(metric_name) is None:
+                continue
+            sequence += 1
+            matcher = (
+                f'{{job="{_promql_string(job_name)}",'
+                f'__name__="{_promql_string(metric_name)}"}}'
+            )
+            query = urlencode(
+                (
+                    ("query", matcher),
+                    ("start", str(start)),
+                    ("end", str(end)),
+                    ("step", query_step),
+                )
+            )
+            capture = candidate / "query-range" / f"{sequence:06d}"
+            try:
+                _, problem = _capture_request(
+                    _request_url(url, "/api/v1/query_range", query),
+                    capture,
+                    timeout=timeout,
+                    extra_result={
+                        "job_name": job_name,
+                        "metric_name": metric_name,
+                    },
+                )
+            except OSError as error:
+                return [
+                    *problems,
+                    _with_residue(
+                        f"Prometheus: cannot preserve range request "
+                        f"for job {job_name!r} metric {metric_name!r}: {error}",
+                        staging_directory,
+                    ),
+                ]
+            if problem is not None:
+                problems.append(
+                    f"Prometheus range request for job {job_name!r} "
+                    f"metric {metric_name!r} failed: {problem}"
+                )
 
     try:
         os.rename(candidate, contribution_directory)
