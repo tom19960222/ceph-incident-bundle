@@ -11,7 +11,7 @@ import tarfile
 from tempfile import TemporaryDirectory
 import threading
 import unittest
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from ceph_incident_bundle.inventory import draft_inventory
 
@@ -52,6 +52,7 @@ class _InstalledPrometheusHandler(BaseHTTPRequestHandler):
             "/api/v1/targets": b'{"status":"success","data":{"activeTargets":[]}}',
             "/api/v1/label/job/values": b'{"status":"success","data":["other","node-exporter"]}',
             "/api/v1/label/__name__/values": b'{"status":"success","data":["node_cpu_seconds_total"]}',
+            "/api/v1/query_range": b'{"status":"success","data":{"resultType":"matrix","result":[]}}',
         }
         body = bodies[path]
         self.send_response(200)
@@ -823,6 +824,8 @@ node-a = node-a.example.test
                 "node-a = node-a.example.test\n"
                 "[prometheus]\n"
                 f"url = {prometheus_url}\n"
+                "metrics_filter_regex = ^node_cpu_seconds_total$\n"
+                "query_step = 45s\n"
                 "request_timeout = 1s\n"
             ).encode("ascii")
             (cwd / "inventory.ini").write_bytes(inventory)
@@ -845,12 +848,17 @@ node-a = node-a.example.test
                 metric_result_file = archive.extractfile(
                     f"{root_name}/prometheus/metric-names/000001/result.json"
                 )
+                range_result_file = archive.extractfile(
+                    f"{root_name}/prometheus/query-range/000001/result.json"
+                )
                 metadata_file = archive.extractfile(f"{root_name}/collection.json")
                 assert job_values_file is not None
                 assert metric_result_file is not None
+                assert range_result_file is not None
                 assert metadata_file is not None
                 job_values = job_values_file.read()
                 metric_result = json.load(metric_result_file)
+                range_result = json.load(range_result_file)
                 outcome = json.load(metadata_file)["outcome"]
 
         self.assertEqual(completed.returncode, 0)
@@ -859,7 +867,7 @@ node-a = node-a.example.test
             completed.stdout,
             f"{bundle.resolve()} (complete)\n".encode("utf-8"),
         )
-        self.assertEqual([method for method, _ in requests], ["GET"] * 4)
+        self.assertEqual([method for method, _ in requests], ["GET"] * 5)
         self.assertEqual(
             [urlsplit(request).path for _, request in requests],
             [
@@ -867,7 +875,19 @@ node-a = node-a.example.test
                 "/api/v1/targets",
                 "/api/v1/label/job/values",
                 "/api/v1/label/__name__/values",
+                "/api/v1/query_range",
             ],
+        )
+        range_query = parse_qs(urlsplit(requests[-1][1]).query)
+        self.assertEqual(set(range_query), {"query", "start", "end", "step"})
+        self.assertEqual(
+            range_query["query"],
+            ['{job="node-exporter",__name__="node_cpu_seconds_total"}'],
+        )
+        self.assertEqual(range_query["step"], ["45s"])
+        self.assertEqual(
+            int(range_query["end"][0]) - int(range_query["start"][0]),
+            86400,
         )
         self.assertEqual(
             job_values,
@@ -875,6 +895,9 @@ node-a = node-a.example.test
         )
         self.assertEqual(metric_result["job_name"], "node-exporter")
         self.assertEqual(metric_result["outcome"], "received")
+        self.assertEqual(range_result["job_name"], "node-exporter")
+        self.assertEqual(range_result["metric_name"], "node_cpu_seconds_total")
+        self.assertEqual(range_result["outcome"], "received")
         self.assertEqual(outcome, "complete")
         self.assertIn(f"{root_name}/prometheus/buildinfo/response", names)
 
