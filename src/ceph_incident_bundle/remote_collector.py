@@ -39,6 +39,11 @@ class Probe(NamedTuple):
 # Target Node Probe catalog" table for the built-in name/argv contract.
 NODE_PROBE_CATALOG: tuple[Probe, ...] = (
     Probe(name="hostname", area="node", argv=("hostname",)),
+    Probe(
+        name="current-utc",
+        area="node",
+        argv=("date", "-u", "+%Y-%m-%dT%H:%M:%SZ"),
+    ),
 )
 
 
@@ -72,7 +77,14 @@ def _run_probe(probe: Probe, capture: Path, timeout_seconds: int) -> bool:
                 exit_code = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 outcome = "timed_out"
-                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    # The child can leave between wait timing out and the
+                    # normal V1 process-group termination request.  It still
+                    # timed out from the Probe contract's point of view, so
+                    # retain that result instead of losing its capture.
+                    pass
                 process.wait()
                 error = {
                     "kind": "timeout",
@@ -82,7 +94,10 @@ def _run_probe(probe: Probe, capture: Path, timeout_seconds: int) -> bool:
                 exit_code = process.poll()
                 if exit_code is None:
                     outcome = "timed_out"
-                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                     process.wait()
                     error = {
                         "kind": "timeout",
@@ -106,8 +121,12 @@ def _run_probe(probe: Probe, capture: Path, timeout_seconds: int) -> bool:
 
     succeeded = outcome == "exited" and exit_code == 0
     if not succeeded:
+        error_detail = ""
+        if error is not None:
+            error_detail = f" error={error['kind']}: {error['message']}"
         print(
-            f"{probe.name} Probe failed: outcome={outcome} exit_code={exit_code}",
+            f"{probe.name} Probe failed: outcome={outcome} exit_code={exit_code}"
+            f"{error_detail}",
             file=sys.stderr,
         )
     return succeeded

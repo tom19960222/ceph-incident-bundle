@@ -1069,6 +1069,70 @@ node-a = node-a.example.test
         self.assertIn(f"{root}/nodes/node-a/probes/hostname/stdout", names)
         self.assertEqual(outcome, "partial")
 
+    def test_remote_probe_failure_delivers_an_admitted_partial_bundle_without_diagnostics(
+        self,
+    ) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            hostname = fake_bin / "hostname"
+            hostname.write_text(
+                f"""#!{sys.executable}
+import os
+os.write(1, b"raw hostname output\\x00")
+os.write(2, b"raw hostname error\\xff")
+raise SystemExit(7)
+""",
+                encoding="utf-8",
+            )
+            hostname.chmod(0o755)
+            (cwd / "inventory.ini").write_bytes(inventory)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+
+            completed = self.run_cli("collect", cwd=cwd, env=environment, timeout=20)
+
+            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            bundle = bundles[0]
+            with tarfile.open(bundle, "r:gz") as archive:
+                root = bundle.name.removesuffix(".tar.gz")
+                stdout_file = archive.extractfile(
+                    f"{root}/nodes/node-a/probes/hostname/stdout"
+                )
+                stderr_file = archive.extractfile(
+                    f"{root}/nodes/node-a/probes/hostname/stderr"
+                )
+                result_file = archive.extractfile(
+                    f"{root}/nodes/node-a/probes/hostname/result.json"
+                )
+                metadata_file = archive.extractfile(f"{root}/collection.json")
+                assert stdout_file is not None
+                assert stderr_file is not None
+                assert result_file is not None
+                assert metadata_file is not None
+                probe_stdout = stdout_file.read()
+                probe_stderr = stderr_file.read()
+                result = json.load(result_file)
+                outcome = json.load(metadata_file)["outcome"]
+                member_names = {member.name for member in archive.getmembers()}
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(completed.stdout.endswith(b" (partial)\n"))
+        self.assertIn(b"[node-a] hostname Probe failed", completed.stderr)
+        self.assertIn(b"Remote Node Collector exited with status 1", completed.stderr)
+        self.assertEqual(probe_stdout, b"raw hostname output\x00")
+        self.assertEqual(probe_stderr, b"raw hostname error\xff")
+        self.assertEqual(result["outcome"], "exited")
+        self.assertEqual(result["exit_code"], 7)
+        self.assertIsNone(result["error"])
+        self.assertEqual(outcome, "partial")
+        self.assertFalse(any("diagnostic" in member for member in member_names))
+
     def test_corrupt_ssh_stdout_publishes_partial_without_a_node_contribution(
         self,
     ) -> None:
