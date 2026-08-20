@@ -104,6 +104,7 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
                         context=inventory.kubernetes_context,
                         consumer_namespace=inventory.consumer_namespace,
                         operator_namespace=inventory.operator_namespace,
+                        since=since,
                         probe_timeout_seconds=inventory.probe_timeout_seconds,
                         staging_directory=workspace / "private" / "kubernetes",
                         contribution_directory=kubernetes_contribution,
