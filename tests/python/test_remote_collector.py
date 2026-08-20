@@ -54,10 +54,186 @@ print(os.path.basename(__file__))
             "chronyc",
             "ntpq",
             "timedatectl",
+            "journalctl",
         ):
             executable = directory / command
             executable.write_text(script, encoding="utf-8")
             executable.chmod(0o755)
+
+    @staticmethod
+    def write_log_fixture_sitecustomize(path: Path) -> None:
+        path.write_text(
+            """import datetime as _datetime
+import os
+from pathlib import Path
+
+_source_root = os.environ["REMOTE_COLLECTOR_FILE_FIXTURES"]
+_source_log = os.path.join(_source_root, "var/log")
+_original_open = os.open
+_original_fstat = os.fstat
+_original_fdopen = os.fdopen
+_original_path_open = Path.open
+_original_scandir = os.scandir
+_fail_stat = os.environ.get("REMOTE_COLLECTOR_FAIL_LOG_STAT")
+_fail_fstat = os.environ.get("REMOTE_COLLECTOR_FAIL_LOG_FSTAT")
+_fail_open = os.environ.get("REMOTE_COLLECTOR_FAIL_LOG_OPEN")
+_fail_read = os.environ.get("REMOTE_COLLECTOR_FAIL_LOG_READ")
+_fail_write_suffix = os.environ.get("REMOTE_COLLECTOR_FAIL_WRITE_SUFFIX")
+_race_open = os.environ.get("REMOTE_COLLECTOR_RACE_OPEN")
+_race_old_open = os.environ.get("REMOTE_COLLECTOR_RACE_OLD_OPEN")
+_directory_disappears = os.environ.get(
+    "REMOTE_COLLECTOR_LOG_DIRECTORY_DISAPPEARS"
+)
+_directory_becomes_link = os.environ.get(
+    "REMOTE_COLLECTOR_LOG_DIRECTORY_BECOMES_LINK"
+)
+_directory_becomes_special = os.environ.get(
+    "REMOTE_COLLECTOR_LOG_DIRECTORY_BECOMES_SPECIAL"
+)
+_read_descriptor = None
+_fstat_descriptor = None
+_raced = False
+_raced_old = False
+_directory_disappeared = False
+_directory_replaced = False
+
+class _FrozenDateTime(_datetime.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        fixed = cls(2026, 8, 21, 12, 0, 0, tzinfo=_datetime.timezone.utc)
+        if tz is None:
+            return fixed.replace(tzinfo=None)
+        return fixed.astimezone(tz)
+
+def _name(path):
+    return os.fspath(path).rsplit("/", 1)[-1]
+
+def _is_source_log_descriptor(path):
+    if not isinstance(path, int):
+        return False
+    try:
+        opened = _original_fstat(path)
+        source = os.stat(_source_log)
+    except OSError:
+        return False
+    return (opened.st_dev, opened.st_ino) == (source.st_dev, source.st_ino)
+
+class _Entry:
+    def __init__(self, entry):
+        self._entry = entry
+        self.name = entry.name
+    def stat(self, *args, **kwargs):
+        if _fail_stat and self.name == _name(_fail_stat):
+            raise PermissionError("fixture log stat failure")
+        return self._entry.stat(*args, **kwargs)
+
+class _Scanner:
+    def __init__(self, scanner):
+        self._scanner = scanner
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        return self._scanner.__exit__(*args)
+    def __iter__(self):
+        return (_Entry(entry) for entry in self._scanner)
+
+def scandir(path):
+    scanner = _original_scandir(path)
+    if _fail_stat and _is_source_log_descriptor(path):
+        return _Scanner(scanner)
+    return scanner
+
+def open(path, flags, *args, **kwargs):
+    global _directory_disappeared, _fstat_descriptor, _read_descriptor
+    global _directory_replaced, _raced, _raced_old
+    source = os.fspath(path)
+    if source == "/" and flags & os.O_DIRECTORY:
+        return _original_open(_source_root, flags, *args, **kwargs)
+    if (
+        _directory_disappears
+        and source == _directory_disappears
+        and flags & os.O_DIRECTORY
+        and not _directory_disappeared
+    ):
+        _directory_disappeared = True
+        fixture = os.path.join(_source_log, _directory_disappears)
+        os.rename(fixture, fixture + "-after-selection")
+    replacement = _directory_becomes_link or _directory_becomes_special
+    if (
+        replacement
+        and source == replacement
+        and flags & os.O_DIRECTORY
+        and not _directory_replaced
+    ):
+        _directory_replaced = True
+        fixture = os.path.join(_source_log, replacement)
+        target = fixture + "-after-selection"
+        os.rename(fixture, target)
+        if _directory_becomes_link:
+            os.symlink(os.path.basename(target), fixture)
+        else:
+            os.mkfifo(fixture)
+    if _race_open and _name(source) == _name(_race_open) and not _raced:
+        _raced = True
+        fixture = os.path.join(_source_root, _race_open.lstrip("/"))
+        target = fixture + "-after-race"
+        os.rename(fixture, target)
+        os.symlink(os.path.basename(target), fixture)
+    if _race_old_open and _name(source) == _name(_race_old_open) and not _raced_old:
+        _raced_old = True
+        fixture = os.path.join(_source_root, _race_old_open.lstrip("/"))
+        os.rename(fixture, fixture + "-after-race")
+        Path(fixture).write_bytes(b"older replacement bytes")
+        cutoff_ns = 1_787_313_540_000_000_000
+        os.utime(fixture, ns=(cutoff_ns - 1, cutoff_ns - 1))
+    if _fail_open and _name(source) == _name(_fail_open):
+        raise PermissionError("fixture selected-log open failure")
+    descriptor = _original_open(path, flags, *args, **kwargs)
+    if _fail_fstat and _name(source) == _name(_fail_fstat):
+        _fstat_descriptor = descriptor
+    if _fail_read and _name(source) == _name(_fail_read):
+        _read_descriptor = descriptor
+    return descriptor
+
+def fstat(descriptor):
+    global _fstat_descriptor
+    if descriptor == _fstat_descriptor:
+        _fstat_descriptor = None
+        raise PermissionError("fixture opened-log stat failure")
+    return _original_fstat(descriptor)
+
+class _BrokenRead:
+    def __init__(self, opened):
+        self._opened = opened
+    def __enter__(self):
+        return self
+    def __exit__(self, *unused):
+        self._opened.close()
+    def read(self, *unused):
+        raise OSError("fixture log read failure")
+
+def fdopen(descriptor, *args, **kwargs):
+    global _read_descriptor
+    opened = _original_fdopen(descriptor, *args, **kwargs)
+    if descriptor == _read_descriptor:
+        _read_descriptor = None
+        return _BrokenRead(opened)
+    return opened
+
+def path_open(self, *args, **kwargs):
+    if _fail_write_suffix and str(self).endswith(_fail_write_suffix):
+        raise OSError("fixture log workspace write failure")
+    return _original_path_open(self, *args, **kwargs)
+
+_datetime.datetime = _FrozenDateTime
+os.scandir = scandir
+os.open = open
+os.fstat = fstat
+os.fdopen = fdopen
+Path.open = path_open
+""",
+            encoding="utf-8",
+        )
 
     def run_remote_collector(
         self, *arguments: str, environment: dict[str, str] | None = None
@@ -253,10 +429,482 @@ print(os.path.basename(__file__))
 
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(
-            executed, tuple(argv for _, _, argv in expected_catalog)
+            executed[:-1], tuple(argv for _, _, argv in expected_catalog)
+        )
+        self.assertEqual(executed[-1][0], "journalctl")
+        self.assertEqual(executed[-1][1], "--since")
+        self.assertRegex(executed[-1][2], r"^\d{4}-\d\d-\d\dT.*Z$")
+        self.assertEqual(
+            executed[-1][3:],
+            ("--no-pager", "--utc", "--output=short-iso-precise"),
         )
         for probe_name, _, _ in expected_catalog:
             self.assertIn(f"node/probes/{probe_name}/result.json", member_names)
+        self.assertIn("node/probes/journal-system/result.json", member_names)
+
+    def test_one_node_cutoff_selects_log_mtimes_and_the_journal_probe(self) -> None:
+        cutoff = "2026-08-21T11:59:00Z"
+        cutoff_ns = 1_787_313_540_000_000_000
+        payloads = {
+            "var/log/exact.log": b"complete file at exact cutoff\n",
+            "var/log/adjacent-newer.log.gz": b"\x1f\x8bcompressed\x00\xff",
+            "var/log/rotated.log.1": b"old record\nnew record\n",
+            "var/log/binary.log": b"binary\x00\xff\n",
+            "var/log/journal/raw.journal": b"LPKSHHRHraw-journal\x00\xfe",
+        }
+        omitted = "var/log/adjacent-older.log"
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            journalctl = fake_bin / "journalctl"
+            journalctl.write_text(
+                f"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+import sys
+with Path(os.environ["JOURNAL_EVENT_LOG"]).open("a", encoding="utf-8") as events:
+    events.write(json.dumps([os.path.basename(__file__), *sys.argv[1:]]) + "\\n")
+os.write(1, b"journal bytes\\x00\\xff")
+""",
+                encoding="utf-8",
+            )
+            journalctl.chmod(0o755)
+
+            source_root = root / "sources"
+            for relative, payload in payloads.items():
+                fixture = source_root / relative
+                fixture.parent.mkdir(parents=True, exist_ok=True)
+                fixture.write_bytes(payload)
+            old_fixture = source_root / omitted
+            old_fixture.write_bytes(b"outside the evidence window")
+            os.symlink("exact.log", source_root / "var/log/linked.log")
+            os.mkfifo(source_root / "var/log/special.pipe")
+            os.utime(source_root / "var/log/exact.log", ns=(cutoff_ns, cutoff_ns))
+            os.utime(
+                source_root / "var/log/adjacent-newer.log.gz",
+                ns=(cutoff_ns + 1, cutoff_ns + 1),
+            )
+            os.utime(
+                source_root / "var/log/binary.log",
+                ns=(cutoff_ns + 2, cutoff_ns + 2),
+            )
+            os.utime(
+                source_root / "var/log/rotated.log.1",
+                ns=(cutoff_ns + 2, cutoff_ns + 2),
+            )
+            os.utime(
+                source_root / "var/log/journal/raw.journal",
+                ns=(cutoff_ns + 3, cutoff_ns + 3),
+            )
+            os.utime(old_fixture, ns=(cutoff_ns - 1, cutoff_ns - 1))
+
+            self.write_log_fixture_sitecustomize(root / "sitecustomize.py")
+            journal_events = root / "journal-events.jsonl"
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            environment["PYTHONPATH"] = str(root)
+            environment["REMOTE_COLLECTOR_FILE_FIXTURES"] = str(source_root)
+            environment["JOURNAL_EVENT_LOG"] = str(journal_events)
+
+            completed = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "30",
+                environment=environment,
+            )
+
+            archive = root / "node.tar.gz"
+            archive.write_bytes(completed.stdout)
+            with tarfile.open(archive, "r:gz") as opened:
+                members = {member.name: member for member in opened.getmembers()}
+                archived_payloads = {}
+                for relative in payloads:
+                    member_name = f"node/files/{relative}"
+                    payload_file = opened.extractfile(member_name)
+                    assert payload_file is not None
+                    archived_payloads[relative] = payload_file.read()
+                journal_stdout_file = opened.extractfile(
+                    "node/probes/journal-system/stdout"
+                )
+                journal_result_file = opened.extractfile(
+                    "node/probes/journal-system/result.json"
+                )
+                assert journal_stdout_file is not None
+                assert journal_result_file is not None
+                journal_stdout = journal_stdout_file.read()
+                journal_result = json.load(journal_result_file)
+            journal_argv = json.loads(
+                journal_events.read_text(encoding="utf-8").splitlines()[0]
+            )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8", errors="backslashreplace"),
+        )
+        self.assertEqual(completed.stderr, b"")
+        self.assertEqual(archived_payloads, payloads)
+        self.assertNotIn(f"node/files/{omitted}", members)
+        self.assertNotIn("node/files/var/log/linked.log", members)
+        self.assertNotIn("node/files/var/log/special.pipe", members)
+        self.assertTrue(
+            all(members[f"node/files/{relative}"].isreg() for relative in payloads)
+        )
+        expected_journal_argv = [
+            "journalctl",
+            "--since",
+            cutoff,
+            "--no-pager",
+            "--utc",
+            "--output=short-iso-precise",
+        ]
+        self.assertEqual(journal_argv, expected_journal_argv)
+        self.assertEqual(journal_result["argv"], expected_journal_argv)
+        self.assertEqual(journal_result["outcome"], "exited")
+        self.assertEqual(journal_result["exit_code"], 0)
+        self.assertEqual(journal_stdout, b"journal bytes\x00\xff")
+
+    def test_log_file_failures_are_partial_and_do_not_stop_later_files(self) -> None:
+        cutoff_ns = 1_787_313_540_000_000_000
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            source_root = root / "sources"
+            log_root = source_root / "var/log"
+            log_root.mkdir(parents=True)
+            for name in (
+                "fail-stat.log",
+                "fail-fstat-open.log",
+                "fail-open.log",
+                "fail-read.log",
+                "fail-write.log",
+                "raced.log",
+                "raced-old.log",
+                "later.log",
+            ):
+                fixture = log_root / name
+                fixture.write_bytes(f"{name} bytes".encode("utf-8"))
+                os.utime(fixture, ns=(cutoff_ns, cutoff_ns))
+            vanished = log_root / "vanished-dir/inside.log"
+            vanished.parent.mkdir()
+            vanished.write_bytes(b"selected directory evidence")
+            os.utime(vanished, ns=(cutoff_ns, cutoff_ns))
+
+            self.write_log_fixture_sitecustomize(root / "sitecustomize.py")
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            environment["PYTHONPATH"] = str(root)
+            environment["REMOTE_COLLECTOR_FILE_FIXTURES"] = str(source_root)
+
+            cases = (
+                (
+                    "REMOTE_COLLECTOR_FAIL_LOG_STAT",
+                    "/var/log/fail-stat.log",
+                    "cannot inspect log source /var/log/fail-stat.log",
+                    "fail-stat.log",
+                ),
+                (
+                    "REMOTE_COLLECTOR_FAIL_LOG_READ",
+                    "/var/log/fail-read.log",
+                    "cannot copy selected file /var/log/fail-read.log",
+                    "fail-read.log",
+                ),
+                (
+                    "REMOTE_COLLECTOR_FAIL_LOG_FSTAT",
+                    "/var/log/fail-fstat-open.log",
+                    "cannot inspect opened selected file "
+                    "/var/log/fail-fstat-open.log",
+                    "fail-fstat-open.log",
+                ),
+                (
+                    "REMOTE_COLLECTOR_FAIL_LOG_OPEN",
+                    "/var/log/fail-open.log",
+                    "cannot open selected file /var/log/fail-open.log",
+                    "fail-open.log",
+                ),
+                (
+                    "REMOTE_COLLECTOR_FAIL_WRITE_SUFFIX",
+                    "node/files/var/log/fail-write.log",
+                    "cannot copy selected file /var/log/fail-write.log",
+                    "fail-write.log",
+                ),
+            )
+            results = []
+            for setting, value, diagnostic, failed_name in cases:
+                environment[setting] = value
+                completed = self.run_remote_collector(
+                    "--since-seconds",
+                    "60",
+                    "--probe-timeout-seconds",
+                    "30",
+                    environment=environment,
+                )
+                archive = root / f"{setting}.tar.gz"
+                archive.write_bytes(completed.stdout)
+                with tarfile.open(archive, "r:gz") as opened:
+                    member_names = {member.name for member in opened.getmembers()}
+                results.append((completed, member_names, diagnostic, failed_name))
+                environment.pop(setting)
+
+            environment["REMOTE_COLLECTOR_RACE_OPEN"] = "/var/log/raced.log"
+            raced = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "30",
+                environment=environment,
+            )
+            raced_archive = root / "raced.tar.gz"
+            raced_archive.write_bytes(raced.stdout)
+            with tarfile.open(raced_archive, "r:gz") as opened:
+                raced_names = {member.name for member in opened.getmembers()}
+
+            environment.pop("REMOTE_COLLECTOR_RACE_OPEN")
+            environment["REMOTE_COLLECTOR_RACE_OLD_OPEN"] = (
+                "/var/log/raced-old.log"
+            )
+            raced_old = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "30",
+                environment=environment,
+            )
+            raced_old_archive = root / "raced-old.tar.gz"
+            raced_old_archive.write_bytes(raced_old.stdout)
+            with tarfile.open(raced_old_archive, "r:gz") as opened:
+                raced_old_names = {member.name for member in opened.getmembers()}
+
+            environment.pop("REMOTE_COLLECTOR_RACE_OLD_OPEN")
+            environment["REMOTE_COLLECTOR_LOG_DIRECTORY_DISAPPEARS"] = (
+                "vanished-dir"
+            )
+            disappeared = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "30",
+                environment=environment,
+            )
+            disappeared_archive = root / "disappeared-directory.tar.gz"
+            disappeared_archive.write_bytes(disappeared.stdout)
+            with tarfile.open(disappeared_archive, "r:gz") as opened:
+                disappeared_names = {
+                    member.name for member in opened.getmembers()
+                }
+
+        for completed, member_names, diagnostic, failed_name in results:
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(diagnostic.encode("utf-8"), completed.stderr)
+            self.assertNotIn(f"node/files/var/log/{failed_name}", member_names)
+            self.assertIn(
+                "node/files/var/log/later.log",
+                member_names,
+                diagnostic,
+            )
+            self.assertIn("node/probes/journal-system/result.json", member_names)
+        self.assertEqual(
+            raced.returncode,
+            0,
+            raced.stderr.decode("utf-8", errors="backslashreplace"),
+        )
+        self.assertEqual(raced.stderr, b"")
+        self.assertNotIn("node/files/var/log/raced.log", raced_names)
+        self.assertIn("node/files/var/log/later.log", raced_names)
+        self.assertEqual(
+            raced_old.returncode,
+            0,
+            raced_old.stderr.decode("utf-8", errors="backslashreplace"),
+        )
+        self.assertNotIn("node/files/var/log/raced-old.log", raced_old_names)
+        self.assertIn("node/files/var/log/later.log", raced_old_names)
+        self.assertNotEqual(disappeared.returncode, 0)
+        self.assertIn(
+            b"cannot open log directory /var/log/vanished-dir",
+            disappeared.stderr,
+        )
+        self.assertNotIn(
+            "node/files/var/log/vanished-dir/inside.log",
+            disappeared_names,
+        )
+        self.assertIn("node/files/var/log/later.log", disappeared_names)
+
+    def test_log_directory_type_races_are_normal_omissions(self) -> None:
+        cutoff_ns = 1_787_313_540_000_000_000
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            source_root = root / "sources"
+            log_root = source_root / "var/log"
+            for name in ("linked-dir", "special-dir"):
+                nested = log_root / name / "inside.log"
+                nested.parent.mkdir(parents=True)
+                nested.write_bytes(b"must not follow replacement")
+                os.utime(nested, ns=(cutoff_ns, cutoff_ns))
+            later = log_root / "later.log"
+            later.write_bytes(b"sibling evidence")
+            os.utime(later, ns=(cutoff_ns, cutoff_ns))
+            self.write_log_fixture_sitecustomize(root / "sitecustomize.py")
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            environment["PYTHONPATH"] = str(root)
+            environment["REMOTE_COLLECTOR_FILE_FIXTURES"] = str(source_root)
+
+            results = []
+            for setting, name in (
+                (
+                    "REMOTE_COLLECTOR_LOG_DIRECTORY_BECOMES_LINK",
+                    "linked-dir",
+                ),
+                (
+                    "REMOTE_COLLECTOR_LOG_DIRECTORY_BECOMES_SPECIAL",
+                    "special-dir",
+                ),
+            ):
+                environment[setting] = name
+                completed = self.run_remote_collector(
+                    "--since-seconds",
+                    "60",
+                    "--probe-timeout-seconds",
+                    "30",
+                    environment=environment,
+                )
+                archive = root / f"{name}.tar.gz"
+                archive.write_bytes(completed.stdout)
+                with tarfile.open(archive, "r:gz") as opened:
+                    names = {member.name for member in opened.getmembers()}
+                results.append((completed, names, name))
+                environment.pop(setting)
+
+        for completed, names, replaced_name in results:
+            self.assertEqual(
+                completed.returncode,
+                0,
+                completed.stderr.decode("utf-8", errors="backslashreplace"),
+            )
+            self.assertEqual(completed.stderr, b"")
+            self.assertFalse(
+                any(
+                    name.startswith(f"node/files/var/log/{replaced_name}")
+                    for name in names
+                )
+            )
+            self.assertIn("node/files/var/log/later.log", names)
+
+    def test_journal_failures_preserve_capture_and_continue_to_log_files(self) -> None:
+        cutoff_ns = 1_787_313_540_000_000_000
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            journalctl = fake_bin / "journalctl"
+            journalctl.write_text(
+                f"""#!{sys.executable}
+import os
+import time
+os.write(1, b"journal partial stdout\\x00\\xff")
+os.write(2, b"journal partial stderr\\x00\\xfe")
+if os.environ.get("JOURNAL_MODE") == "timeout":
+    time.sleep(30)
+raise SystemExit(9)
+""",
+                encoding="utf-8",
+            )
+            journalctl.chmod(0o755)
+            source_root = root / "sources"
+            later_log = source_root / "var/log/later.log"
+            later_log.parent.mkdir(parents=True)
+            later_log.write_bytes(b"log collection continued")
+            os.utime(later_log, ns=(cutoff_ns, cutoff_ns))
+            self.write_log_fixture_sitecustomize(root / "sitecustomize.py")
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            environment["PYTHONPATH"] = str(root)
+            environment["REMOTE_COLLECTOR_FILE_FIXTURES"] = str(source_root)
+
+            outcomes = []
+            for mode, timeout in (("exit", "30"), ("timeout", "1")):
+                environment["JOURNAL_MODE"] = mode
+                completed = self.run_remote_collector(
+                    "--since-seconds",
+                    "60",
+                    "--probe-timeout-seconds",
+                    timeout,
+                    environment=environment,
+                )
+                archive = root / f"journal-{mode}.tar.gz"
+                archive.write_bytes(completed.stdout)
+                with tarfile.open(archive, "r:gz") as opened:
+                    names = {member.name for member in opened.getmembers()}
+                    stdout_file = opened.extractfile(
+                        "node/probes/journal-system/stdout"
+                    )
+                    stderr_file = opened.extractfile(
+                        "node/probes/journal-system/stderr"
+                    )
+                    result_file = opened.extractfile(
+                        "node/probes/journal-system/result.json"
+                    )
+                    assert stdout_file is not None
+                    assert stderr_file is not None
+                    assert result_file is not None
+                    outcomes.append(
+                        (
+                            completed,
+                            names,
+                            stdout_file.read(),
+                            stderr_file.read(),
+                            json.load(result_file),
+                        )
+                    )
+
+            journalctl.unlink()
+            environment.pop("JOURNAL_MODE")
+            missing = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "30",
+                environment=environment,
+            )
+            missing_archive = root / "journal-missing.tar.gz"
+            missing_archive.write_bytes(missing.stdout)
+            with tarfile.open(missing_archive, "r:gz") as opened:
+                missing_names = {member.name for member in opened.getmembers()}
+                missing_result_file = opened.extractfile(
+                    "node/probes/journal-system/result.json"
+                )
+                assert missing_result_file is not None
+                missing_result = json.load(missing_result_file)
+
+        exited, timed_out = outcomes
+        for completed, names, stdout, stderr, _ in outcomes:
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(stdout, b"journal partial stdout\x00\xff")
+            self.assertEqual(stderr, b"journal partial stderr\x00\xfe")
+            self.assertIn("node/files/var/log/later.log", names)
+            self.assertIn(b"journal-system Probe failed", completed.stderr)
+        self.assertEqual(exited[4]["outcome"], "exited")
+        self.assertEqual(exited[4]["exit_code"], 9)
+        self.assertIsNone(exited[4]["error"])
+        self.assertEqual(timed_out[4]["outcome"], "timed_out")
+        self.assertIsNone(timed_out[4]["exit_code"])
+        self.assertEqual(timed_out[4]["error"]["kind"], "timeout")
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertEqual(missing_result["outcome"], "failed_to_start")
+        self.assertIsNone(missing_result["exit_code"])
+        self.assertIn("node/files/var/log/later.log", missing_names)
+        self.assertIn(b"journal-system Probe failed", missing.stderr)
 
     def test_selected_ceph_source_includes_the_authorized_empty_ceph_shape(self) -> None:
         with TemporaryDirectory() as command_directory:

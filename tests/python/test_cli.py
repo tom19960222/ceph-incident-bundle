@@ -750,10 +750,12 @@ node-a = node-a.example.test
             "timedatectl-show-timesync",
             "timedatectl-timesync-status",
             "systemd-timesyncd-status",
+            "journal-system",
         ):
             self.assertIn(
                 f"{root}/nodes/node-a/probes/{probe_name}/result.json", names
             )
+        self.assertIn(f"{root}/nodes/node-a/files/var/log/fake.log", names)
         self.assertTrue(all(member.isdir() or member.isreg() for member in members))
         for top_level in ("nodes", "ceph", "kubernetes", "prometheus"):
             self.assertIn(f"{root}/{top_level}", names)
@@ -1303,6 +1305,63 @@ raise SystemExit(7)
         self.assertIsNone(result["error"])
         self.assertEqual(outcome, "partial")
         self.assertFalse(any("diagnostic" in member for member in member_names))
+
+    def test_journal_failure_delivers_its_complete_archive_as_partial(self) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
+            environment["FAKE_SSH_JOURNAL_FAILURE"] = "1"
+
+            completed = self.run_cli("collect", cwd=cwd, env=environment, timeout=30)
+
+            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            bundle = bundles[0]
+            with tarfile.open(bundle, "r:gz") as archive:
+                root = bundle.name.removesuffix(".tar.gz")
+                stdout_file = archive.extractfile(
+                    f"{root}/nodes/node-a/probes/journal-system/stdout"
+                )
+                stderr_file = archive.extractfile(
+                    f"{root}/nodes/node-a/probes/journal-system/stderr"
+                )
+                result_file = archive.extractfile(
+                    f"{root}/nodes/node-a/probes/journal-system/result.json"
+                )
+                metadata_file = archive.extractfile(f"{root}/collection.json")
+                assert stdout_file is not None
+                assert stderr_file is not None
+                assert result_file is not None
+                assert metadata_file is not None
+                journal_stdout = stdout_file.read()
+                journal_stderr = stderr_file.read()
+                journal_result = json.load(result_file)
+                outcome = json.load(metadata_file)["outcome"]
+                member_names = {member.name for member in archive.getmembers()}
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stdout,
+            f"{bundle.resolve()} (partial)\n".encode("utf-8"),
+        )
+        self.assertIn(b"[node-a] journal-system Probe failed", completed.stderr)
+        self.assertIn(b"Remote Node Collector exited with status 1", completed.stderr)
+        self.assertEqual(journal_stdout, b"partial journal stdout\x00\xff")
+        self.assertEqual(journal_stderr, b"partial journal stderr\x00\xfe")
+        self.assertEqual(journal_result["outcome"], "exited")
+        self.assertEqual(journal_result["exit_code"], 9)
+        self.assertEqual(outcome, "partial")
+        self.assertIn(
+            f"{root}/nodes/node-a/files/var/log/fake.log",
+            member_names,
+        )
 
     def test_complete_archive_with_selected_file_failure_is_admitted_as_partial(
         self,
@@ -1860,16 +1919,45 @@ if hostile_member:
     raise SystemExit(0)
 remote_start = sys.argv.index("python3") + 1
 probe_bin = Path(tempfile.mkdtemp(prefix="fake-ssh-probes."))
+remote_support = Path(tempfile.mkdtemp(prefix="fake-ssh-remote-support."))
+remote_source_root = remote_support / "source"
+remote_log = remote_source_root / "var/log/fake.log"
+remote_log.parent.mkdir(parents=True)
+remote_log.write_bytes(b"fake remote var log bytes\\x00\\xff")
+(remote_support / "sitecustomize.py").write_text(
+    "import os\\n"
+    "_source_root = os.environ['FAKE_REMOTE_SOURCE_ROOT']\\n"
+    "_original_open = os.open\\n"
+    "def open(path, flags, *args, **kwargs):\\n"
+    "    if os.fspath(path) == '/' and flags & os.O_DIRECTORY:\\n"
+    "        return _original_open(_source_root, flags, *args, **kwargs)\\n"
+    "    return _original_open(path, flags, *args, **kwargs)\\n"
+    "os.open = open\\n",
+    encoding="utf-8",
+)
 probe_script = f"#!{sys.executable}\\nimport os\\nprint(os.path.basename(__file__))\\n"
 for command in (
     "hostname", "date", "uname", "uptime", "lscpu", "free", "ps", "df",
     "lsblk", "iostat", "pvs", "vgs", "lvs", "ip", "dmesg", "systemctl",
-    "podman", "docker", "chronyc", "ntpq", "timedatectl",
+    "podman", "docker", "chronyc", "ntpq", "timedatectl", "journalctl",
 ):
     executable = probe_bin / command
     executable.write_text(probe_script, encoding="utf-8")
     executable.chmod(0o755)
+if os.environ.get("FAKE_SSH_JOURNAL_FAILURE"):
+    journalctl = probe_bin / "journalctl"
+    journalctl.write_text(
+        "#!" + sys.executable + "\\n"
+        "import os\\n"
+        "os.write(1, b'partial journal stdout\\\\x00\\\\xff')\\n"
+        "os.write(2, b'partial journal stderr\\\\x00\\\\xfe')\\n"
+        "raise SystemExit(9)\\n",
+        encoding="utf-8",
+    )
+    journalctl.chmod(0o755)
 remote_environment = os.environ.copy()
+remote_environment["FAKE_REMOTE_SOURCE_ROOT"] = str(remote_source_root)
+remote_environment["PYTHONPATH"] = str(remote_support)
 path_entries = remote_environment["PATH"].split(os.pathsep)
 remote_environment["PATH"] = os.pathsep.join(
     (path_entries[0], str(probe_bin), remote_environment["PATH"])
@@ -1885,6 +1973,7 @@ try:
     )
 finally:
     shutil.rmtree(probe_bin)
+    shutil.rmtree(remote_support)
 archive_bytes = completed.stdout
 if os.environ.get("FAKE_SSH_TRUNCATE"):
     archive_bytes = archive_bytes[:-8]
