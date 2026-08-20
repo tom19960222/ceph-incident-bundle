@@ -708,6 +708,53 @@ node-a = node-a.example.test
         for top_level in ("nodes", "ceph", "kubernetes", "prometheus"):
             self.assertIn(f"{root}/{top_level}", names)
 
+    def test_multi_node_failure_keeps_later_admitted_evidence_in_inventory_order(
+        self,
+    ) -> None:
+        inventory = b"""\
+[common]
+ssh_user = root
+[nodes]
+node-a = node-a.example.test
+node-b = node-b.example.test
+"""
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            record = cwd / "ssh-record"
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_SSH_RECORD"] = str(record)
+            environment["FAKE_SSH_CORRUPT_HOST"] = "node-a.example.test"
+
+            completed = self.run_cli("collect", cwd=cwd, env=environment, timeout=20)
+
+            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            bundle = bundles[0]
+            with tarfile.open(bundle, "r:gz") as archive:
+                root = bundle.name.removesuffix(".tar.gz")
+                names = {member.name for member in archive.getmembers()}
+                metadata_file = archive.extractfile(f"{root}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+            count = (record / "count").read_text(encoding="ascii")
+            first_argv = json.loads((record / "argv.1.json").read_text(encoding="utf-8"))
+            second_argv = json.loads((record / "argv.2.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(completed.stdout.endswith(b" (partial)\n"))
+        self.assertIn(b"Target Node node-a: Node Evidence Archive rejected", completed.stderr)
+        self.assertEqual(count, "2\n")
+        self.assertIn("root@node-a.example.test", first_argv)
+        self.assertIn("root@node-b.example.test", second_argv)
+        self.assertFalse(any(name.startswith(f"{root}/nodes/node-a") for name in names))
+        self.assertIn(f"{root}/nodes/node-b/probes/hostname/stdout", names)
+        self.assertEqual(outcome, "partial")
+
     def test_delivered_bundle_remains_success_when_stdout_result_cannot_be_written(
         self,
     ) -> None:
@@ -1466,11 +1513,17 @@ import sys
 import tarfile
 
 record = Path(os.environ["FAKE_SSH_RECORD"])
-record.mkdir()
-(record / "count").write_text("1\\n", encoding="ascii")
-(record / "argv.json").write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+record.mkdir(exist_ok=True)
+(record / "count").touch()
+count_file = record / "count"
+count = int(count_file.read_text(encoding="ascii") or "0") + 1
+count_file.write_text(f"{{count}}\\n", encoding="ascii")
+argv = json.dumps(sys.argv[1:])
+(record / "argv.json").write_text(argv, encoding="utf-8")
+(record / f"argv.{{count}}.json").write_text(argv, encoding="utf-8")
 source = sys.stdin.buffer.read()
 (record / "stdin.py").write_bytes(source)
+(record / f"stdin.{{count}}.py").write_bytes(source)
 precreate_extraction = os.environ.get("FAKE_SSH_PRECREATE_EXTRACTION")
 if precreate_extraction:
     temporary_root = Path(os.environ["TMPDIR"])
@@ -1498,6 +1551,10 @@ if lock_workspace_parent:
     # workspace fail, reproducing a genuine post-publication cleanup problem.
     temporary_root.chmod(0o555)
 if os.environ.get("FAKE_SSH_CORRUPT"):
+    sys.stdout.buffer.write(b"not-an-archive")
+    raise SystemExit(0)
+corrupt_host = os.environ.get("FAKE_SSH_CORRUPT_HOST")
+if corrupt_host and f"root@{{corrupt_host}}" in sys.argv:
     sys.stdout.buffer.write(b"not-an-archive")
     raise SystemExit(0)
 hostile_member = os.environ.get("FAKE_SSH_HOSTILE_MEMBER")

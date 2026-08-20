@@ -19,8 +19,65 @@ ssh_user = root
 node-a = node-a.example.test
 """
 
+MULTI_NODE_INVENTORY = b"""\
+[common]
+ssh_user = root
+[nodes]
+node-a = node-a.example.test
+node-b = node-b.example.test
+[ceph]
+source = node-a
+"""
+
 
 class TopLevelCollectionTests(unittest.TestCase):
+    def test_node_problems_are_accumulated_in_inventory_order_after_an_exception(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(MULTI_NODE_INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.collect_node",
+                    side_effect=[
+                        ["Target Node node-a: connection failed"],
+                        RuntimeError("receive failed\nsecond line"),
+                    ],
+                ) as node_operation,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            bundles = list(root.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            with tarfile.open(bundles[0], "r:gz") as archive:
+                root_name = bundles[0].name.removesuffix(".tar.gz")
+                metadata_file = archive.extractfile(f"{root_name}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+
+        self.assertEqual(status, 0)
+        self.assertEqual(outcome, "partial")
+        self.assertEqual(
+            [call.args[0].inventory_name for call in node_operation.call_args_list],
+            ["node-a", "node-b"],
+        )
+        self.assertTrue(node_operation.call_args_list[0].kwargs["ceph_allowed"])
+        self.assertFalse(node_operation.call_args_list[1].kwargs["ceph_allowed"])
+        self.assertIn("Target Node node-a: connection failed", stderr.getvalue())
+        self.assertIn(
+            "Target Node node-b: unexpected collection failure: "
+            "receive failed\\x0asecond line",
+            stderr.getvalue(),
+        )
+        self.assertEqual(stdout.getvalue(), f"{bundles[0].resolve()} (partial)\n")
+
     def test_unexpected_node_exception_still_publishes_truthful_partial_bundle(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

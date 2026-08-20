@@ -76,26 +76,26 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
         (workspace / "admitted" / "prometheus").mkdir()
         (workspace / "admitted" / "inventory.ini").write_bytes(inventory.snapshot)
 
-        node = inventory.nodes[0]
         problems: list[str] = []
-        try:
-            problems.extend(
-                collect_node(
-                    node,
-                    ssh_user=inventory.ssh_user,
-                    since_seconds=since_seconds,
-                    probe_timeout_seconds=inventory.probe_timeout_seconds,
-                    ssh_connect_timeout_seconds=inventory.ssh_connect_timeout_seconds,
-                    ceph_allowed=inventory.ceph_source == node.inventory_name,
-                    staging_directory=private_nodes / node.inventory_name,
-                    contribution_directory=contributions / node.inventory_name,
+        for node in inventory.nodes:
+            try:
+                problems.extend(
+                    collect_node(
+                        node,
+                        ssh_user=inventory.ssh_user,
+                        since_seconds=since_seconds,
+                        probe_timeout_seconds=inventory.probe_timeout_seconds,
+                        ssh_connect_timeout_seconds=inventory.ssh_connect_timeout_seconds,
+                        ceph_allowed=inventory.ceph_source == node.inventory_name,
+                        staging_directory=private_nodes / node.inventory_name,
+                        contribution_directory=contributions / node.inventory_name,
+                    )
                 )
-            )
-        except Exception as error:
-            problems.append(
-                f"Target Node {node.inventory_name}: unexpected collection failure: "
-                f"{_terminal_safe(str(error))}"
-            )
+            except Exception as error:
+                problems.append(
+                    f"Target Node {node.inventory_name}: unexpected collection failure: "
+                    f"{_terminal_safe(str(error))}"
+                )
         try:
             for problem in problems:
                 print(_terminal_safe(problem), file=sys.stderr)
@@ -199,10 +199,6 @@ def _validate_startup(
         if not stat.S_ISDIR(output_mode):
             problems.append(f"output directory is not an ordinary directory: {output}")
 
-    if inventory is not None and len(inventory.nodes) != 1:
-        problems.append(
-            "this one-node collection requires exactly one Target Node in the Inventory"
-        )
     return inventory, since_seconds, output, problems
 
 
