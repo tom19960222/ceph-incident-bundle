@@ -13,6 +13,26 @@ from ceph_incident_bundle.inventory import draft_inventory
 
 
 COMMAND = os.environ.get("CEPH_INCIDENT_BUNDLE_COMMAND")
+KUBERNETES_PODS = {
+    "apiVersion": "v1",
+    "items": [
+        {
+            "metadata": {"name": "rook-pod", "namespace": "rook-shared"},
+            "spec": {
+                "containers": [{"name": "main"}],
+                "initContainers": [{"name": "init"}],
+                "ephemeralContainers": [{"name": "debugger"}],
+            },
+            "status": {
+                "containerStatuses": [{"name": "main", "restartCount": 1}],
+                "initContainerStatuses": [{"name": "init", "restartCount": 0}],
+                "ephemeralContainerStatuses": [
+                    {"name": "debugger", "restartCount": 1}
+                ],
+            },
+        }
+    ],
+}
 
 
 def missing_username_without_a_home() -> str:
@@ -779,6 +799,11 @@ operator_namespace = rook-shared
                 )
                 assert events_file is not None
                 events_bytes = events_file.read()
+                current_log_file = archive.extractfile(
+                    f"{root_name}/kubernetes/probes/pod-log-000001/stdout"
+                )
+                assert current_log_file is not None
+                current_log_bytes = current_log_file.read()
             kubectl_argv = [
                 json.loads(line)
                 for line in kubectl_record.read_text(encoding="utf-8").splitlines()
@@ -790,7 +815,7 @@ operator_namespace = rook-shared
             completed.stdout,
             f"{bundle.resolve()} (partial)\n".encode("utf-8"),
         )
-        self.assertEqual(len(kubectl_argv), 4)
+        self.assertEqual(len(kubectl_argv), 9)
         self.assertEqual(
             kubectl_argv[0],
             [
@@ -801,10 +826,55 @@ operator_namespace = rook-shared
                 "--output=wide",
             ],
         )
-        self.assertTrue(
-            all(argv[2] == "get" for argv in kubectl_argv), kubectl_argv
+        self.assertEqual(
+            kubectl_argv[4:],
+            [
+                [
+                    "--context=lab-context",
+                    "--namespace=rook-shared",
+                    "logs",
+                    "rook-pod",
+                    "--container=main",
+                    "--since=24h",
+                ],
+                [
+                    "--context=lab-context",
+                    "--namespace=rook-shared",
+                    "logs",
+                    "rook-pod",
+                    "--container=main",
+                    "--since=24h",
+                    "--previous",
+                ],
+                [
+                    "--context=lab-context",
+                    "--namespace=rook-shared",
+                    "logs",
+                    "rook-pod",
+                    "--container=init",
+                    "--since=24h",
+                ],
+                [
+                    "--context=lab-context",
+                    "--namespace=rook-shared",
+                    "logs",
+                    "rook-pod",
+                    "--container=debugger",
+                    "--since=24h",
+                ],
+                [
+                    "--context=lab-context",
+                    "--namespace=rook-shared",
+                    "logs",
+                    "rook-pod",
+                    "--container=debugger",
+                    "--since=24h",
+                    "--previous",
+                ],
+            ],
         )
         self.assertEqual(events_bytes, b"events raw bytes\x00")
+        self.assertEqual(current_log_bytes, b"pod log raw bytes\x00\xff")
         self.assertIn(
             f"{root_name}/kubernetes/probes/consumer-pods-json/result.json", names
         )
@@ -1842,8 +1912,10 @@ import sys
 record = Path(os.environ["FAKE_KUBECTL_RECORD"])
 with record.open("a", encoding="utf-8") as stream:
     stream.write(json.dumps(sys.argv[1:]) + "\\n")
-if sys.argv[-2:] == ["pods", "--output=json"]:
-    sys.stdout.write('{{"apiVersion":"v1","items":[]}}')
+if sys.argv[3:4] == ["logs"]:
+    sys.stdout.buffer.write(b"pod log raw bytes\\x00\\xff")
+elif sys.argv[-2:] == ["pods", "--output=json"]:
+    sys.stdout.write(json.dumps({json.dumps(KUBERNETES_PODS)}))
 elif "events" in sys.argv:
     sys.stdout.buffer.write(b"events raw bytes\\x00")
 else:

@@ -16,7 +16,7 @@ from typing import NamedTuple
 class _KubernetesProbe(NamedTuple):
     name: str
     argv: tuple[str, ...]
-    pod_control: bool = False
+    pod_control_namespace: str | None = None
 
 
 _ROOK_RESOURCES = (
@@ -31,6 +31,7 @@ def collect_kubernetes(
     context: str,
     consumer_namespace: str,
     operator_namespace: str,
+    since: str,
     probe_timeout_seconds: int,
     staging_directory: Path,
     contribution_directory: Path,
@@ -56,11 +57,18 @@ def collect_kubernetes(
         ]
 
     problems: list[str] = []
-    for probe in _probe_catalog(
-        context=context,
-        consumer_namespace=consumer_namespace,
-        operator_namespace=operator_namespace,
-    ):
+    pending_probes = list(
+        _probe_catalog(
+            context=context,
+            consumer_namespace=consumer_namespace,
+            operator_namespace=operator_namespace,
+        )
+    )
+    next_log_sequence = 1
+    probe_index = 0
+    while probe_index < len(pending_probes):
+        probe = pending_probes[probe_index]
+        probe_index += 1
         capture = probes_directory / probe.name
         try:
             succeeded, process_residue = _run_probe(
@@ -92,10 +100,20 @@ def collect_kubernetes(
             return problems
         if not succeeded:
             continue
-        if probe.pod_control:
-            parse_problem = _pod_control_problem(capture / "stdout", probe.name)
+        if probe.pod_control_namespace is not None:
+            log_probes, parse_problem = _pod_log_probes(
+                capture / "stdout",
+                probe.name,
+                context=context,
+                namespace=probe.pod_control_namespace,
+                since=since,
+                first_sequence=next_log_sequence,
+            )
             if parse_problem is not None:
                 problems.append(parse_problem)
+            else:
+                pending_probes[probe_index:probe_index] = log_probes
+                next_log_sequence += len(log_probes)
 
     try:
         os.rename(candidate, contribution_directory)
@@ -125,7 +143,7 @@ def _probe_catalog(
         name: str,
         namespace: str,
         *arguments: str,
-        pod_control: bool = False,
+        pod_control_namespace: str | None = None,
     ) -> _KubernetesProbe:
         return _KubernetesProbe(
             name=name,
@@ -135,7 +153,7 @@ def _probe_catalog(
                 f"--namespace={namespace}",
                 *arguments,
             ),
-            pod_control=pod_control,
+            pod_control_namespace=pod_control_namespace,
         )
 
     catalog = [
@@ -160,7 +178,7 @@ def _probe_catalog(
             "get",
             "pods",
             "--output=json",
-            pod_control=True,
+            pod_control_namespace=consumer_namespace,
         ),
     ]
     if operator_namespace != consumer_namespace:
@@ -171,7 +189,7 @@ def _probe_catalog(
                 "get",
                 "pods",
                 "--output=json",
-                pod_control=True,
+                pod_control_namespace=operator_namespace,
             )
         )
     return tuple(catalog)
@@ -295,11 +313,20 @@ def _termination_suffix(problem: str | None) -> str:
     return f"; {problem}"
 
 
-def _pod_control_problem(capture: Path, probe_name: str) -> str | None:
+def _pod_log_probes(
+    capture: Path,
+    probe_name: str,
+    *,
+    context: str,
+    namespace: str,
+    since: str,
+    first_sequence: int,
+) -> tuple[list[_KubernetesProbe], str | None]:
     try:
         document = json.loads(capture.read_bytes())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        return f"Kubernetes {probe_name} control response is not valid JSON: {error}"
+        return [], f"Kubernetes {probe_name} control response is not valid JSON: {error}"
+    containers_to_collect: list[tuple[str, str, bool]] = []
     try:
         items = document["items"]
         if not isinstance(items, list):
@@ -310,7 +337,7 @@ def _pod_control_problem(capture: Path, probe_name: str) -> str | None:
             metadata = pod["metadata"]
             spec = pod["spec"]
             status = pod.get("status", {})
-            _plain_text(metadata["name"], "Pod name")
+            pod_name = _plain_text(metadata["name"], "Pod name")
             _plain_text(metadata["namespace"], "Pod namespace")
             for spec_key, status_key in (
                 ("containers", "containerStatuses"),
@@ -330,10 +357,45 @@ def _pod_control_problem(capture: Path, probe_name: str) -> str | None:
                     restart_counts[name] = restart_count
                 for container in containers:
                     name = _plain_text(container["name"], "container name")
-                    restart_counts.setdefault(name, 0)
+                    containers_to_collect.append(
+                        (pod_name, name, restart_counts.get(name, 0) > 0)
+                    )
     except (AttributeError, KeyError, TypeError) as error:
-        return f"Kubernetes {probe_name} control response is malformed: {error}"
-    return None
+        return [], f"Kubernetes {probe_name} control response is malformed: {error}"
+
+    probes: list[_KubernetesProbe] = []
+    sequence = first_sequence
+    for pod_name, container_name, has_previous in containers_to_collect:
+        arguments = (
+            "kubectl",
+            f"--context={context}",
+            f"--namespace={namespace}",
+            "logs",
+            pod_name,
+            f"--container={container_name}",
+            f"--since={since}",
+        )
+        probes.append(
+            _KubernetesProbe(
+                _log_probe_name(sequence, previous=False),
+                arguments,
+            )
+        )
+        sequence += 1
+        if has_previous:
+            probes.append(
+                _KubernetesProbe(
+                    _log_probe_name(sequence, previous=True),
+                    (*arguments, "--previous"),
+                )
+            )
+            sequence += 1
+    return probes, None
+
+
+def _log_probe_name(sequence: int, *, previous: bool) -> str:
+    prefix = "pod-previous-log" if previous else "pod-log"
+    return f"{prefix}-{sequence:06d}"
 
 
 def _plain_text(value: object, label: str) -> str:
