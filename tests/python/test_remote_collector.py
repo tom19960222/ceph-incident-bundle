@@ -19,6 +19,46 @@ REMOTE_COLLECTOR = (
 
 
 class RemoteCollectorTests(unittest.TestCase):
+    @staticmethod
+    def write_successful_node_probe_commands(directory: Path) -> None:
+        script = f"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+import sys
+event_log = os.environ.get("PROBE_EVENT_LOG")
+if event_log:
+    with Path(event_log).open("a", encoding="utf-8") as events:
+        events.write(json.dumps([os.path.basename(__file__), *sys.argv[1:]]) + "\\n")
+print(os.path.basename(__file__))
+"""
+        for command in (
+            "hostname",
+            "date",
+            "uname",
+            "uptime",
+            "lscpu",
+            "free",
+            "ps",
+            "df",
+            "lsblk",
+            "iostat",
+            "pvs",
+            "vgs",
+            "lvs",
+            "ip",
+            "dmesg",
+            "systemctl",
+            "podman",
+            "docker",
+            "chronyc",
+            "ntpq",
+            "timedatectl",
+        ):
+            executable = directory / command
+            executable.write_text(script, encoding="utf-8")
+            executable.chmod(0o755)
+
     def run_remote_collector(
         self, *arguments: str, environment: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[bytes]:
@@ -50,10 +90,9 @@ class RemoteCollectorTests(unittest.TestCase):
                 json.load(result_file),
             )
 
-    def test_node_probe_catalog_is_exactly_the_two_probe_tracer(self) -> None:
-        # Expected (name, area, argv) is enumerated by hand here, independent
-        # of the production catalog's own definition, so this fails if the
-        # catalog silently drifts (extra Probes, renamed area, changed argv).
+    @staticmethod
+    def expected_node_probe_catalog() -> tuple[tuple[str, str, tuple[str, ...]], ...]:
+        """Return the hand-written #90 contract, independent of production."""
         expected = (
             ("hostname", "node", ("hostname",)),
             (
@@ -61,23 +100,88 @@ class RemoteCollectorTests(unittest.TestCase):
                 "node",
                 ("date", "-u", "+%Y-%m-%dT%H:%M:%SZ"),
             ),
+            ("uname", "node", ("uname", "-a")),
+            ("uptime", "node", ("uptime",)),
+            ("lscpu", "node", ("lscpu",)),
+            ("free", "node", ("free", "-h")),
+            ("processes", "node", ("ps", "auxfww")),
+            ("df", "node", ("df", "-hT")),
+            (
+                "lsblk",
+                "node",
+                (
+                    "lsblk",
+                    "-a",
+                    "-o",
+                    "NAME,MAJ:MIN,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,SERIAL",
+                ),
+            ),
+            ("iostat", "node", ("iostat", "-xz", "1", "3")),
+            ("pvs", "node", ("pvs", "--noheadings", "--separator", " ")),
+            ("vgs", "node", ("vgs", "--noheadings", "--separator", " ")),
+            ("lvs", "node", ("lvs", "--noheadings", "--separator", " ")),
+            ("ip-address", "node", ("ip", "addr", "show")),
+            ("dmesg", "node", ("dmesg", "-T")),
+            (
+                "failed-units",
+                "node",
+                ("systemctl", "--failed", "--no-pager", "--plain"),
+            ),
+            ("podman-ps", "node", ("podman", "ps", "-a")),
+            ("docker-ps", "node", ("docker", "ps", "-a")),
+            ("chronyc-tracking", "node", ("chronyc", "tracking")),
+            ("chronyc-sources", "node", ("chronyc", "sources", "-v")),
+            ("ntpq-peers", "node", ("ntpq", "-pn")),
+            ("timedatectl-status", "node", ("timedatectl", "status")),
+            (
+                "timedatectl-show-timesync",
+                "node",
+                ("timedatectl", "show-timesync", "--all"),
+            ),
+            (
+                "timedatectl-timesync-status",
+                "node",
+                ("timedatectl", "timesync-status"),
+            ),
+            (
+                "systemd-timesyncd-status",
+                "node",
+                (
+                    "systemctl",
+                    "status",
+                    "systemd-timesyncd",
+                    "--no-pager",
+                    "--plain",
+                ),
+            ),
         )
-        self.assertEqual(NODE_PROBE_CATALOG, expected)
+        return expected
+
+    def test_node_probe_catalog_is_exactly_the_non_journal_baseline_and_time_catalog(
+        self,
+    ) -> None:
+        self.assertEqual(NODE_PROBE_CATALOG, self.expected_node_probe_catalog())
 
     def test_hostname_probe_is_streamed_as_a_complete_node_archive(self) -> None:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(REMOTE_COLLECTOR),
-                "--since-seconds",
-                "86400",
-                "--probe-timeout-seconds",
-                "30",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
+        with TemporaryDirectory() as command_directory:
+            fake_bin = Path(command_directory)
+            self.write_successful_node_probe_commands(fake_bin)
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REMOTE_COLLECTOR),
+                    "--since-seconds",
+                    "86400",
+                    "--probe-timeout-seconds",
+                    "30",
+                ],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
 
         with TemporaryDirectory() as directory:
             archive = Path(directory) / "node.tar.gz"
@@ -116,21 +220,65 @@ class RemoteCollectorTests(unittest.TestCase):
         self.assertRegex(result["started_at"], r"^\d{4}-\d\d-\d\dT.*Z$")
         self.assertRegex(result["finished_at"], r"^\d{4}-\d\d-\d\dT.*Z$")
 
-    def test_selected_ceph_source_includes_the_authorized_empty_ceph_shape(self) -> None:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(REMOTE_COLLECTOR),
+    def test_external_subprocess_runs_the_full_catalog_in_documented_order(
+        self,
+    ) -> None:
+        expected_catalog = self.expected_node_probe_catalog()
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            event_log = root / "probe-events.jsonl"
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            environment["PROBE_EVENT_LOG"] = str(event_log)
+
+            completed = self.run_remote_collector(
                 "--since-seconds",
                 "60",
                 "--probe-timeout-seconds",
-                "0",
-                "--collect-ceph",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+                "30",
+                environment=environment,
+            )
+
+            executed = tuple(
+                tuple(json.loads(line))
+                for line in event_log.read_text(encoding="utf-8").splitlines()
+            )
+            archive = root / "node.tar.gz"
+            archive.write_bytes(completed.stdout)
+            with tarfile.open(archive, "r:gz") as opened:
+                member_names = {member.name for member in opened.getmembers()}
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            executed, tuple(argv for _, _, argv in expected_catalog)
         )
+        for probe_name, _, _ in expected_catalog:
+            self.assertIn(f"node/probes/{probe_name}/result.json", member_names)
+
+    def test_selected_ceph_source_includes_the_authorized_empty_ceph_shape(self) -> None:
+        with TemporaryDirectory() as command_directory:
+            fake_bin = Path(command_directory)
+            self.write_successful_node_probe_commands(fake_bin)
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REMOTE_COLLECTOR),
+                    "--since-seconds",
+                    "60",
+                    "--probe-timeout-seconds",
+                    "0",
+                    "--collect-ceph",
+                ],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
         with TemporaryDirectory() as directory:
             archive = Path(directory) / "node.tar.gz"
             archive.write_bytes(completed.stdout)
@@ -250,6 +398,7 @@ class RemoteCollectorTests(unittest.TestCase):
             root = Path(directory)
             fake_bin = root / "bin"
             fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
             hostname = fake_bin / "hostname"
             hostname.write_text(
                 f"""#!{sys.executable}
@@ -311,8 +460,10 @@ raise SystemExit(7)
             root = Path(directory)
             fake_bin = root / "bin"
             fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
             hostname = fake_bin / "hostname"
             hostname.write_bytes(b"not executable")
+            hostname.chmod(0o644)
             date = fake_bin / "date"
             date.write_text(
                 f"""#!{sys.executable}
@@ -391,6 +542,7 @@ print("2026-08-21T00:00:00Z")
             root = Path(directory)
             fake_bin = root / "bin"
             fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
             hostname = fake_bin / "hostname"
             hostname.write_text(
                 f"""#!{sys.executable}
@@ -453,6 +605,7 @@ time.sleep(30)
             root = Path(directory)
             fake_bin = root / "bin"
             fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
             hostname = fake_bin / "hostname"
             hostname.write_text(
                 f"""#!{sys.executable}

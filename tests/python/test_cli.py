@@ -704,6 +704,36 @@ node-a = node-a.example.test
         self.assertEqual(bundled_inventory, inventory)
         self.assertTrue(hostname)
         self.assertEqual(metadata["outcome"], "complete")
+        for probe_name in (
+            "hostname",
+            "current-utc",
+            "uname",
+            "uptime",
+            "lscpu",
+            "free",
+            "processes",
+            "df",
+            "lsblk",
+            "iostat",
+            "pvs",
+            "vgs",
+            "lvs",
+            "ip-address",
+            "dmesg",
+            "failed-units",
+            "podman-ps",
+            "docker-ps",
+            "chronyc-tracking",
+            "chronyc-sources",
+            "ntpq-peers",
+            "timedatectl-status",
+            "timedatectl-show-timesync",
+            "timedatectl-timesync-status",
+            "systemd-timesyncd-status",
+        ):
+            self.assertIn(
+                f"{root}/nodes/node-a/probes/{probe_name}/result.json", names
+            )
         self.assertTrue(all(member.isdir() or member.isreg() for member in members))
         for top_level in ("nodes", "ceph", "kubernetes", "prometheus"):
             self.assertIn(f"{root}/{top_level}", names)
@@ -1572,9 +1602,11 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 
 record = Path(os.environ["FAKE_SSH_RECORD"])
 record.mkdir(exist_ok=True)
@@ -1638,13 +1670,32 @@ if hostile_member:
     sys.stdout.buffer.write(hostile_archive.getvalue())
     raise SystemExit(0)
 remote_start = sys.argv.index("python3") + 1
-completed = subprocess.run(
-    [sys.executable, *sys.argv[remote_start:]],
-    input=source,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    check=False,
+probe_bin = Path(tempfile.mkdtemp(prefix="fake-ssh-probes."))
+probe_script = f"#!{sys.executable}\\nimport os\\nprint(os.path.basename(__file__))\\n"
+for command in (
+    "hostname", "date", "uname", "uptime", "lscpu", "free", "ps", "df",
+    "lsblk", "iostat", "pvs", "vgs", "lvs", "ip", "dmesg", "systemctl",
+    "podman", "docker", "chronyc", "ntpq", "timedatectl",
+):
+    executable = probe_bin / command
+    executable.write_text(probe_script, encoding="utf-8")
+    executable.chmod(0o755)
+remote_environment = os.environ.copy()
+path_entries = remote_environment["PATH"].split(os.pathsep)
+remote_environment["PATH"] = os.pathsep.join(
+    (path_entries[0], str(probe_bin), remote_environment["PATH"])
 )
+try:
+    completed = subprocess.run(
+        [sys.executable, *sys.argv[remote_start:]],
+        input=source,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=remote_environment,
+        check=False,
+    )
+finally:
+    shutil.rmtree(probe_bin)
 archive_bytes = completed.stdout
 if os.environ.get("FAKE_SSH_TRUNCATE"):
     archive_bytes = archive_bytes[:-8]
