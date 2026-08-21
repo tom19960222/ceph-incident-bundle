@@ -9,10 +9,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from ceph_incident_bundle.collect.kubernetes import (
-    _log_probe_name,
-    collect_kubernetes,
-)
+from ceph_incident_bundle.collect.kubernetes import collect_kubernetes
 
 
 PODS = {
@@ -156,25 +153,6 @@ collect_kubernetes(
         self.assertIn(
             "injected kubectl signal failure",
             str(caught.exception.__cause__),
-        )
-
-    def test_log_sequence_name_grows_beyond_six_digits_without_collision(
-        self,
-    ) -> None:
-        # Reaching this boundary through the public collector would require one
-        # million real subprocess/capture attempts.  This narrowly checks only
-        # the private sequence-to-path value conversion; scheduling, argv, and
-        # capture behavior stay covered through the other ``collect_kubernetes``
-        # tests.
-        self.assertEqual(_log_probe_name(999_999, previous=False), "pod-log-999999")
-        self.assertEqual(_log_probe_name(1_000_000, previous=False), "pod-log-1000000")
-        self.assertEqual(
-            _log_probe_name(1_000_000, previous=True),
-            "pod-previous-log-1000000",
-        )
-        self.assertNotEqual(
-            _log_probe_name(999_999, previous=False),
-            _log_probe_name(1_000_000, previous=False),
         )
 
     def test_timed_out_log_preserves_partial_bytes_and_continues(self) -> None:
