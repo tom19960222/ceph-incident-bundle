@@ -78,15 +78,19 @@ collect_kubernetes(
                 env=environment,
             )
             try:
+                ready_pid: str | None = None
                 for _attempt in range(500):
                     if ready.exists():
-                        break
+                        ready_pid = ready.read_text(encoding="ascii").strip()
+                        if ready_pid:
+                            break
                     if process.poll() is not None:
                         self.fail("Kubernetes collector exited before interrupt boundary")
                     time.sleep(0.01)
                 else:
                     self.fail("fake kubectl did not reach interrupt boundary")
-                child_pid = int(ready.read_text(encoding="ascii"))
+                assert ready_pid is not None
+                child_pid = int(ready_pid)
                 process.send_signal(signal.SIGINT)
                 _stdout, _stderr = process.communicate(timeout=10)
                 child_is_running = True
@@ -99,6 +103,10 @@ collect_kubernetes(
                 if process.poll() is None:
                     process.kill()
                     process.wait()
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
                 if child_pid is not None:
                     try:
                         os.killpg(child_pid, signal.SIGKILL)
@@ -910,7 +918,10 @@ interrupt_ready = os.environ.get("FAKE_KUBECTL_INTERRUPT_READY")
 if interrupt_ready:
     event_log = Path(os.environ["FAKE_KUBECTL_EVENT_LOG"])
     event_log.write_text("kubectl-start\\n", encoding="utf-8")
-    Path(interrupt_ready).write_text(str(os.getpid()), encoding="ascii")
+    ready_path = Path(interrupt_ready)
+    ready_candidate = ready_path.with_suffix(".candidate")
+    ready_candidate.write_text(str(os.getpid()), encoding="ascii")
+    os.replace(ready_candidate, ready_path)
     def terminate(_signal, _frame):
         with event_log.open("a", encoding="utf-8") as events:
             events.write("kubectl-termination-request\\n")
