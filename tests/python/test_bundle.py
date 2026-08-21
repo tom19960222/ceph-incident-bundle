@@ -621,6 +621,232 @@ class IncidentBundlePublicationTests(unittest.TestCase):
 
         self.assertEqual(outcome, "partial")
 
+    def test_output_directory_handle_close_does_not_undo_delivery(self) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+        real_close = os.close
+        close_failure_seen = False
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_identity = root.stat().st_dev, root.stat().st_ino
+            workspace = root / "workspace"
+            self._write_workspace(workspace, inventory)
+            final_path = root / "ceph-incident-bundle-20260814T120000Z.tar.gz"
+
+            def close_then_report_error(descriptor: int) -> None:
+                nonlocal close_failure_seen
+                facts = os.fstat(descriptor)
+                identity = facts.st_dev, facts.st_ino
+                if (
+                    identity == output_identity
+                    and final_path.exists()
+                    and not close_failure_seen
+                ):
+                    close_failure_seen = True
+                    real_close(descriptor)
+                    raise OSError("injected output directory close report")
+                real_close(descriptor)
+
+            with patch(
+                "ceph_incident_bundle.collect.bundle.os.close",
+                new=close_then_report_error,
+            ):
+                cleanup_problem = publish_bundle(
+                    workspace,
+                    final_path,
+                    collector_version="0.1.0",
+                    started_at=started_at,
+                    since="24h",
+                    prior_partial=False,
+                )
+
+            with tarfile.open(final_path, "r:gz") as archive:
+                metadata_file = archive.extractfile(
+                    "ceph-incident-bundle-20260814T120000Z/collection.json"
+                )
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+
+        self.assertTrue(close_failure_seen)
+        self.assertIsNone(cleanup_problem)
+        self.assertEqual(outcome, "complete")
+
+    def test_archive_construction_failure_removes_owned_incomplete_work(self) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            self._write_workspace(workspace, inventory)
+            final_path = root / "ceph-incident-bundle-20260814T120000Z.tar.gz"
+            outside = root / "outside-sentinel"
+            outside.write_bytes(b"unchanged")
+
+            with (
+                patch(
+                    "tarfile.TarFile.addfile",
+                    side_effect=OSError("injected archive construction failure"),
+                ),
+                self.assertRaises(BundlePublicationError) as caught,
+            ):
+                publish_bundle(
+                    workspace,
+                    final_path,
+                    collector_version="0.1.0",
+                    started_at=started_at,
+                    since="24h",
+                    prior_partial=False,
+                )
+
+            candidates = list(root.glob(".*.candidate.*"))
+            outside_bytes = outside.read_bytes()
+            workspace_exists = workspace.exists()
+            final_exists = final_path.exists()
+
+        self.assertIn("injected archive construction failure", str(caught.exception))
+        self.assertFalse(workspace_exists)
+        self.assertFalse(final_exists)
+        self.assertEqual(candidates, [])
+        self.assertEqual(outside_bytes, b"unchanged")
+
+    def test_archive_close_failure_removes_owned_incomplete_work(self) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+        real_close = tarfile.TarFile.close
+        close_failure_seen = False
+
+        def close_then_fail(archive: tarfile.TarFile) -> None:
+            nonlocal close_failure_seen
+            real_close(archive)
+            if not close_failure_seen:
+                close_failure_seen = True
+                raise OSError("injected archive close failure")
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            self._write_workspace(workspace, inventory)
+            final_path = root / "ceph-incident-bundle-20260814T120000Z.tar.gz"
+
+            with (
+                patch("tarfile.TarFile.close", new=close_then_fail),
+                self.assertRaises(BundlePublicationError) as caught,
+            ):
+                publish_bundle(
+                    workspace,
+                    final_path,
+                    collector_version="0.1.0",
+                    started_at=started_at,
+                    since="24h",
+                    prior_partial=False,
+                )
+
+            candidates = list(root.glob(".*.candidate.*"))
+            final_exists = final_path.exists()
+
+        self.assertTrue(close_failure_seen)
+        self.assertIn("injected archive close failure", str(caught.exception))
+        self.assertFalse(final_exists)
+        self.assertEqual(candidates, [])
+
+    def test_atomic_publication_failure_removes_private_candidate(self) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+
+        def fail_link(*args, **kwargs) -> None:
+            raise OSError("injected atomic publication failure")
+
+        supported_dir_fd = os.supports_dir_fd | {fail_link}
+        supported_follow_symlinks = os.supports_follow_symlinks | {fail_link}
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            self._write_workspace(workspace, inventory)
+            final_path = root / "ceph-incident-bundle-20260814T120000Z.tar.gz"
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.bundle.os.link",
+                    new=fail_link,
+                ),
+                patch(
+                    "ceph_incident_bundle.collect.bundle.os.supports_dir_fd",
+                    supported_dir_fd,
+                ),
+                patch(
+                    "ceph_incident_bundle.collect.bundle.os.supports_follow_symlinks",
+                    supported_follow_symlinks,
+                ),
+                self.assertRaises(BundlePublicationError) as caught,
+            ):
+                publish_bundle(
+                    workspace,
+                    final_path,
+                    collector_version="0.1.0",
+                    started_at=started_at,
+                    since="24h",
+                    prior_partial=False,
+                )
+
+            candidates = list(root.glob(".*.candidate.*"))
+            final_exists = final_path.exists()
+
+        self.assertIn("injected atomic publication failure", str(caught.exception))
+        self.assertFalse(final_exists)
+        self.assertEqual(candidates, [])
+
+    def test_interrupted_candidate_cleanup_reports_exact_residue(self) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+        real_unlink = os.unlink
+
+        def refuse_candidate_unlink(path, *args, **kwargs) -> None:
+            if ".candidate." in os.fspath(path):
+                raise OSError("injected interrupted candidate residue")
+            real_unlink(path, *args, **kwargs)
+
+        supported_dir_fd = os.supports_dir_fd | {refuse_candidate_unlink}
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            self._write_workspace(workspace, inventory)
+            final_path = root / "ceph-incident-bundle-20260814T120000Z.tar.gz"
+
+            with (
+                patch("tarfile.TarFile.addfile", side_effect=KeyboardInterrupt),
+                patch(
+                    "ceph_incident_bundle.collect.bundle.os.unlink",
+                    new=refuse_candidate_unlink,
+                ),
+                patch(
+                    "ceph_incident_bundle.collect.bundle.os.supports_dir_fd",
+                    supported_dir_fd,
+                ),
+                self.assertRaises(KeyboardInterrupt) as caught,
+            ):
+                publish_bundle(
+                    workspace,
+                    final_path,
+                    collector_version="0.1.0",
+                    started_at=started_at,
+                    since="24h",
+                    prior_partial=False,
+                )
+
+            candidates = list(root.glob(".*.candidate.*"))
+            workspace_exists = workspace.exists()
+            final_exists = final_path.exists()
+
+        self.assertEqual(len(candidates), 1)
+        self.assertFalse(workspace_exists)
+        self.assertFalse(final_exists)
+        self.assertIn(str(candidates[0]), " ".join(str(arg) for arg in caught.exception.args))
+        self.assertIn(
+            "cannot remove private Incident Bundle candidate",
+            " ".join(str(arg) for arg in caught.exception.args),
+        )
+
     @staticmethod
     def _write_workspace(workspace: Path, inventory: bytes) -> None:
         workspace.mkdir()

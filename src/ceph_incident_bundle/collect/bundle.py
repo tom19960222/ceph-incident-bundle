@@ -27,6 +27,47 @@ class BundlePublicationError(Exception):
     """The final Incident Bundle was not delivered."""
 
 
+def cleanup_owned_workspace_before_publication(
+    workspace: Path, expected_identity: tuple[int, int]
+) -> str | None:
+    """Remove the exact workspace while the top-level flow still owns it."""
+    workspace = Path(workspace)
+    workspace_parent_descriptor: int | None = None
+    workspace_descriptor: int | None = None
+    cleanup_problem: str | None = None
+    try:
+        _require_posix_file_protection()
+        workspace_parent_descriptor = _open_workspace_parent(workspace)
+        workspace_descriptor = _open_directory_at(
+            workspace_parent_descriptor,
+            workspace.name,
+            "owned workstation workspace",
+        )
+        if _file_identity(os.fstat(workspace_descriptor)) != expected_identity:
+            cleanup_problem = (
+                f"refusing to clean replaced workstation workspace {workspace}"
+            )
+        else:
+            cleanup_problem = _cleanup_workspace(
+                workspace,
+                workspace_parent_descriptor,
+                workspace_descriptor,
+                str(workspace.resolve()),
+            )
+    except (BundlePublicationError, OSError) as error:
+        cleanup_problem = f"cannot remove workstation workspace {workspace}: {error}"
+    finally:
+        if workspace_descriptor is not None:
+            close_problem = _close_workspace_input(workspace_descriptor)
+            if close_problem is not None:
+                cleanup_problem = _combine_problems(cleanup_problem, close_problem)
+        if workspace_parent_descriptor is not None:
+            close_problem = _close_workspace_parent(workspace_parent_descriptor)
+            if close_problem is not None:
+                cleanup_problem = _combine_problems(cleanup_problem, close_problem)
+    return cleanup_problem
+
+
 def publish_bundle(
     workspace: Path,
     final_path: Path,
@@ -186,32 +227,45 @@ def publish_bundle(
                 "final publication was rolled back"
             ) from cleanup_error
         return cleanup_problem
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as interruption:
+        interruption_problems: list[str] = []
         if (
             not workspace_cleanup_attempted
             and workspace_parent_descriptor is not None
             and workspace_descriptor is not None
             and workspace_marker_path is not None
         ):
-            _cleanup_workspace(
+            cleanup_problem = _cleanup_workspace(
                 workspace,
                 workspace_parent_descriptor,
                 workspace_descriptor,
                 workspace_marker_path,
             )
+        if cleanup_problem is not None:
+            interruption_problems.append(cleanup_problem)
         if workspace_descriptor is not None:
-            _close_workspace_input(workspace_descriptor)
+            workspace_close_problem = _close_workspace_input(workspace_descriptor)
+            if workspace_close_problem is not None:
+                interruption_problems.append(workspace_close_problem)
             workspace_descriptor = None
         if workspace_parent_descriptor is not None:
-            _close_workspace_parent(workspace_parent_descriptor)
+            parent_close_problem = _close_workspace_parent(
+                workspace_parent_descriptor
+            )
+            if parent_close_problem is not None:
+                interruption_problems.append(parent_close_problem)
             workspace_parent_descriptor = None
         if (
             candidate is not None
             and candidate_name is not None
             and output_descriptor is not None
         ):
-            _remove_candidate_at(output_descriptor, candidate_name, candidate)
-        raise
+            candidate_cleanup_problem = _remove_candidate_at(
+                output_descriptor, candidate_name, candidate
+            )
+            if candidate_cleanup_problem is not None:
+                interruption_problems.append(candidate_cleanup_problem)
+        raise KeyboardInterrupt(*interruption_problems) from interruption
     except Exception as error:
         if not workspace_cleanup_attempted:
             if (
@@ -262,10 +316,15 @@ def publish_bundle(
         raise BundlePublicationError(message) from error
     finally:
         if output_descriptor is not None:
-            # Issue #100 owns the post-link close-failure delivery/residue matrix.
-            # Keep #87's existing propagation instead of guessing whether a linked
-            # final path should be rolled back or reported as delivered.
-            os.close(output_descriptor)
+            try:
+                os.close(output_descriptor)
+            except OSError:
+                # This descriptor owns no evidence bytes or filesystem object.
+                # Once the final hard link is visible, a close report cannot turn
+                # actual delivery into nondelivery or rewrite final metadata.  On
+                # earlier failures, workspace/candidate cleanup above has already
+                # handled every path owned by the invocation.
+                pass
 
 
 def _validate_lifecycle_paths(
@@ -1097,3 +1156,7 @@ def _remove_candidate_at(
 
 def _rfc3339(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _combine_problems(first: str | None, second: str) -> str:
+    return second if first is None else f"{first}; {second}"

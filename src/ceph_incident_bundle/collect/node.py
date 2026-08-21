@@ -50,6 +50,7 @@ def collect_node(
     )
 
     start_error: OSError | None = None
+    interrupted = False
     try:
         # Regular files let OpenSSH read and write without pipe backpressure.  The
         # lexical scope also proves stdin, the complete stdout archive, and stderr
@@ -72,9 +73,13 @@ def collect_node(
                 try:
                     return_code = process.wait()
                 except KeyboardInterrupt:
-                    os.killpg(process.pid, signal.SIGTERM)
+                    # The SSH process owns a separate group, so the operator's
+                    # Ctrl-C reaches only the workstation flow.  Forward SIGINT
+                    # to request the remote Python collector's normal ``finally``
+                    # cleanup while the connection is still reachable.
+                    os.killpg(process.pid, signal.SIGINT)
                     process.wait()
-                    raise
+                    interrupted = True
     except OSError as error:
         return [
             f"Target Node {node.inventory_name}: "
@@ -85,6 +90,13 @@ def collect_node(
         return [
             f"Target Node {node.inventory_name}: cannot start SSH: {start_error}"
         ]
+
+    if interrupted:
+        try:
+            _print_diagnostics(node.inventory_name, diagnostics_path)
+        except Exception:
+            pass
+        raise KeyboardInterrupt
 
     try:
         _print_diagnostics(node.inventory_name, diagnostics_path)
