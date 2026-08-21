@@ -920,13 +920,13 @@ if interrupt_ready:
     event_log.write_text("kubectl-start\\n", encoding="utf-8")
     ready_path = Path(interrupt_ready)
     ready_candidate = ready_path.with_suffix(".candidate")
-    ready_candidate.write_text(str(os.getpid()), encoding="ascii")
-    os.replace(ready_candidate, ready_path)
     def terminate(_signal, _frame):
         with event_log.open("a", encoding="utf-8") as events:
             events.write("kubectl-termination-request\\n")
         raise SystemExit(130)
     signal.signal(signal.SIGTERM, terminate)
+    ready_candidate.write_text(str(os.getpid()), encoding="ascii")
+    os.replace(ready_candidate, ready_path)
     time.sleep(30)
 if os.environ.get("FAKE_KUBECTL_TIMEOUT_WIDE") and args[-2:] == ["pods", "--output=wide"]:
     stubborn_pid = os.environ.get("FAKE_KUBECTL_STUBBORN_PID")
