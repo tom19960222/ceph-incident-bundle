@@ -54,6 +54,8 @@ def cleanup_owned_workspace_before_publication(
                 workspace_descriptor,
                 str(workspace.resolve()),
             )
+    except FileNotFoundError:
+        cleanup_problem = None
     except (BundlePublicationError, OSError) as error:
         cleanup_problem = f"cannot remove workstation workspace {workspace}: {error}"
     finally:

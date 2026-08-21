@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import re
 import stat
 import sys
+import tarfile
 import tempfile
 
 from .. import __version__
@@ -20,6 +22,9 @@ from .bundle import (
 from .kubernetes import collect_kubernetes
 from .node import collect_node
 from .prometheus import collect_prometheus
+
+
+_PUBLICATION_RESULT_PENDING = object()
 
 
 _EVIDENCE_WINDOW = re.compile(r"([1-9][0-9]*)([mhdw])\Z", re.ASCII)
@@ -65,7 +70,7 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
 
     workspace: Path | None = None
     workspace_identity: tuple[int, int] | None = None
-    publication_has_ownership = False
+    publication_cleanup_problem: object | str | None = _PUBLICATION_RESULT_PENDING
     try:
         workspace = Path(tempfile.mkdtemp(prefix="ceph-incident-work."))
         workspace_facts = workspace.stat(follow_symlinks=False)
@@ -151,8 +156,7 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
             # diagnostic stream itself is no longer writable.
             pass
 
-        publication_has_ownership = True
-        cleanup_problem = publish_bundle(
+        publication_cleanup_problem = publish_bundle(
             workspace,
             final_path,
             collector_version=__version__,
@@ -160,10 +164,11 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
             since=since,
             prior_partial=bool(problems),
         )
-        if cleanup_problem is not None:
-            problems.append(cleanup_problem)
+        if publication_cleanup_problem is not None:
+            assert isinstance(publication_cleanup_problem, str)
+            problems.append(publication_cleanup_problem)
             try:
-                print(_terminal_safe(cleanup_problem), file=sys.stderr)
+                print(_terminal_safe(publication_cleanup_problem), file=sys.stderr)
             except Exception:
                 # Returned problems still determine the bundle outcome when the
                 # diagnostic stream itself is no longer writable.
@@ -190,13 +195,36 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
             if isinstance(interruption.__cause__, OSError)
             else None
         )
-        if publication_has_ownership and _is_delivered_bundle(final_path):
-            outcome = "partial" if problems else "complete"
+        delivered_outcome = _delivered_bundle_outcome(final_path)
+        if delivered_outcome is not None:
+            retry_cleanup_problem = None
+            if workspace is not None:
+                retry_cleanup_problem = _cleanup_owned_workspace(
+                    workspace, workspace_identity
+                )
             try:
                 if interruption_problem is not None:
                     print(_terminal_safe(interruption_problem), file=sys.stderr)
+                if isinstance(publication_cleanup_problem, str):
+                    print(
+                        _terminal_safe(publication_cleanup_problem), file=sys.stderr
+                    )
+                if retry_cleanup_problem is not None:
+                    print(_terminal_safe(retry_cleanup_problem), file=sys.stderr)
+                elif (
+                    publication_cleanup_problem is _PUBLICATION_RESULT_PENDING
+                    and delivered_outcome == "partial"
+                    and not problems
+                    and workspace is not None
+                ):
+                    print(
+                        "workstation cleanup was partial during publication for "
+                        f"{workspace}",
+                        file=sys.stderr,
+                    )
                 print(
-                    f"Incident Bundle delivered at {final_path} ({outcome}), but "
+                    f"Incident Bundle delivered at {final_path} "
+                    f"({delivered_outcome}), but "
                     "the final standard-output result was interrupted",
                     file=sys.stderr,
                 )
@@ -204,7 +232,7 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
                 pass
             return 0
         cleanup_problem = None
-        if workspace is not None and not publication_has_ownership:
+        if workspace is not None:
             cleanup_problem = _cleanup_owned_workspace(
                 workspace, workspace_identity
             )
@@ -220,7 +248,7 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
         )
     except Exception as error:
         cleanup_problem = None
-        if workspace is not None and not publication_has_ownership:
+        if workspace is not None:
             cleanup_problem = _cleanup_owned_workspace(
                 workspace, workspace_identity
             )
@@ -298,13 +326,25 @@ def _cleanup_owned_workspace(
     )
 
 
-def _is_delivered_bundle(final_path: Path) -> bool:
-    """Return whether publication left a regular final bundle at its fixed path."""
+def _delivered_bundle_outcome(final_path: Path) -> str | None:
+    """Read the completed bundle's outcome after publication owns the lifecycle."""
     try:
         final_facts = final_path.stat(follow_symlinks=False)
     except OSError:
-        return False
-    return stat.S_ISREG(final_facts.st_mode)
+        return None
+    if not stat.S_ISREG(final_facts.st_mode):
+        return None
+    bundle_root = final_path.name.removesuffix(".tar.gz")
+    try:
+        with tarfile.open(final_path, "r:gz") as archive:
+            metadata_file = archive.extractfile(f"{bundle_root}/collection.json")
+            if metadata_file is None:
+                return None
+            with metadata_file:
+                outcome = json.load(metadata_file).get("outcome")
+    except (OSError, tarfile.TarError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return outcome if outcome in {"complete", "partial"} else None
 
 
 def _terminal_safe(value: str) -> str:

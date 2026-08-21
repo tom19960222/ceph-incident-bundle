@@ -9,7 +9,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 from ceph_incident_bundle.collect import run
-from ceph_incident_bundle.collect.bundle import BundlePublicationError
+from ceph_incident_bundle.collect.bundle import (
+    BundlePublicationError,
+    publish_bundle as publish_incident_bundle,
+)
 from ceph_incident_bundle.collect.node import collect_node
 from ceph_incident_bundle.inventory import TargetNode
 
@@ -59,6 +62,102 @@ request_timeout = 7s
 
 
 class TopLevelCollectionTests(unittest.TestCase):
+    def test_interrupt_at_publication_entry_keeps_top_level_cleanup_ownership(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            temporary_root = root / "temporary"
+            temporary_root.mkdir()
+            workspace = temporary_root / "ceph-incident-work.fixed"
+            workspace.mkdir()
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.tempfile.mkdtemp",
+                    return_value=str(workspace),
+                ),
+                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
+                patch(
+                    "ceph_incident_bundle.collect.publish_bundle",
+                    side_effect=KeyboardInterrupt,
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+
+        self.assertEqual(status, 130)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(workspaces, [])
+        self.assertTrue(
+            stderr.getvalue().endswith("FAIL: no Incident Bundle delivered\n")
+        )
+
+    def test_interrupt_at_publication_return_recovers_partial_delivery_truth(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            temporary_root = root / "temporary"
+            temporary_root.mkdir()
+            workspace = temporary_root / "ceph-incident-work.fixed"
+            workspace.mkdir()
+            workspace_path: Path | None = None
+
+            def lock_workspace_parent(*args, **kwargs) -> list[str]:
+                nonlocal workspace_path
+                workspace_path = Path(kwargs["staging_directory"]).parents[2]
+                temporary_root.chmod(0o500)
+                return []
+
+            def publish_then_interrupt(*args, **kwargs) -> str | None:
+                publish_incident_bundle(*args, **kwargs)
+                raise KeyboardInterrupt
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            try:
+                with (
+                    patch(
+                        "ceph_incident_bundle.collect.tempfile.mkdtemp",
+                        return_value=str(workspace),
+                    ),
+                    patch(
+                        "ceph_incident_bundle.collect.collect_node",
+                        side_effect=lock_workspace_parent,
+                    ),
+                    patch(
+                        "ceph_incident_bundle.collect.publish_bundle",
+                        side_effect=publish_then_interrupt,
+                    ),
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
+                    status = run(inventory, "24h", root)
+            finally:
+                temporary_root.chmod(0o700)
+
+            bundles = list(root.glob("ceph-incident-bundle-*.tar.gz"))
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+
+        assert workspace_path is not None
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(len(bundles), 1)
+        self.assertEqual(len(workspaces), 1)
+        self.assertIn("(partial)", stderr.getvalue())
+        self.assertIn(str(workspace_path), stderr.getvalue())
+        self.assertIn("cannot remove workstation workspace", stderr.getvalue())
+        self.assertNotIn("FAIL: no Incident Bundle delivered", stderr.getvalue())
+
     def test_interrupt_after_publication_is_reported_as_delivered(self) -> None:
         class InterruptingResultStream(io.StringIO):
             def write(self, value: str) -> int:
