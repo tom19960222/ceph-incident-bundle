@@ -13,3 +13,6 @@ ceph-incident-bundle = "ceph_incident_bundle.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools]
+include-package-data = false

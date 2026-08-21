@@ -1,9 +1,8 @@
-.PHONY: test shellcheck validate
+PYTHON ?= python3
+
+.PHONY: test validate
 
 test:
-	bash tests/run-tests.sh
+	$(PYTHON) validation/run_offline.py
 
-shellcheck:
-	shellcheck lib/*.sh run/*.sh tests/*.sh
-
-validate: test shellcheck
+validate: test
