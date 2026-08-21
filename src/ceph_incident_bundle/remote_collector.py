@@ -951,9 +951,8 @@ def main() -> int:
         return 1
 
     arguments = _parse_arguments()
-    # The #87 hostname tracer does not yet consume the evidence window.  It is
-    # still a required validated control in the fixed one-SSH protocol so later
-    # time-bounded built-in Probes can reuse this exact remote invocation.
+    # The validated evidence window is applied below to both raw log selection
+    # and the all-system journal Probe in this one-SSH invocation.
     workspace = Path(tempfile.mkdtemp(prefix="ceph-incident-node."))
     succeeded = True
     try:

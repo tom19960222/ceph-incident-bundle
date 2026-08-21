@@ -1081,10 +1081,10 @@ def _cleanup_workspace(
 ) -> str | None:
     """Remove only the exact pinned workspace after publication handoff.
 
-    The top-level flow deliberately keeps its pre-handoff cleanup local because it
-    still owns failures that happen before publication starts.  Issue #87 has one
-    collector owner for this private tree and no concurrent workspace writer.  A
-    complete same-uid interleaving and cancellation matrix belongs to issue #100.
+    The top-level flow keeps pre-handoff cleanup local because it still owns
+    failures before publication starts.  After handoff, this routine removes only
+    the descriptor-pinned, marker-verified workspace and never follows a replaced
+    path or broadens cleanup beyond that owned tree.
     """
     try:
         _require_owned_workspace_at(workspace_descriptor, expected_marker_path)

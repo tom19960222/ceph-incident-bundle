@@ -4,7 +4,12 @@
 /env.sh
 /*.tar.gz
 .ssh/
+.claude/worktrees/
+/CEPH-LAB-CONNECTION.md
 __pycache__/
 *.py[cod]
 /build/
 *.egg-info/
+# Lab Profiles, candidates, and activation ledgers are local-only.
+*.toml
+lab-activation.log.jsonl
