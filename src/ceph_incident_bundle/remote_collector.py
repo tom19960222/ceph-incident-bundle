@@ -112,6 +112,121 @@ NODE_PROBE_CATALOG: tuple[Probe, ...] = (
 )
 
 
+# Fixed direct-Ceph Probe catalog.  Every argv begins with the actual executable
+# because the Remote Node Collector invokes each command directly, without a
+# shell, runner discovery, privilege escalation, or fallback path.
+CEPH_PROBE_CATALOG: tuple[Probe, ...] = (
+    Probe("status-json", "ceph", ("ceph", "status", "--format", "json-pretty")),
+    Probe(
+        "health-detail-json",
+        "ceph",
+        ("ceph", "health", "detail", "--format", "json-pretty"),
+    ),
+    Probe(
+        "versions-json",
+        "ceph",
+        ("ceph", "versions", "--format", "json-pretty"),
+    ),
+    Probe(
+        "df-detail-json",
+        "ceph",
+        ("ceph", "df", "detail", "--format", "json-pretty"),
+    ),
+    Probe(
+        "osd-tree-json",
+        "ceph",
+        ("ceph", "osd", "tree", "--format", "json-pretty"),
+    ),
+    Probe(
+        "osd-df-json",
+        "ceph",
+        ("ceph", "osd", "df", "--format", "json-pretty"),
+    ),
+    Probe(
+        "osd-dump-json",
+        "ceph",
+        ("ceph", "osd", "dump", "--format", "json-pretty"),
+    ),
+    Probe(
+        "osd-perf-json",
+        "ceph",
+        ("ceph", "osd", "perf", "--format", "json-pretty"),
+    ),
+    Probe(
+        "osd-blocked-by-json",
+        "ceph",
+        ("ceph", "osd", "blocked-by", "--format", "json-pretty"),
+    ),
+    Probe(
+        "pg-stat-json",
+        "ceph",
+        ("ceph", "pg", "stat", "--format", "json-pretty"),
+    ),
+    Probe(
+        "pg-dump-json",
+        "ceph",
+        ("ceph", "pg", "dump", "--format", "json-pretty"),
+    ),
+    Probe(
+        "pg-dump-stuck-json",
+        "ceph",
+        ("ceph", "pg", "dump_stuck", "--format", "json-pretty"),
+    ),
+    Probe(
+        "mon-dump-json",
+        "ceph",
+        ("ceph", "mon", "dump", "--format", "json-pretty"),
+    ),
+    Probe(
+        "quorum-status-json",
+        "ceph",
+        ("ceph", "quorum_status", "--format", "json-pretty"),
+    ),
+    Probe(
+        "mgr-dump-json",
+        "ceph",
+        ("ceph", "mgr", "dump", "--format", "json-pretty"),
+    ),
+    Probe(
+        "orch-host-ls-json",
+        "ceph",
+        ("ceph", "orch", "host", "ls", "--format", "json-pretty"),
+    ),
+    Probe(
+        "orch-ps-json",
+        "ceph",
+        ("ceph", "orch", "ps", "--format", "json-pretty"),
+    ),
+    Probe(
+        "orch-device-ls-wide-json",
+        "ceph",
+        (
+            "ceph",
+            "orch",
+            "device",
+            "ls",
+            "--wide",
+            "--format",
+            "json-pretty",
+        ),
+    ),
+    Probe(
+        "config-dump-json",
+        "ceph",
+        ("ceph", "config", "dump", "--format", "json-pretty"),
+    ),
+    Probe(
+        "crash-ls-json",
+        "ceph",
+        ("ceph", "crash", "ls", "--format", "json-pretty"),
+    ),
+    Probe("status-text", "ceph", ("ceph", "status")),
+    Probe("health-detail-text", "ceph", ("ceph", "health", "detail")),
+    Probe("osd-tree-text", "ceph", ("ceph", "osd", "tree")),
+    Probe("orch-ps-text", "ceph", ("ceph", "orch", "ps")),
+)
+
+
 # Fixed regular-file evidence.  Each path is mirrored below node/files after
 # its leading slash, so the archive records where the bytes were observed
 # without preserving source filesystem metadata.
@@ -646,7 +761,7 @@ def _run_probe(probe: Probe, capture: Path, timeout_seconds: int) -> bool:
                 stderr=stderr_file,
                 start_new_session=True,
             )
-        except OSError as process_error:
+        except (OSError, ValueError) as process_error:
             outcome = "failed_to_start"
             error = {
                 "kind": type(process_error).__name__,
@@ -711,6 +826,78 @@ def _run_probe(probe: Probe, capture: Path, timeout_seconds: int) -> bool:
             file=sys.stderr,
         )
     return succeeded
+
+
+def _run_ceph_probes(probes_directory: Path, timeout_seconds: int) -> bool:
+    """Run the fixed direct-Ceph catalog and confirmed crash details."""
+    succeeded = True
+    crash_list_succeeded = False
+    crash_list_capture = probes_directory / "crash-ls-json"
+
+    for probe in CEPH_PROBE_CATALOG:
+        probe_succeeded = _run_ceph_probe(
+            probe,
+            probes_directory,
+            timeout_seconds,
+        )
+        if probe.name == "crash-ls-json":
+            crash_list_succeeded = probe_succeeded
+        succeeded = probe_succeeded and succeeded
+
+    if not crash_list_succeeded:
+        return succeeded
+
+    try:
+        response = json.loads((crash_list_capture / "stdout").read_bytes())
+        if not isinstance(response, list):
+            raise ValueError("top-level response is not a list")
+        crash_ids: list[str] = []
+        for index, item in enumerate(response, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"item {index} is not an object")
+            crash_id = item.get("crash_id")
+            if not isinstance(crash_id, str) or not crash_id:
+                raise ValueError(f"item {index} has no nonempty string crash_id")
+            if len(crash_ids) < 10:
+                crash_ids.append(crash_id)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        print(f"crash-ls-json control parse failed: {error}", file=sys.stderr)
+        return False
+
+    for sequence, crash_id in enumerate(crash_ids, start=1):
+        probe = Probe(
+            name=f"crash-info-{sequence:06d}",
+            area="ceph",
+            argv=("ceph", "crash", "info", crash_id),
+        )
+        probe_succeeded = _run_ceph_probe(
+            probe,
+            probes_directory,
+            timeout_seconds,
+        )
+        succeeded = probe_succeeded and succeeded
+
+    return succeeded
+
+
+def _run_ceph_probe(
+    probe: Probe,
+    probes_directory: Path,
+    timeout_seconds: int,
+) -> bool:
+    """Attempt one Ceph Probe without letting capture I/O stop the catalog."""
+    try:
+        return _run_probe(
+            probe,
+            probes_directory / probe.name,
+            timeout_seconds,
+        )
+    except OSError as capture_error:
+        print(
+            f"cannot preserve {probe.name} Probe Capture: {capture_error}",
+            file=sys.stderr,
+        )
+        return False
 
 
 def _stream_archive(evidence_root: Path) -> None:
@@ -791,6 +978,11 @@ def main() -> int:
                 )
                 probe_succeeded = False
             succeeded = succeeded and probe_succeeded
+        if arguments.collect_ceph:
+            succeeded = _run_ceph_probes(
+                workspace / "ceph" / "probes",
+                arguments.probe_timeout_seconds,
+            ) and succeeded
         succeeded = _copy_configuration_files(files) and succeeded
         log_cutoff = datetime.now(timezone.utc) - timedelta(
             seconds=arguments.since_seconds

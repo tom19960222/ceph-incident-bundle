@@ -18,6 +18,72 @@ REMOTE_COLLECTOR = (
 )
 
 
+# Independent specification oracle: do not derive this from the production
+# catalog.  These are the exact direct commands and capture names from the
+# fixed direct-Ceph Probe table in docs/python-rewrite-spec.md.
+EXPECTED_CEPH_PROBES = (
+    ("status-json", ("ceph", "status", "--format", "json-pretty")),
+    (
+        "health-detail-json",
+        ("ceph", "health", "detail", "--format", "json-pretty"),
+    ),
+    ("versions-json", ("ceph", "versions", "--format", "json-pretty")),
+    (
+        "df-detail-json",
+        ("ceph", "df", "detail", "--format", "json-pretty"),
+    ),
+    ("osd-tree-json", ("ceph", "osd", "tree", "--format", "json-pretty")),
+    ("osd-df-json", ("ceph", "osd", "df", "--format", "json-pretty")),
+    ("osd-dump-json", ("ceph", "osd", "dump", "--format", "json-pretty")),
+    ("osd-perf-json", ("ceph", "osd", "perf", "--format", "json-pretty")),
+    (
+        "osd-blocked-by-json",
+        ("ceph", "osd", "blocked-by", "--format", "json-pretty"),
+    ),
+    ("pg-stat-json", ("ceph", "pg", "stat", "--format", "json-pretty")),
+    ("pg-dump-json", ("ceph", "pg", "dump", "--format", "json-pretty")),
+    (
+        "pg-dump-stuck-json",
+        ("ceph", "pg", "dump_stuck", "--format", "json-pretty"),
+    ),
+    ("mon-dump-json", ("ceph", "mon", "dump", "--format", "json-pretty")),
+    (
+        "quorum-status-json",
+        ("ceph", "quorum_status", "--format", "json-pretty"),
+    ),
+    ("mgr-dump-json", ("ceph", "mgr", "dump", "--format", "json-pretty")),
+    (
+        "orch-host-ls-json",
+        ("ceph", "orch", "host", "ls", "--format", "json-pretty"),
+    ),
+    ("orch-ps-json", ("ceph", "orch", "ps", "--format", "json-pretty")),
+    (
+        "orch-device-ls-wide-json",
+        (
+            "ceph",
+            "orch",
+            "device",
+            "ls",
+            "--wide",
+            "--format",
+            "json-pretty",
+        ),
+    ),
+    (
+        "config-dump-json",
+        ("ceph", "config", "dump", "--format", "json-pretty"),
+    ),
+    (
+        "crash-ls-json",
+        ("ceph", "crash", "ls", "--format", "json-pretty"),
+    ),
+    ("status-text", ("ceph", "status")),
+    ("health-detail-text", ("ceph", "health", "detail")),
+    ("osd-tree-text", ("ceph", "osd", "tree")),
+    ("orch-ps-text", ("ceph", "orch", "ps")),
+)
+
+
 class RemoteCollectorTests(unittest.TestCase):
     @staticmethod
     def write_successful_node_probe_commands(directory: Path) -> None:
@@ -59,6 +125,41 @@ print(os.path.basename(__file__))
             executable = directory / command
             executable.write_text(script, encoding="utf-8")
             executable.chmod(0o755)
+
+    @staticmethod
+    def write_ceph_probe_command(path: Path) -> None:
+        path.write_text(
+            f'''#!{sys.executable}
+import json
+import os
+from pathlib import Path
+import sys
+
+arguments = sys.argv[1:]
+with Path(os.environ["CEPH_EVENT_LOG"]).open("a", encoding="utf-8") as events:
+    events.write(json.dumps(["ceph", *arguments]) + "\\n")
+failed_argv = json.loads(os.environ.get("CEPH_FAIL_ARGV", "null"))
+if failed_argv == ["ceph", *arguments]:
+    os.write(1, b"failed raw stdout\\x00\\xff")
+    os.write(2, b"failed raw stderr\\x00\\xfe")
+    raise SystemExit(9)
+if arguments == ["crash", "ls", "--format", "json-pretty"]:
+    if "CEPH_CRASH_LIST_TEXT" in os.environ:
+        os.write(1, os.environ["CEPH_CRASH_LIST_TEXT"].encode())
+    else:
+        crash_ids = json.loads(os.environ.get("CEPH_CRASH_IDS", "[]"))
+        os.write(1, json.dumps([{{"crash_id": value}} for value in crash_ids]).encode())
+elif arguments[:2] == ["crash", "info"]:
+    os.write(1, b"crash raw stdout\\x00\\xff")
+    os.write(2, b"crash raw stderr\\x00\\xfe")
+elif arguments == ["status", "--format", "json-pretty"]:
+    os.write(1, b"not-json-is-still-raw\\x00\\xff")
+else:
+    os.write(1, b"ordinary raw stdout\\x00\\xff")
+''',
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
 
     @staticmethod
     def write_log_fixture_sitecustomize(path: Path) -> None:
@@ -1002,12 +1103,103 @@ raise SystemExit(9)
         self.assertIn("node/files/var/log/later.log", missing_names)
         self.assertIn(b"journal-system Probe failed", missing.stderr)
 
-    def test_selected_ceph_source_includes_the_authorized_empty_ceph_shape(self) -> None:
+    def test_selected_ceph_source_runs_the_exact_catalog_then_ten_crash_details(
+        self,
+    ) -> None:
+        crash_ids = [f"crash/id-{index}" for index in range(1, 13)]
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            self.write_ceph_probe_command(fake_bin / "ceph")
+            event_log = root / "ceph-events.jsonl"
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            environment["CEPH_EVENT_LOG"] = str(event_log)
+            environment["CEPH_CRASH_IDS"] = json.dumps(crash_ids)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REMOTE_COLLECTOR),
+                    "--since-seconds",
+                    "60",
+                    "--probe-timeout-seconds",
+                    "0",
+                    "--collect-ceph",
+                ],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            archive = root / "node.tar.gz"
+            archive.write_bytes(completed.stdout)
+            with tarfile.open(archive, "r:gz") as opened:
+                names = {member.name for member in opened.getmembers()}
+                observed_results = []
+                for probe_name, unused_argv in EXPECTED_CEPH_PROBES:
+                    result_file = opened.extractfile(
+                        f"ceph/probes/{probe_name}/result.json"
+                    )
+                    assert result_file is not None
+                    observed_results.append(
+                        (probe_name, tuple(json.load(result_file)["argv"]))
+                    )
+                status_stdout_file = opened.extractfile(
+                    "ceph/probes/status-json/stdout"
+                )
+                crash_stdout_file = opened.extractfile(
+                    "ceph/probes/crash-info-000001/stdout"
+                )
+                crash_stderr_file = opened.extractfile(
+                    "ceph/probes/crash-info-000001/stderr"
+                )
+                assert status_stdout_file is not None
+                assert crash_stdout_file is not None
+                assert crash_stderr_file is not None
+                status_stdout = status_stdout_file.read()
+                crash_stdout = crash_stdout_file.read()
+                crash_stderr = crash_stderr_file.read()
+            events = tuple(
+                tuple(json.loads(line))
+                for line in event_log.read_text(encoding="utf-8").splitlines()
+            )
+
+        expected_fixed = tuple(EXPECTED_CEPH_PROBES)
+        expected_dynamic = tuple(
+            (
+                f"crash-info-{index:06d}",
+                ("ceph", "crash", "info", crash_id),
+            )
+            for index, crash_id in enumerate(crash_ids[:10], start=1)
+        )
+        # Dependent details follow the complete fixed catalog, while their IDs
+        # come from the earlier crash-list control capture in response order.
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(observed_results, list(expected_fixed))
+        self.assertEqual(
+            events,
+            tuple(
+                argv for unused_name, argv in expected_fixed + expected_dynamic
+            ),
+        )
+        for probe_name, expected_argv in expected_dynamic:
+            self.assertIn(f"ceph/probes/{probe_name}/result.json", names)
+            self.assertNotIn(expected_argv[-1], "\n".join(names))
+        self.assertNotIn("ceph/probes/crash-info-000011", names)
+        self.assertEqual(status_stdout, b"not-json-is-still-raw\x00\xff")
+        self.assertEqual(crash_stdout, b"crash raw stdout\x00\xff")
+        self.assertEqual(crash_stderr, b"crash raw stderr\x00\xfe")
+
+    def test_selected_ceph_source_includes_the_authorized_ceph_shape(self) -> None:
         with TemporaryDirectory() as command_directory:
             fake_bin = Path(command_directory)
             self.write_successful_node_probe_commands(fake_bin)
+            self.write_ceph_probe_command(fake_bin / "ceph")
             environment = os.environ.copy()
             environment["PATH"] = str(fake_bin)
+            environment["CEPH_EVENT_LOG"] = str(fake_bin / "ceph-events.jsonl")
             completed = subprocess.run(
                 [
                     sys.executable,
@@ -1032,6 +1224,261 @@ raise SystemExit(9)
         self.assertEqual(completed.returncode, 0)
         self.assertIn("ceph", names)
         self.assertIn("ceph/probes", names)
+
+    def test_ceph_probe_failure_preserves_raw_bytes_and_later_probes_continue(
+        self,
+    ) -> None:
+        failed_argv = ("ceph", "osd", "dump", "--format", "json-pretty")
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            self.write_ceph_probe_command(fake_bin / "ceph")
+            event_log = root / "ceph-events.jsonl"
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            environment["CEPH_EVENT_LOG"] = str(event_log)
+            environment["CEPH_FAIL_ARGV"] = json.dumps(failed_argv)
+            completed = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "0",
+                "--collect-ceph",
+                environment=environment,
+            )
+            archive = root / "node.tar.gz"
+            archive.write_bytes(completed.stdout)
+            with tarfile.open(archive, "r:gz") as opened:
+                failed_stdout_file = opened.extractfile(
+                    "ceph/probes/osd-dump-json/stdout"
+                )
+                failed_stderr_file = opened.extractfile(
+                    "ceph/probes/osd-dump-json/stderr"
+                )
+                failed_result_file = opened.extractfile(
+                    "ceph/probes/osd-dump-json/result.json"
+                )
+                later_result_file = opened.extractfile(
+                    "ceph/probes/orch-ps-text/result.json"
+                )
+                assert failed_stdout_file is not None
+                assert failed_stderr_file is not None
+                assert failed_result_file is not None
+                assert later_result_file is not None
+                failed_stdout = failed_stdout_file.read()
+                failed_stderr = failed_stderr_file.read()
+                failed_result = json.load(failed_result_file)
+                later_result = json.load(later_result_file)
+            events = tuple(
+                tuple(json.loads(line))
+                for line in event_log.read_text(encoding="utf-8").splitlines()
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(
+            events,
+            tuple(argv for unused_name, argv in EXPECTED_CEPH_PROBES),
+        )
+        self.assertEqual(failed_stdout, b"failed raw stdout\x00\xff")
+        self.assertEqual(failed_stderr, b"failed raw stderr\x00\xfe")
+        self.assertEqual(failed_result["outcome"], "exited")
+        self.assertEqual(failed_result["exit_code"], 9)
+        self.assertIsNone(failed_result["error"])
+        self.assertEqual(later_result["argv"], ["ceph", "orch", "ps"])
+        self.assertIn(b"osd-dump-json Probe failed", completed.stderr)
+
+    def test_malformed_successful_crash_list_is_partial_without_detail_probes(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            self.write_ceph_probe_command(fake_bin / "ceph")
+            event_log = root / "ceph-events.jsonl"
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            environment["CEPH_EVENT_LOG"] = str(event_log)
+            environment["CEPH_CRASH_LIST_TEXT"] = '{"crash_id":'
+            completed = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "0",
+                "--collect-ceph",
+                environment=environment,
+            )
+            archive = root / "node.tar.gz"
+            archive.write_bytes(completed.stdout)
+            with tarfile.open(archive, "r:gz") as opened:
+                names = {member.name for member in opened.getmembers()}
+                later_result_file = opened.extractfile(
+                    "ceph/probes/orch-ps-text/result.json"
+                )
+                assert later_result_file is not None
+                later_result = json.load(later_result_file)
+            events = tuple(
+                tuple(json.loads(line))
+                for line in event_log.read_text(encoding="utf-8").splitlines()
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(
+            events,
+            tuple(argv for unused_name, argv in EXPECTED_CEPH_PROBES),
+        )
+        self.assertFalse(
+            any(name.startswith("ceph/probes/crash-info-") for name in names)
+        )
+        self.assertEqual(later_result["argv"], ["ceph", "orch", "ps"])
+        self.assertIn(b"crash-ls-json control parse failed", completed.stderr)
+
+    def test_nonzero_crash_list_does_not_schedule_detail_probes(self) -> None:
+        failed_argv = ("ceph", "crash", "ls", "--format", "json-pretty")
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            self.write_ceph_probe_command(fake_bin / "ceph")
+            event_log = root / "ceph-events.jsonl"
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            environment["CEPH_EVENT_LOG"] = str(event_log)
+            environment["CEPH_FAIL_ARGV"] = json.dumps(failed_argv)
+            completed = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "0",
+                "--collect-ceph",
+                environment=environment,
+            )
+            archive = root / "node.tar.gz"
+            archive.write_bytes(completed.stdout)
+            with tarfile.open(archive, "r:gz") as opened:
+                names = {member.name for member in opened.getmembers()}
+                later_result_file = opened.extractfile(
+                    "ceph/probes/orch-ps-text/result.json"
+                )
+                assert later_result_file is not None
+                later_result = json.load(later_result_file)
+            events = tuple(
+                tuple(json.loads(line))
+                for line in event_log.read_text(encoding="utf-8").splitlines()
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(
+            events,
+            tuple(argv for unused_name, argv in EXPECTED_CEPH_PROBES),
+        )
+        self.assertFalse(
+            any(name.startswith("ceph/probes/crash-info-") for name in names)
+        )
+        self.assertEqual(later_result["argv"], ["ceph", "orch", "ps"])
+        self.assertIn(b"crash-ls-json Probe failed", completed.stderr)
+        self.assertNotIn(b"control parse failed", completed.stderr)
+
+    def test_malformed_crash_item_after_tenth_rejects_the_whole_control_set(
+        self,
+    ) -> None:
+        response = [{"crash_id": f"crash-{index}"} for index in range(1, 11)]
+        response.append({"wrong_field": "must-not-be-ignored"})
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            self.write_ceph_probe_command(fake_bin / "ceph")
+            event_log = root / "ceph-events.jsonl"
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            environment["CEPH_EVENT_LOG"] = str(event_log)
+            environment["CEPH_CRASH_LIST_TEXT"] = json.dumps(response)
+            completed = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "0",
+                "--collect-ceph",
+                environment=environment,
+            )
+            archive = root / "node.tar.gz"
+            archive.write_bytes(completed.stdout)
+            with tarfile.open(archive, "r:gz") as opened:
+                names = {member.name for member in opened.getmembers()}
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(
+            any(name.startswith("ceph/probes/crash-info-") for name in names)
+        )
+        self.assertIn(
+            b"item 11 has no nonempty string crash_id",
+            completed.stderr,
+        )
+
+    def test_unrepresentable_crash_id_is_failed_to_start_and_later_work_continues(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self.write_successful_node_probe_commands(fake_bin)
+            self.write_ceph_probe_command(fake_bin / "ceph")
+            event_log = root / "ceph-events.jsonl"
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+            environment["CEPH_EVENT_LOG"] = str(event_log)
+            environment["CEPH_CRASH_IDS"] = json.dumps(
+                ["cannot\x00be-an-argv", "later-crash"]
+            )
+            completed = self.run_remote_collector(
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "0",
+                "--collect-ceph",
+                environment=environment,
+            )
+            self.assertTrue(completed.stdout, "collector must still stream an archive")
+            archive = root / "node.tar.gz"
+            archive.write_bytes(completed.stdout)
+            with tarfile.open(archive, "r:gz") as opened:
+                failed_result_file = opened.extractfile(
+                    "ceph/probes/crash-info-000001/result.json"
+                )
+                later_result_file = opened.extractfile(
+                    "ceph/probes/crash-info-000002/result.json"
+                )
+                journal_result_file = opened.extractfile(
+                    "node/probes/journal-system/result.json"
+                )
+                assert failed_result_file is not None
+                assert later_result_file is not None
+                assert journal_result_file is not None
+                failed_result = json.load(failed_result_file)
+                later_result = json.load(later_result_file)
+                journal_result = json.load(journal_result_file)
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(failed_result["outcome"], "failed_to_start")
+        self.assertIsNone(failed_result["exit_code"])
+        self.assertEqual(failed_result["error"]["kind"], "ValueError")
+        self.assertEqual(
+            later_result["argv"],
+            ["ceph", "crash", "info", "later-crash"],
+        )
+        self.assertEqual(later_result["outcome"], "exited")
+        self.assertEqual(journal_result["outcome"], "exited")
+        self.assertIn(
+            b"crash-info-000001 Probe failed: outcome=failed_to_start",
+            completed.stderr,
+        )
 
     def test_noncanonical_or_repeated_remote_controls_are_rejected(self) -> None:
         invalid_arguments = (

@@ -699,9 +699,11 @@ node-a = node-a.example.test
             inventory_path = cwd / "inventory.ini"
             inventory_path.write_bytes(inventory)
             record = cwd / "ssh-record"
+            ceph_record = cwd / "ceph-events.jsonl"
             environment = os.environ.copy()
             environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
             environment["FAKE_SSH_RECORD"] = str(record)
+            environment["FAKE_SSH_CEPH_RECORD"] = str(ceph_record)
             command = COMMAND
             assert command is not None
 
@@ -742,6 +744,7 @@ node-a = node-a.example.test
             from ceph_incident_bundle import remote_collector
 
             installed_source = Path(remote_collector.__file__).read_bytes()
+            ceph_was_invoked = ceph_record.exists()
 
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(completed.stderr, b"")
@@ -769,6 +772,7 @@ node-a = node-a.example.test
         )
         self.assertEqual(transferred_source, installed_source)
         self.assertEqual(process_count, "1\n")
+        self.assertFalse(ceph_was_invoked)
         self.assertEqual(bundled_inventory, inventory)
         self.assertTrue(hostname)
         self.assertEqual(metadata["outcome"], "complete")
@@ -807,6 +811,150 @@ node-a = node-a.example.test
         self.assertTrue(all(member.isdir() or member.isreg() for member in members))
         for top_level in ("nodes", "ceph", "kubernetes", "prometheus"):
             self.assertIn(f"{root}/{top_level}", names)
+
+    def test_installed_collect_runs_direct_ceph_only_in_selected_existing_session(
+        self,
+    ) -> None:
+        inventory = b"""\
+[common]
+ssh_user = root
+probe_timeout = 30m
+ssh_connect_timeout = 15s
+[nodes]
+node-a = node-a.example.test
+node-b = node-b.example.test
+[ceph]
+source = node-b
+"""
+        failed_argv = ["ceph", "osd", "dump", "--format", "json-pretty"]
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (cwd / "inventory.ini").write_bytes(inventory)
+            record = cwd / "ssh-record"
+            ceph_record = cwd / "ceph-events.jsonl"
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_SSH_RECORD"] = str(record)
+            environment["FAKE_SSH_CEPH_RECORD"] = str(ceph_record)
+            environment["FAKE_SSH_CEPH_FAIL_ARGV"] = json.dumps(failed_argv)
+
+            completed = self.run_cli(
+                "collect",
+                cwd=cwd,
+                env=environment,
+                timeout=60,
+            )
+
+            bundle = next(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+            root = bundle.name.removesuffix(".tar.gz")
+            with tarfile.open(bundle, "r:gz") as archive:
+                names = {member.name for member in archive.getmembers()}
+                failed_stdout_file = archive.extractfile(
+                    f"{root}/ceph/probes/osd-dump-json/stdout"
+                )
+                failed_stderr_file = archive.extractfile(
+                    f"{root}/ceph/probes/osd-dump-json/stderr"
+                )
+                metadata_file = archive.extractfile(f"{root}/collection.json")
+                assert failed_stdout_file is not None
+                assert failed_stderr_file is not None
+                assert metadata_file is not None
+                failed_stdout = failed_stdout_file.read()
+                failed_stderr = failed_stderr_file.read()
+                outcome = json.load(metadata_file)["outcome"]
+            argv_by_session = tuple(
+                json.loads((record / f"argv.{sequence}.json").read_text())
+                for sequence in (1, 2)
+            )
+            process_count = (record / "count").read_text(encoding="ascii")
+            ceph_events = tuple(
+                json.loads(line)
+                for line in ceph_record.read_text(encoding="utf-8").splitlines()
+            )
+
+        expected_ceph_events = tuple(
+            ["root@node-b.example.test", *argv]
+            for unused_name, argv in (
+                ("status-json", ("ceph", "status", "--format", "json-pretty")),
+                (
+                    "health-detail-json",
+                    ("ceph", "health", "detail", "--format", "json-pretty"),
+                ),
+                ("versions-json", ("ceph", "versions", "--format", "json-pretty")),
+                (
+                    "df-detail-json",
+                    ("ceph", "df", "detail", "--format", "json-pretty"),
+                ),
+                ("osd-tree-json", ("ceph", "osd", "tree", "--format", "json-pretty")),
+                ("osd-df-json", ("ceph", "osd", "df", "--format", "json-pretty")),
+                ("osd-dump-json", tuple(failed_argv)),
+                ("osd-perf-json", ("ceph", "osd", "perf", "--format", "json-pretty")),
+                (
+                    "osd-blocked-by-json",
+                    ("ceph", "osd", "blocked-by", "--format", "json-pretty"),
+                ),
+                ("pg-stat-json", ("ceph", "pg", "stat", "--format", "json-pretty")),
+                ("pg-dump-json", ("ceph", "pg", "dump", "--format", "json-pretty")),
+                (
+                    "pg-dump-stuck-json",
+                    ("ceph", "pg", "dump_stuck", "--format", "json-pretty"),
+                ),
+                ("mon-dump-json", ("ceph", "mon", "dump", "--format", "json-pretty")),
+                (
+                    "quorum-status-json",
+                    ("ceph", "quorum_status", "--format", "json-pretty"),
+                ),
+                ("mgr-dump-json", ("ceph", "mgr", "dump", "--format", "json-pretty")),
+                (
+                    "orch-host-ls-json",
+                    ("ceph", "orch", "host", "ls", "--format", "json-pretty"),
+                ),
+                ("orch-ps-json", ("ceph", "orch", "ps", "--format", "json-pretty")),
+                (
+                    "orch-device-ls-wide-json",
+                    (
+                        "ceph",
+                        "orch",
+                        "device",
+                        "ls",
+                        "--wide",
+                        "--format",
+                        "json-pretty",
+                    ),
+                ),
+                (
+                    "config-dump-json",
+                    ("ceph", "config", "dump", "--format", "json-pretty"),
+                ),
+                (
+                    "crash-ls-json",
+                    ("ceph", "crash", "ls", "--format", "json-pretty"),
+                ),
+                ("status-text", ("ceph", "status")),
+                ("health-detail-text", ("ceph", "health", "detail")),
+                ("osd-tree-text", ("ceph", "osd", "tree")),
+                ("orch-ps-text", ("ceph", "orch", "ps")),
+            )
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(outcome, "partial")
+        self.assertEqual(process_count, "2\n")
+        self.assertNotIn("--collect-ceph", argv_by_session[0])
+        self.assertEqual(argv_by_session[0][-1], "1800")
+        self.assertEqual(argv_by_session[1][-1], "--collect-ceph")
+        self.assertEqual(ceph_events, expected_ceph_events)
+        self.assertEqual(failed_stdout, b"failed ceph stdout\x00\xff")
+        self.assertEqual(failed_stderr, b"failed ceph stderr\x00\xfe")
+        self.assertIn(
+            f"{root}/ceph/probes/orch-ps-text/result.json",
+            names,
+        )
+        self.assertIn(b"[node-b] osd-dump-json Probe failed", completed.stderr)
+        self.assertNotIn(b"sudo", completed.stderr)
+        self.assertNotIn(b"cephadm", completed.stderr)
 
     def test_installed_collect_preserves_prometheus_controls_from_loopback(self) -> None:
         with _installed_prometheus_server() as (
@@ -2058,7 +2206,9 @@ if hostile_member:
         archive.addfile(hostile, io.BytesIO(private_payload))
     sys.stdout.buffer.write(hostile_archive.getvalue())
     raise SystemExit(0)
-remote_start = sys.argv.index("python3") + 1
+remote_python_index = sys.argv.index("python3")
+remote_destination = sys.argv[remote_python_index - 1]
+remote_start = remote_python_index + 1
 probe_bin = Path(tempfile.mkdtemp(prefix="fake-ssh-probes."))
 remote_support = Path(tempfile.mkdtemp(prefix="fake-ssh-remote-support."))
 remote_source_root = remote_support / "source"
@@ -2085,6 +2235,31 @@ for command in (
     executable = probe_bin / command
     executable.write_text(probe_script, encoding="utf-8")
     executable.chmod(0o755)
+ceph = probe_bin / "ceph"
+ceph.write_text(
+    f"#!{sys.executable}\\n"
+    "import json\\n"
+    "import os\\n"
+    "from pathlib import Path\\n"
+    "import sys\\n"
+    "argv = ['ceph', *sys.argv[1:]]\\n"
+    "record = os.environ.get('FAKE_SSH_CEPH_RECORD')\\n"
+    "if record:\\n"
+    "    with Path(record).open('a', encoding='utf-8') as events:\\n"
+    "        event = [os.environ['FAKE_SSH_DESTINATION'], *argv]\\n"
+    "        events.write(json.dumps(event) + '\\\\n')\\n"
+    "failed = json.loads(os.environ.get('FAKE_SSH_CEPH_FAIL_ARGV', 'null'))\\n"
+    "if argv == failed:\\n"
+    "    os.write(1, b'failed ceph stdout\\\\x00\\\\xff')\\n"
+    "    os.write(2, b'failed ceph stderr\\\\x00\\\\xfe')\\n"
+    "    raise SystemExit(9)\\n"
+    "if sys.argv[1:] == ['crash', 'ls', '--format', 'json-pretty']:\\n"
+    "    os.write(1, b'[]')\\n"
+    "else:\\n"
+    "    os.write(1, b'ordinary ceph stdout\\\\x00\\\\xff')\\n",
+    encoding="utf-8",
+)
+ceph.chmod(0o755)
 if os.environ.get("FAKE_SSH_JOURNAL_FAILURE"):
     journalctl = probe_bin / "journalctl"
     journalctl.write_text(
@@ -2098,6 +2273,7 @@ if os.environ.get("FAKE_SSH_JOURNAL_FAILURE"):
     journalctl.chmod(0o755)
 remote_environment = os.environ.copy()
 remote_environment["FAKE_REMOTE_SOURCE_ROOT"] = str(remote_source_root)
+remote_environment["FAKE_SSH_DESTINATION"] = remote_destination
 remote_environment["PYTHONPATH"] = str(remote_support)
 path_entries = remote_environment["PATH"].split(os.pathsep)
 remote_environment["PATH"] = os.pathsep.join(
