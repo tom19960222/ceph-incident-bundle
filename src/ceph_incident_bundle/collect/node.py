@@ -24,7 +24,6 @@ def collect_node(
     ceph_allowed: bool,
     staging_directory: Path,
     contribution_directory: Path,
-    interruption_problems: list[str],
 ) -> list[str]:
     """Receive and admit one Target Node contribution, returning its problems."""
     staging_directory = Path(staging_directory)
@@ -52,6 +51,7 @@ def collect_node(
 
     start_error: OSError | None = None
     interrupted = False
+    interruption_problems: list[str] = []
     try:
         # Regular files let OpenSSH read and write without pipe backpressure.  The
         # lexical scope also proves stdin, the complete stdout archive, and stderr
@@ -97,10 +97,16 @@ def collect_node(
                             f"interrupted process group {process.pid}: {error}"
                         )
     except OSError as error:
-        return [
-            f"Target Node {node.inventory_name}: "
-            f"cannot complete one-SSH stream files: {error}"
-        ]
+        if interrupted:
+            interruption_problems.append(
+                f"Target Node {node.inventory_name}: cannot close interrupted "
+                f"SSH protocol streams: {error}"
+            )
+        else:
+            return [
+                f"Target Node {node.inventory_name}: "
+                f"cannot complete one-SSH stream files: {error}"
+            ]
 
     if start_error is not None:
         return [
@@ -112,6 +118,10 @@ def collect_node(
             _print_diagnostics(node.inventory_name, diagnostics_path)
         except Exception:
             pass
+        if interruption_problems:
+            # The top-level interrupt owner reports this standard chained cause
+            # after all three protocol streams have left their context managers.
+            raise KeyboardInterrupt from OSError("; ".join(interruption_problems))
         raise KeyboardInterrupt
 
     try:

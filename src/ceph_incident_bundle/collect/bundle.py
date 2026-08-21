@@ -76,7 +76,6 @@ def publish_bundle(
     started_at: datetime,
     since: str,
     prior_partial: bool,
-    interruption_problems: list[str] | None = None,
 ) -> str | None:
     """Validate admitted state and publish one bundle without replacing a path.
 
@@ -90,18 +89,16 @@ def publish_bundle(
 
     The caller owns the workspace until this function is called.  At that handoff,
     publication assumes responsibility for workspace cleanup and exact residue
-    reporting on every return or raised publication error.  A caller that handles
-    ``KeyboardInterrupt`` passes ``interruption_problems`` so cleanup residue can be
-    reported explicitly after this function has closed all publication inputs.
+    reporting on every return or raised publication error.  Interrupt cleanup
+    problems are attached as the standard exception cause so the top-level owner
+    can report them after this function has closed all publication inputs.
     """
     workspace = Path(workspace)
     final_path = Path(final_path)
     candidate: Path | None = None
     candidate_name: str | None = None
     candidate_identity: tuple[int, int] | None = None
-    final_linked = False
-    if interruption_problems is None:
-        interruption_problems = []
+    interruption_problems: list[str] = []
     cleanup_problem: str | None = None
     workspace_cleanup_attempted = False
     workspace_marker_path: str | None = None
@@ -220,7 +217,6 @@ def publish_bundle(
             dst_dir_fd=output_descriptor,
             follow_symlinks=False,
         )
-        final_linked = True
         try:
             os.unlink(candidate_name, dir_fd=output_descriptor)
         except OSError as cleanup_error:
@@ -237,11 +233,7 @@ def publish_bundle(
             ) from cleanup_error
         return cleanup_problem
     except KeyboardInterrupt:
-        if (
-            final_linked
-            and candidate_identity is not None
-            and output_descriptor is not None
-        ):
+        if candidate_identity is not None and output_descriptor is not None:
             final_cleanup_problem = _remove_owned_final_at(
                 output_descriptor,
                 final_path.name,
@@ -286,6 +278,8 @@ def publish_bundle(
             )
             if candidate_cleanup_problem is not None:
                 interruption_problems.append(candidate_cleanup_problem)
+        if interruption_problems:
+            raise KeyboardInterrupt from OSError("; ".join(interruption_problems))
         raise
     except Exception as error:
         if not workspace_cleanup_attempted:
@@ -339,7 +333,7 @@ def publish_bundle(
         if output_descriptor is not None:
             try:
                 os.close(output_descriptor)
-            except OSError:
+            except (OSError, KeyboardInterrupt):
                 # This descriptor owns no evidence bytes or filesystem object.
                 # Once the final hard link is visible, a close report cannot turn
                 # actual delivery into nondelivery or rewrite final metadata.  On

@@ -87,7 +87,6 @@ class TopLevelCollectionTests(unittest.TestCase):
     def test_node_process_group_exit_race_preserves_interrupt(self) -> None:
         process = Mock(pid=54321)
         process.wait.side_effect = [KeyboardInterrupt, 0]
-        interruption_problems: list[str] = []
         with TemporaryDirectory() as directory:
             root = Path(directory)
             staging = root / "private" / "node-a"
@@ -115,11 +114,71 @@ class TopLevelCollectionTests(unittest.TestCase):
                     ceph_allowed=False,
                     staging_directory=staging,
                     contribution_directory=contribution,
-                    interruption_problems=interruption_problems,
                 )
 
         self.assertEqual(caught.exception.args, ())
-        self.assertEqual(interruption_problems, [])
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_node_stream_close_failure_preserves_interrupt(self) -> None:
+        process = Mock(pid=54321)
+        process.wait.side_effect = [KeyboardInterrupt, 0]
+        real_open = Path.open
+        close_failure_seen = False
+
+        class CloseFailure:
+            def __init__(self, opened_file) -> None:
+                self.opened_file = opened_file
+
+            def __enter__(self):
+                return self.opened_file
+
+            def __exit__(self, exception_type, exception, traceback) -> None:
+                nonlocal close_failure_seen
+                self.opened_file.close()
+                if not close_failure_seen:
+                    close_failure_seen = True
+                    raise OSError("injected interrupted stream close failure")
+
+        def open_with_one_close_failure(path: Path, *args, **kwargs):
+            opened_file = real_open(path, *args, **kwargs)
+            if path.name == "node-evidence.tar.gz":
+                return CloseFailure(opened_file)
+            return opened_file
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            staging = root / "private" / "node-a"
+            staging.parent.mkdir(parents=True)
+            contribution = root / "admitted" / "node-a"
+            contribution.parent.mkdir(parents=True)
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.node.subprocess.Popen",
+                    return_value=process,
+                ),
+                patch("ceph_incident_bundle.collect.node.os.killpg"),
+                patch.object(Path, "open", new=open_with_one_close_failure),
+                self.assertRaises(KeyboardInterrupt) as caught,
+            ):
+                collect_node(
+                    TargetNode("node-a", "node-a.example.test"),
+                    ssh_user="root",
+                    since_seconds=3600,
+                    probe_timeout_seconds=60,
+                    ssh_connect_timeout_seconds=10,
+                    ceph_allowed=False,
+                    staging_directory=staging,
+                    contribution_directory=contribution,
+                )
+
+        self.assertTrue(close_failure_seen)
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        assert caught.exception.__cause__ is not None
+        self.assertIn(
+            "injected interrupted stream close failure",
+            str(caught.exception.__cause__),
+        )
 
     def test_absent_prometheus_url_skips_capability_cleanly(self) -> None:
         with TemporaryDirectory() as directory:

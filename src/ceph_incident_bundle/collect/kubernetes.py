@@ -35,7 +35,6 @@ def collect_kubernetes(
     probe_timeout_seconds: int,
     staging_directory: Path,
     contribution_directory: Path,
-    interruption_problems: list[str],
 ) -> list[str]:
     """Collect and atomically admit one configured Kubernetes contribution."""
     staging_directory = Path(staging_directory)
@@ -76,9 +75,27 @@ def collect_kubernetes(
                 probe,
                 capture,
                 probe_timeout_seconds=probe_timeout_seconds,
-                interruption_problems=interruption_problems,
             )
         except OSError as error:
+            cleanup_errors = [str(error)]
+            interrupted = error.__context__
+            while interrupted is not None and not isinstance(
+                interrupted, KeyboardInterrupt
+            ):
+                if isinstance(interrupted, OSError):
+                    cleanup_errors.append(str(interrupted))
+                interrupted = interrupted.__context__
+            if isinstance(interrupted, KeyboardInterrupt):
+                details: list[str] = []
+                if isinstance(interrupted.__cause__, OSError):
+                    details.append(str(interrupted.__cause__))
+                details.extend(
+                    f"Kubernetes {probe.name}: interruption cleanup failed: {message}"
+                    for message in reversed(cleanup_errors)
+                )
+                # Preserve the interrupt as the outcome; the standard cause is
+                # only the concrete cleanup detail the top-level owner reports.
+                raise KeyboardInterrupt from OSError("; ".join(details))
             return [
                 *problems,
                 _with_residue(
@@ -204,7 +221,6 @@ def _run_probe(
     capture: Path,
     *,
     probe_timeout_seconds: int,
-    interruption_problems: list[str],
 ) -> tuple[bool, str | None]:
     capture.mkdir()
     started_at = _utc_now()
@@ -237,7 +253,7 @@ def _run_probe(
             except KeyboardInterrupt:
                 process_residue = _terminate_process_group(process)
                 if process_residue is not None:
-                    interruption_problems.append(
+                    raise KeyboardInterrupt from OSError(
                         f"Kubernetes {probe.name}: {process_residue}"
                     )
                 raise

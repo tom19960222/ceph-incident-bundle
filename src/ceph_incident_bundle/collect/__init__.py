@@ -66,8 +66,6 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
     workspace: Path | None = None
     workspace_identity: tuple[int, int] | None = None
     publication_has_ownership = False
-    publication_completed = False
-    interruption_problems: list[str] = []
     try:
         workspace = Path(tempfile.mkdtemp(prefix="ceph-incident-work."))
         workspace_facts = workspace.stat(follow_symlinks=False)
@@ -94,7 +92,6 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
                         ceph_allowed=inventory.ceph_source == node.inventory_name,
                         staging_directory=private_nodes / node.inventory_name,
                         contribution_directory=contributions / node.inventory_name,
-                        interruption_problems=interruption_problems,
                     )
                 )
             except Exception as error:
@@ -115,7 +112,6 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
                         probe_timeout_seconds=inventory.probe_timeout_seconds,
                         staging_directory=workspace / "private" / "kubernetes",
                         contribution_directory=kubernetes_contribution,
-                        interruption_problems=interruption_problems,
                     )
                 )
             except Exception as error:
@@ -163,9 +159,7 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
             started_at=started_at,
             since=since,
             prior_partial=bool(problems),
-            interruption_problems=interruption_problems,
         )
-        publication_completed = True
         if cleanup_problem is not None:
             problems.append(cleanup_problem)
             try:
@@ -187,10 +181,20 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
                 file=sys.stderr,
             )
         return 0
-    except KeyboardInterrupt:
-        if publication_completed:
+    except KeyboardInterrupt as interruption:
+        # Capability cleanup stays separate from ordinary returned problems.  A
+        # standard chained OSError carries only concrete interruption-cleanup
+        # residue; no mutable status object or new exception category is needed.
+        interruption_problem = (
+            str(interruption.__cause__)
+            if isinstance(interruption.__cause__, OSError)
+            else None
+        )
+        if publication_has_ownership and _is_delivered_bundle(final_path):
             outcome = "partial" if problems else "complete"
             try:
+                if interruption_problem is not None:
+                    print(_terminal_safe(interruption_problem), file=sys.stderr)
                 print(
                     f"Incident Bundle delivered at {final_path} ({outcome}), but "
                     "the final standard-output result was interrupted",
@@ -205,7 +209,8 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
                 workspace, workspace_identity
             )
         problems = ["collection interrupted"]
-        problems.extend(interruption_problems)
+        if interruption_problem is not None:
+            problems.append(interruption_problem)
         if cleanup_problem:
             problems.append(cleanup_problem)
         return _nondelivery(problems, status=130)
@@ -291,6 +296,15 @@ def _cleanup_owned_workspace(
     return cleanup_owned_workspace_before_publication(
         workspace, workspace_identity
     )
+
+
+def _is_delivered_bundle(final_path: Path) -> bool:
+    """Return whether publication left a regular final bundle at its fixed path."""
+    try:
+        final_facts = final_path.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISREG(final_facts.st_mode)
 
 
 def _terminal_safe(value: str) -> str:

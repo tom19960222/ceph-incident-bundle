@@ -7,7 +7,7 @@ import sys
 from tempfile import TemporaryDirectory
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ceph_incident_bundle.collect.kubernetes import (
     _log_probe_name,
@@ -52,7 +52,6 @@ collect_kubernetes(
     probe_timeout_seconds=30,
     staging_directory=Path(sys.argv[1]),
     contribution_directory=Path(sys.argv[2]),
-    interruption_problems=[],
 )
 """
         child_pid: int | None = None
@@ -111,6 +110,44 @@ collect_kubernetes(
         self.assertEqual(
             boundary_events,
             ["kubectl-start", "kubectl-termination-request"],
+        )
+
+    def test_kubectl_signal_failure_preserves_interrupt(self) -> None:
+        process = Mock(pid=65432)
+        process.wait.side_effect = KeyboardInterrupt
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            staging = root / "private" / "kubernetes"
+            staging.parent.mkdir()
+            admitted = root / "admitted" / "kubernetes"
+            admitted.parent.mkdir()
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.kubernetes.subprocess.Popen",
+                    return_value=process,
+                ),
+                patch(
+                    "ceph_incident_bundle.collect.kubernetes.os.killpg",
+                    side_effect=PermissionError("injected kubectl signal failure"),
+                ),
+                self.assertRaises(KeyboardInterrupt) as caught,
+            ):
+                collect_kubernetes(
+                    context="lab-context",
+                    consumer_namespace="rook-consumer",
+                    operator_namespace="rook-operator",
+                    since="24h",
+                    probe_timeout_seconds=30,
+                    staging_directory=staging,
+                    contribution_directory=admitted,
+                )
+
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        assert caught.exception.__cause__ is not None
+        self.assertIn(
+            "injected kubectl signal failure",
+            str(caught.exception.__cause__),
         )
 
     def test_log_sequence_name_grows_beyond_six_digits_without_collision(
@@ -838,7 +875,6 @@ collect_kubernetes(
                 probe_timeout_seconds=timeout,
                 staging_directory=staging,
                 contribution_directory=admitted,
-                interruption_problems=[],
             )
 
     @staticmethod
