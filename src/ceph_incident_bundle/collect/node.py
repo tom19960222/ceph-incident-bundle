@@ -24,6 +24,7 @@ def collect_node(
     ceph_allowed: bool,
     staging_directory: Path,
     contribution_directory: Path,
+    interruption_problems: list[str],
 ) -> list[str]:
     """Receive and admit one Target Node contribution, returning its problems."""
     staging_directory = Path(staging_directory)
@@ -77,9 +78,24 @@ def collect_node(
                     # Ctrl-C reaches only the workstation flow.  Forward SIGINT
                     # to request the remote Python collector's normal ``finally``
                     # cleanup while the connection is still reachable.
-                    os.killpg(process.pid, signal.SIGINT)
-                    process.wait()
                     interrupted = True
+                    try:
+                        os.killpg(process.pid, signal.SIGINT)
+                    except ProcessLookupError:
+                        # The group already completed its cleanup and exited.
+                        pass
+                    except OSError as error:
+                        interruption_problems.append(
+                            f"Target Node {node.inventory_name}: cannot request "
+                            f"cleanup from process group {process.pid}: {error}"
+                        )
+                    try:
+                        process.wait()
+                    except OSError as error:
+                        interruption_problems.append(
+                            f"Target Node {node.inventory_name}: cannot wait for "
+                            f"interrupted process group {process.pid}: {error}"
+                        )
     except OSError as error:
         return [
             f"Target Node {node.inventory_name}: "

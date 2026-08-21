@@ -6,10 +6,12 @@ from pathlib import Path
 import tarfile
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ceph_incident_bundle.collect import run
 from ceph_incident_bundle.collect.bundle import BundlePublicationError
+from ceph_incident_bundle.collect.node import collect_node
+from ceph_incident_bundle.inventory import TargetNode
 
 
 INVENTORY = b"""\
@@ -57,6 +59,68 @@ request_timeout = 7s
 
 
 class TopLevelCollectionTests(unittest.TestCase):
+    def test_interrupt_after_publication_is_reported_as_delivered(self) -> None:
+        class InterruptingResultStream(io.StringIO):
+            def write(self, value: str) -> int:
+                raise KeyboardInterrupt
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            stderr = io.StringIO()
+            with (
+                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
+                redirect_stdout(InterruptingResultStream()),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            bundles = list(root.glob("ceph-incident-bundle-*.tar.gz"))
+
+        self.assertEqual(status, 0)
+        self.assertEqual(len(bundles), 1)
+        self.assertIn("Incident Bundle delivered at", stderr.getvalue())
+        self.assertIn("result was interrupted", stderr.getvalue())
+        self.assertNotIn("FAIL: no Incident Bundle delivered", stderr.getvalue())
+
+    def test_node_process_group_exit_race_preserves_interrupt(self) -> None:
+        process = Mock(pid=54321)
+        process.wait.side_effect = [KeyboardInterrupt, 0]
+        interruption_problems: list[str] = []
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            staging = root / "private" / "node-a"
+            staging.parent.mkdir(parents=True)
+            contribution = root / "admitted" / "node-a"
+            contribution.parent.mkdir(parents=True)
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.node.subprocess.Popen",
+                    return_value=process,
+                ),
+                patch(
+                    "ceph_incident_bundle.collect.node.os.killpg",
+                    side_effect=ProcessLookupError("process group exited"),
+                ),
+                self.assertRaises(KeyboardInterrupt) as caught,
+            ):
+                collect_node(
+                    TargetNode("node-a", "node-a.example.test"),
+                    ssh_user="root",
+                    since_seconds=3600,
+                    probe_timeout_seconds=60,
+                    ssh_connect_timeout_seconds=10,
+                    ceph_allowed=False,
+                    staging_directory=staging,
+                    contribution_directory=contribution,
+                    interruption_problems=interruption_problems,
+                )
+
+        self.assertEqual(caught.exception.args, ())
+        self.assertEqual(interruption_problems, [])
+
     def test_absent_prometheus_url_skips_capability_cleanly(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

@@ -796,6 +796,59 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertFalse(final_exists)
         self.assertEqual(candidates, [])
 
+    def test_interrupt_after_final_link_rolls_back_owned_final(self) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+        real_unlink = os.unlink
+        interrupted = False
+
+        def interrupt_first_candidate_unlink(path, *args, **kwargs) -> None:
+            nonlocal interrupted
+            if ".candidate." in os.fspath(path) and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            real_unlink(path, *args, **kwargs)
+
+        supported_dir_fd = os.supports_dir_fd | {interrupt_first_candidate_unlink}
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            self._write_workspace(workspace, inventory)
+            final_path = root / "ceph-incident-bundle-20260814T120000Z.tar.gz"
+            interruption_problems: list[str] = []
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.bundle.os.unlink",
+                    new=interrupt_first_candidate_unlink,
+                ),
+                patch(
+                    "ceph_incident_bundle.collect.bundle.os.supports_dir_fd",
+                    supported_dir_fd,
+                ),
+                self.assertRaises(KeyboardInterrupt) as caught,
+            ):
+                publish_bundle(
+                    workspace,
+                    final_path,
+                    collector_version="0.1.0",
+                    started_at=started_at,
+                    since="24h",
+                    prior_partial=False,
+                    interruption_problems=interruption_problems,
+                )
+
+            candidates = list(root.glob(".*.candidate.*"))
+            final_exists = final_path.exists()
+            workspace_exists = workspace.exists()
+
+        self.assertTrue(interrupted)
+        self.assertEqual(caught.exception.args, ())
+        self.assertEqual(interruption_problems, [])
+        self.assertFalse(final_exists)
+        self.assertFalse(workspace_exists)
+        self.assertEqual(candidates, [])
+
     def test_interrupted_candidate_cleanup_reports_exact_residue(self) -> None:
         inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
@@ -812,6 +865,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
             workspace = root / "workspace"
             self._write_workspace(workspace, inventory)
             final_path = root / "ceph-incident-bundle-20260814T120000Z.tar.gz"
+            interruption_problems: list[str] = []
 
             with (
                 patch("tarfile.TarFile.addfile", side_effect=KeyboardInterrupt),
@@ -832,6 +886,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
                     started_at=started_at,
                     since="24h",
                     prior_partial=False,
+                    interruption_problems=interruption_problems,
                 )
 
             candidates = list(root.glob(".*.candidate.*"))
@@ -841,10 +896,11 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertFalse(workspace_exists)
         self.assertFalse(final_exists)
-        self.assertIn(str(candidates[0]), " ".join(str(arg) for arg in caught.exception.args))
+        self.assertEqual(caught.exception.args, ())
+        self.assertIn(str(candidates[0]), " ".join(interruption_problems))
         self.assertIn(
             "cannot remove private Incident Bundle candidate",
-            " ".join(str(arg) for arg in caught.exception.args),
+            " ".join(interruption_problems),
         )
 
     @staticmethod

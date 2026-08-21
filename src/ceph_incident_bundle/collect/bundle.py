@@ -76,6 +76,7 @@ def publish_bundle(
     started_at: datetime,
     since: str,
     prior_partial: bool,
+    interruption_problems: list[str] | None = None,
 ) -> str | None:
     """Validate admitted state and publish one bundle without replacing a path.
 
@@ -89,12 +90,18 @@ def publish_bundle(
 
     The caller owns the workspace until this function is called.  At that handoff,
     publication assumes responsibility for workspace cleanup and exact residue
-    reporting on every return or raised publication error.
+    reporting on every return or raised publication error.  A caller that handles
+    ``KeyboardInterrupt`` passes ``interruption_problems`` so cleanup residue can be
+    reported explicitly after this function has closed all publication inputs.
     """
     workspace = Path(workspace)
     final_path = Path(final_path)
     candidate: Path | None = None
     candidate_name: str | None = None
+    candidate_identity: tuple[int, int] | None = None
+    final_linked = False
+    if interruption_problems is None:
+        interruption_problems = []
     cleanup_problem: str | None = None
     workspace_cleanup_attempted = False
     workspace_marker_path: str | None = None
@@ -200,6 +207,7 @@ def publish_bundle(
             # no-replace hard link makes the inode visible under the published name.
             os.fchmod(candidate_anchor, published_mode)
             os.fsync(candidate_anchor)
+            candidate_identity = _file_identity(os.fstat(candidate_anchor))
         finally:
             if candidate_anchor is not None:
                 anchor_to_close = candidate_anchor
@@ -212,6 +220,7 @@ def publish_bundle(
             dst_dir_fd=output_descriptor,
             follow_symlinks=False,
         )
+        final_linked = True
         try:
             os.unlink(candidate_name, dir_fd=output_descriptor)
         except OSError as cleanup_error:
@@ -227,8 +236,20 @@ def publish_bundle(
                 "final publication was rolled back"
             ) from cleanup_error
         return cleanup_problem
-    except KeyboardInterrupt as interruption:
-        interruption_problems: list[str] = []
+    except KeyboardInterrupt:
+        if (
+            final_linked
+            and candidate_identity is not None
+            and output_descriptor is not None
+        ):
+            final_cleanup_problem = _remove_owned_final_at(
+                output_descriptor,
+                final_path.name,
+                final_path,
+                candidate_identity,
+            )
+            if final_cleanup_problem is not None:
+                interruption_problems.append(final_cleanup_problem)
         if (
             not workspace_cleanup_attempted
             and workspace_parent_descriptor is not None
@@ -265,7 +286,7 @@ def publish_bundle(
             )
             if candidate_cleanup_problem is not None:
                 interruption_problems.append(candidate_cleanup_problem)
-        raise KeyboardInterrupt(*interruption_problems) from interruption
+        raise
     except Exception as error:
         if not workspace_cleanup_attempted:
             if (
@@ -1151,6 +1172,34 @@ def _remove_candidate_at(
             "cannot remove private Incident Bundle candidate "
             f"{candidate_path}: {error}"
         )
+    return None
+
+
+def _remove_owned_final_at(
+    output_descriptor: int,
+    final_name: str,
+    final_path: Path,
+    expected_identity: tuple[int, int],
+) -> str | None:
+    try:
+        current_facts = os.stat(
+            final_name,
+            dir_fd=output_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return f"cannot inspect interrupted final destination {final_path}: {error}"
+    if (
+        not stat.S_ISREG(current_facts.st_mode)
+        or _file_identity(current_facts) != expected_identity
+    ):
+        return f"refusing to remove replaced final destination {final_path}"
+    try:
+        os.unlink(final_name, dir_fd=output_descriptor)
+    except OSError as error:
+        return f"cannot remove interrupted final destination {final_path}: {error}"
     return None
 
 

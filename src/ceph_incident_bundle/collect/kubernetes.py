@@ -35,6 +35,7 @@ def collect_kubernetes(
     probe_timeout_seconds: int,
     staging_directory: Path,
     contribution_directory: Path,
+    interruption_problems: list[str],
 ) -> list[str]:
     """Collect and atomically admit one configured Kubernetes contribution."""
     staging_directory = Path(staging_directory)
@@ -72,7 +73,10 @@ def collect_kubernetes(
         capture = probes_directory / probe.name
         try:
             succeeded, process_residue = _run_probe(
-                probe, capture, probe_timeout_seconds=probe_timeout_seconds
+                probe,
+                capture,
+                probe_timeout_seconds=probe_timeout_seconds,
+                interruption_problems=interruption_problems,
             )
         except OSError as error:
             return [
@@ -196,7 +200,11 @@ def _probe_catalog(
 
 
 def _run_probe(
-    probe: _KubernetesProbe, capture: Path, *, probe_timeout_seconds: int
+    probe: _KubernetesProbe,
+    capture: Path,
+    *,
+    probe_timeout_seconds: int,
+    interruption_problems: list[str],
 ) -> tuple[bool, str | None]:
     capture.mkdir()
     started_at = _utc_now()
@@ -226,6 +234,13 @@ def _run_probe(
         else:
             try:
                 exit_code = process.wait(timeout=probe_timeout_seconds or None)
+            except KeyboardInterrupt:
+                process_residue = _terminate_process_group(process)
+                if process_residue is not None:
+                    interruption_problems.append(
+                        f"Kubernetes {probe.name}: {process_residue}"
+                    )
+                raise
             except subprocess.TimeoutExpired:
                 outcome = "timed_out"
                 process_residue = _terminate_process_group(process)

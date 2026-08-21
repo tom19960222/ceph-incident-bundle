@@ -1,8 +1,11 @@
 import json
 import os
 from pathlib import Path
+import signal
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
+import time
 import unittest
 from unittest.mock import patch
 
@@ -35,6 +38,81 @@ PODS = {
 
 
 class KubernetesCollectionTests(unittest.TestCase):
+    def test_interrupt_terminates_active_kubectl_process_group(self) -> None:
+        helper = """\
+from pathlib import Path
+import sys
+from ceph_incident_bundle.collect.kubernetes import collect_kubernetes
+
+collect_kubernetes(
+    context="lab-context",
+    consumer_namespace="rook-consumer",
+    operator_namespace="rook-operator",
+    since="24h",
+    probe_timeout_seconds=30,
+    staging_directory=Path(sys.argv[1]),
+    contribution_directory=Path(sys.argv[2]),
+    interruption_problems=[],
+)
+"""
+        child_pid: int | None = None
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self._write_fake_kubectl(fake_bin / "kubectl")
+            staging = root / "private" / "kubernetes"
+            staging.parent.mkdir()
+            admitted = root / "admitted" / "kubernetes"
+            admitted.parent.mkdir()
+            ready = root / "kubectl-ready"
+            events = root / "boundary-events"
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_KUBECTL_RECORD"] = str(root / "kubectl.jsonl")
+            environment["FAKE_KUBECTL_INTERRUPT_READY"] = str(ready)
+            environment["FAKE_KUBECTL_EVENT_LOG"] = str(events)
+            process = subprocess.Popen(
+                [sys.executable, "-c", helper, str(staging), str(admitted)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+            )
+            try:
+                for _attempt in range(500):
+                    if ready.exists():
+                        break
+                    if process.poll() is not None:
+                        self.fail("Kubernetes collector exited before interrupt boundary")
+                    time.sleep(0.01)
+                else:
+                    self.fail("fake kubectl did not reach interrupt boundary")
+                child_pid = int(ready.read_text(encoding="ascii"))
+                process.send_signal(signal.SIGINT)
+                _stdout, _stderr = process.communicate(timeout=10)
+                child_is_running = True
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    child_is_running = False
+                boundary_events = events.read_text(encoding="utf-8").splitlines()
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                if child_pid is not None:
+                    try:
+                        os.killpg(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+        self.assertNotEqual(process.returncode, 0)
+        self.assertFalse(child_is_running)
+        self.assertEqual(
+            boundary_events,
+            ["kubectl-start", "kubectl-termination-request"],
+        )
+
     def test_log_sequence_name_grows_beyond_six_digits_without_collision(
         self,
     ) -> None:
@@ -760,6 +838,7 @@ class KubernetesCollectionTests(unittest.TestCase):
                 probe_timeout_seconds=timeout,
                 staging_directory=staging,
                 contribution_directory=admitted,
+                interruption_problems=[],
             )
 
     @staticmethod
@@ -775,6 +854,7 @@ class KubernetesCollectionTests(unittest.TestCase):
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -790,6 +870,17 @@ args = sys.argv[1:]
 locked_capture = os.environ.get("FAKE_KUBECTL_LOCK_CAPTURE")
 if locked_capture:
     Path(locked_capture).chmod(0o500)
+interrupt_ready = os.environ.get("FAKE_KUBECTL_INTERRUPT_READY")
+if interrupt_ready:
+    event_log = Path(os.environ["FAKE_KUBECTL_EVENT_LOG"])
+    event_log.write_text("kubectl-start\\n", encoding="utf-8")
+    Path(interrupt_ready).write_text(str(os.getpid()), encoding="ascii")
+    def terminate(_signal, _frame):
+        with event_log.open("a", encoding="utf-8") as events:
+            events.write("kubectl-termination-request\\n")
+        raise SystemExit(130)
+    signal.signal(signal.SIGTERM, terminate)
+    time.sleep(30)
 if os.environ.get("FAKE_KUBECTL_TIMEOUT_WIDE") and args[-2:] == ["pods", "--output=wide"]:
     stubborn_pid = os.environ.get("FAKE_KUBECTL_STUBBORN_PID")
     if stubborn_pid:
