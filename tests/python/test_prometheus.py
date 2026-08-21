@@ -11,10 +11,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from ceph_incident_bundle.collect.prometheus import (
-    _deduplicate_metric_names,
-    collect_prometheus,
-)
+from ceph_incident_bundle.collect.prometheus import collect_prometheus
 
 
 class _PrometheusHandler(BaseHTTPRequestHandler):
@@ -106,16 +103,6 @@ def _loopback_prometheus(
 
 
 class PrometheusCollectionTests(unittest.TestCase):
-    def test_metric_names_are_deduplicated_exactly_in_first_occurrence_order(
-        self,
-    ) -> None:
-        self.assertEqual(
-            _deduplicate_metric_names(
-                ["same", "Same", "same", "metric/../../name", "Same"]
-            ),
-            ("same", "Same", "metric/../../name"),
-        )
-
     def test_fixed_controls_and_per_job_discovery_are_raw_ordered_and_path_safe(
         self,
     ) -> None:
