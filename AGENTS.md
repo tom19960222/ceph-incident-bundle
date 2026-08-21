@@ -21,59 +21,49 @@ Non-negotiable rules:
   state or Kubernetes objects/workloads. Writes stay in collector-owned workspaces and output.
 - Treat every Node Evidence Archive as untrusted. Validate all members before extraction; reject
   absolute/traversal paths, links, devices, FIFOs, collisions and workspace escapes.
-- CPython 3.10+ is the production support floor; validation and real-lab tooling remain Python
-  3.11+. `cephadm shell` and `kubectl exec` have no supported path and must not be reintroduced as
-  fallbacks.
+- CPython 3.10+ is the production support floor. `cephadm shell` and `kubectl exec` have no
+  supported path and must not be reintroduced as fallbacks.
 - Real-lab work uses an explicitly selected active TOML Lab Profile, never
   `CEPH-LAB-CONNECTION.md`, and fails closed on every identity mismatch.
 - Profiles/reports may reference credential paths but never contain private keys, keyrings,
   passwords, tokens or credential payloads.
 - `make validate` remains offline. Real-lab execution is a separate explicit opt-in.
 
-A failed `validate-lab` retains its local evidence on purpose. Read the failure, then use
-`make lab-clean` to preview and `make lab-clean CEPH_INCIDENT_LAB_CLEAN=1` to reclaim according to
-the retention policy. Never wire cleanup into collect or the gate.
+A failed real-lab run retains its owner-only local evidence on purpose. Read and classify the
+failure before considering a new run. Never wire broad cleanup into collect or an acceptance gate;
+only invocation-owned resources may be reclaimed.
 
-## Post-cutover qualification
+## Current Python-only product
 
-Issue #21 PASS evidence is run `20260805T155047Z`, commit `155e057`. Its shell baseline bundle,
-report and hashes remain local-only evidence. Issue #22 removed the shell runtime and dual-run
-fixtures.
+Issues #85 and #115 define the current contract. The only production entry point is the installed
+`ceph-incident-bundle` console script, with exactly two public subcommands:
+`generate-inventory` and `collect`. Do not restore root-level collector scripts, a verifier or
+redactor command, shell compatibility, a second runtime, or a second qualification suite.
 
-`make validate-lab` now requires four absolute paths:
+`make validate` is the offline gate. It builds from a clean source copy, installs the wheel into a
+fresh environment, and exercises the installed console script and Python qualification suite. It
+must not connect to a lab. Real-lab execution is an agent-managed, separately authorized workflow;
+it is not a Make target or a product command.
 
-```text
-LAB_PROFILE=/absolute/path/to/lab.toml
-LAB_BASELINE_REPORT=/absolute/path/to/20260805T155047Z/report.json
-PRODUCTION_PYTHON=/absolute/path/to/cpython3.10
-TOOLING_PYTHON=/absolute/path/to/python3.11
-```
+Current qualification records are:
 
-It validates that preserved PASS evidence before lab access, proves exact current lab identity,
-runs one Python four-path full collect, verifies it, checks successful workstation cleanup,
-compares it with the saved shell bundle, and proves stable state plus remote residue. A schema-v3
-report additionally proves workstation/node runtime identity and one complete CPython 3.10 floor
-witness. Only schema-v3 `status: pass` is Python 3.10 qualification proof; preserved schema-v2 PASS
-reports keep their historical post-cutover meaning but do not prove 3.10 compatibility.
+- `docs/python-offline-qualification.md` — #102 offline CPython 3.10 installed-wheel proof.
+- `docs/python-single-node-acceptance.md` — #103 pinned single-node read-only acceptance.
+- `docs/python-full-live-acceptance.md` — #104 pinned seven-node full read-only acceptance.
 
-## Equivalence claims
+Raw profiles, reports, manifests and bundles remain local-only under ignored `results/` paths with
+owner-only permissions. Documents may record hashes and sanitized summaries, never credential
+payloads.
 
-The historical offline differential gate (#18) passed before cutover and its reviewed rules remain
-in `docs/differential-normalizer.md`; its executable and shell fakes were intentionally removed.
-Current `make validate` checks the Python suite only, including the scenario ledger:
+## Cutover coverage
 
-- `docs/test-scenario-ledger.md` maps every frozen shell scenario to live Python coverage or an
-  implementation-detail classification.
-- `docs/test-scenario-audit.md` records clause-level review and fingerprints every mapping.
-- The current mechanical count is 145 scenarios: 134 behavior-bearing/ported and 11 shell-only
-  implementation details. The older #22 text saying 137/127/10 predates added scenarios and must
-  not be used to drop later coverage.
+Current `make validate` checks the Python suite, including
+`docs/python-cutover-coverage.md`, the authoritative non-runnable deletion audit. Its mechanical
+count is 145 scenarios: all 134 behavior-bearing rows are either covered by current public Python
+tests or explicitly #85-obsolete, and 11 rows are shell-only implementation details. Older counts
+must not be used to drop later coverage.
 
-The workstation-side equivalence was demonstrated by the historical differential gate. Node
-evidence equivalence remains asserted by the N-series Python black-box tests, not demonstrated by
-shell-versus-Python node-body comparison; ADR 0010 deliberately differs on manifest coverage.
-
-The real-lab normalizer compares collector-authored structure and decisions across different live
-moments, not evidence bodies: member set, manifest argv/exit, capture headers, JSON parseability,
-skip classes, source/runner selection and complete coverage. See `docs/lab-bundle-contract.md` for
-the exact limits. Runs #67 and #68 closed known gaps before shell removal.
+The historical shell implementation and its differential tooling are rollback history only, not a
+current executable contract. Current equivalence and acceptance claims come from public Python
+black-box tests plus the #102–#104 records. See `docs/lab-bundle-contract.md` for the exact live
+bundle, coverage, stable-state and residue obligations.

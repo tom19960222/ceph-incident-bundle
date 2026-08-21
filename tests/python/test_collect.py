@@ -1,0 +1,873 @@
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
+import io
+import json
+import os
+from pathlib import Path
+import tarfile
+from tempfile import TemporaryDirectory
+import unittest
+from unittest.mock import Mock, patch
+
+from ceph_incident_bundle.collect import run
+from ceph_incident_bundle.collect.bundle import (
+    BundlePublicationError,
+    publish_bundle as publish_incident_bundle,
+)
+from ceph_incident_bundle.collect.node import collect_node
+from ceph_incident_bundle.inventory import TargetNode
+
+
+INVENTORY = b"""\
+[common]
+ssh_user = root
+[nodes]
+node-a = node-a.example.test
+"""
+
+MULTI_NODE_INVENTORY = b"""\
+[common]
+ssh_user = root
+[nodes]
+node-a = node-a.example.test
+node-b = node-b.example.test
+[ceph]
+source = node-a
+"""
+
+KUBERNETES_INVENTORY = b"""\
+[common]
+ssh_user = root
+probe_timeout = 7m
+[nodes]
+node-a = node-a.example.test
+[kubernetes]
+context = lab-blue
+consumer_namespace = rook-consumer
+operator_namespace = rook-operator
+"""
+
+PROMETHEUS_INVENTORY = b"""\
+[common]
+ssh_user = root
+[nodes]
+node-a = node-a.example.test
+[kubernetes]
+context = lab-blue
+[prometheus]
+url = http://127.0.0.1:19090/prometheus
+metrics_filter_regex = ^node_.+_total$
+query_step = 45s
+request_timeout = 7s
+"""
+
+
+class TopLevelCollectionTests(unittest.TestCase):
+    def test_interrupt_at_publication_entry_keeps_top_level_cleanup_ownership(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            temporary_root = root / "temporary"
+            temporary_root.mkdir()
+            workspace = temporary_root / "ceph-incident-work.fixed"
+            workspace.mkdir()
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.tempfile.mkdtemp",
+                    return_value=str(workspace),
+                ),
+                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
+                patch(
+                    "ceph_incident_bundle.collect.publish_bundle",
+                    side_effect=KeyboardInterrupt,
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+
+        self.assertEqual(status, 130)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(workspaces, [])
+        self.assertTrue(
+            stderr.getvalue().endswith("FAIL: no Incident Bundle delivered\n")
+        )
+
+    def test_interrupt_at_publication_return_recovers_partial_delivery_truth(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            temporary_root = root / "temporary"
+            temporary_root.mkdir()
+            workspace = temporary_root / "ceph-incident-work.fixed"
+            workspace.mkdir()
+            workspace_path: Path | None = None
+
+            def lock_workspace_parent(*args, **kwargs) -> list[str]:
+                nonlocal workspace_path
+                workspace_path = Path(kwargs["staging_directory"]).parents[2]
+                temporary_root.chmod(0o500)
+                return []
+
+            def publish_then_interrupt(*args, **kwargs) -> str | None:
+                publish_incident_bundle(*args, **kwargs)
+                raise KeyboardInterrupt
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            try:
+                with (
+                    patch(
+                        "ceph_incident_bundle.collect.tempfile.mkdtemp",
+                        return_value=str(workspace),
+                    ),
+                    patch(
+                        "ceph_incident_bundle.collect.collect_node",
+                        side_effect=lock_workspace_parent,
+                    ),
+                    patch(
+                        "ceph_incident_bundle.collect.publish_bundle",
+                        side_effect=publish_then_interrupt,
+                    ),
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
+                    status = run(inventory, "24h", root)
+            finally:
+                temporary_root.chmod(0o700)
+
+            bundles = list(root.glob("ceph-incident-bundle-*.tar.gz"))
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+
+        assert workspace_path is not None
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(len(bundles), 1)
+        self.assertEqual(len(workspaces), 1)
+        self.assertIn("(partial)", stderr.getvalue())
+        self.assertIn(str(workspace_path), stderr.getvalue())
+        self.assertIn("cannot remove workstation workspace", stderr.getvalue())
+        self.assertNotIn("FAIL: no Incident Bundle delivered", stderr.getvalue())
+
+    def test_interrupt_after_publication_is_reported_as_delivered(self) -> None:
+        class InterruptingResultStream(io.StringIO):
+            def __init__(self, unreadable_metadata) -> None:
+                super().__init__()
+                self.unreadable_metadata = unreadable_metadata
+
+            def write(self, value: str) -> int:
+                self.unreadable_metadata.start()
+                raise KeyboardInterrupt
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            stderr = io.StringIO()
+
+            def publish_with_restrictive_umask(*args, **kwargs) -> str | None:
+                previous_umask = os.umask(0o777)
+                try:
+                    return publish_incident_bundle(*args, **kwargs)
+                finally:
+                    os.umask(previous_umask)
+
+            unreadable_metadata = patch(
+                "ceph_incident_bundle.collect.tarfile.open",
+                side_effect=PermissionError("injected unreadable delivered bundle"),
+            )
+            try:
+                with (
+                    patch(
+                        "ceph_incident_bundle.collect.collect_node", return_value=[]
+                    ),
+                    patch(
+                        "ceph_incident_bundle.collect.publish_bundle",
+                        side_effect=publish_with_restrictive_umask,
+                    ),
+                    redirect_stdout(InterruptingResultStream(unreadable_metadata)),
+                    redirect_stderr(stderr),
+                ):
+                    status = run(inventory, "24h", root)
+            finally:
+                unreadable_metadata.stop()
+
+            bundles = list(root.glob("ceph-incident-bundle-*.tar.gz"))
+            bundle_mode = bundles[0].stat().st_mode & 0o777
+
+        self.assertEqual(status, 0)
+        self.assertEqual(len(bundles), 1)
+        self.assertEqual(bundle_mode, 0)
+        self.assertIn("Incident Bundle delivered at", stderr.getvalue())
+        self.assertIn("(partial)", stderr.getvalue())
+        self.assertIn("result was interrupted", stderr.getvalue())
+        self.assertNotIn("cannot remove workstation workspace", stderr.getvalue())
+        self.assertNotIn("FAIL: no Incident Bundle delivered", stderr.getvalue())
+
+    def test_node_process_group_exit_race_preserves_interrupt(self) -> None:
+        process = Mock(pid=54321)
+        process.wait.side_effect = [KeyboardInterrupt, 0]
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            staging = root / "private" / "node-a"
+            staging.parent.mkdir(parents=True)
+            contribution = root / "admitted" / "node-a"
+            contribution.parent.mkdir(parents=True)
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.node.subprocess.Popen",
+                    return_value=process,
+                ),
+                patch(
+                    "ceph_incident_bundle.collect.node.os.killpg",
+                    side_effect=ProcessLookupError("process group exited"),
+                ),
+                self.assertRaises(KeyboardInterrupt) as caught,
+            ):
+                collect_node(
+                    TargetNode("node-a", "node-a.example.test"),
+                    ssh_user="root",
+                    since_seconds=3600,
+                    probe_timeout_seconds=60,
+                    ssh_connect_timeout_seconds=10,
+                    ceph_allowed=False,
+                    staging_directory=staging,
+                    contribution_directory=contribution,
+                )
+
+        self.assertEqual(caught.exception.args, ())
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_node_stream_close_failure_preserves_interrupt(self) -> None:
+        process = Mock(pid=54321)
+        process.wait.side_effect = [KeyboardInterrupt, 0]
+        real_open = Path.open
+        close_failure_seen = False
+
+        class CloseFailure:
+            def __init__(self, opened_file) -> None:
+                self.opened_file = opened_file
+
+            def __enter__(self):
+                return self.opened_file
+
+            def __exit__(self, exception_type, exception, traceback) -> None:
+                nonlocal close_failure_seen
+                self.opened_file.close()
+                if not close_failure_seen:
+                    close_failure_seen = True
+                    raise OSError("injected interrupted stream close failure")
+
+        def open_with_one_close_failure(path: Path, *args, **kwargs):
+            opened_file = real_open(path, *args, **kwargs)
+            if path.name == "node-evidence.tar.gz":
+                return CloseFailure(opened_file)
+            return opened_file
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            staging = root / "private" / "node-a"
+            staging.parent.mkdir(parents=True)
+            contribution = root / "admitted" / "node-a"
+            contribution.parent.mkdir(parents=True)
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.node.subprocess.Popen",
+                    return_value=process,
+                ),
+                patch("ceph_incident_bundle.collect.node.os.killpg"),
+                patch.object(Path, "open", new=open_with_one_close_failure),
+                self.assertRaises(KeyboardInterrupt) as caught,
+            ):
+                collect_node(
+                    TargetNode("node-a", "node-a.example.test"),
+                    ssh_user="root",
+                    since_seconds=3600,
+                    probe_timeout_seconds=60,
+                    ssh_connect_timeout_seconds=10,
+                    ceph_allowed=False,
+                    staging_directory=staging,
+                    contribution_directory=contribution,
+                )
+
+        self.assertTrue(close_failure_seen)
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        assert caught.exception.__cause__ is not None
+        self.assertIn(
+            "injected interrupted stream close failure",
+            str(caught.exception.__cause__),
+        )
+
+    def test_absent_prometheus_url_skips_capability_cleanly(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
+                patch(
+                    "ceph_incident_bundle.collect.collect_prometheus"
+                ) as prometheus_operation,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            bundle = next(root.glob("ceph-incident-bundle-*.tar.gz"))
+            with tarfile.open(bundle, "r:gz") as archive:
+                root_name = bundle.name.removesuffix(".tar.gz")
+                prometheus_members = [
+                    member.name
+                    for member in archive.getmembers()
+                    if member.name.startswith(f"{root_name}/prometheus")
+                ]
+
+        self.assertEqual(status, 0)
+        prometheus_operation.assert_not_called()
+        self.assertEqual(prometheus_members, [f"{root_name}/prometheus"])
+        self.assertTrue(stdout.getvalue().endswith(" (complete)\n"))
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_prometheus_runs_after_kubernetes_with_shared_window_controls(self) -> None:
+        events: list[str] = []
+
+        def node_operation(*args: object, **kwargs: object) -> list[str]:
+            events.append("node")
+            return []
+
+        def kubernetes_operation(*args: object, **kwargs: object) -> list[str]:
+            events.append("kubernetes")
+            contribution = Path(str(kwargs["contribution_directory"]))
+            (contribution / "probes").mkdir(parents=True)
+            return []
+
+        def prometheus_operation(*args: object, **kwargs: object) -> list[str]:
+            events.append("prometheus")
+            contribution = Path(str(kwargs["contribution_directory"]))
+            (contribution / "buildinfo").mkdir(parents=True)
+            return ["Prometheus buildinfo request failed: timeout: stalled"]
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(PROMETHEUS_INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.collect_node",
+                    side_effect=node_operation,
+                ),
+                patch(
+                    "ceph_incident_bundle.collect.collect_kubernetes",
+                    side_effect=kubernetes_operation,
+                ),
+                patch(
+                    "ceph_incident_bundle.collect.collect_prometheus",
+                    side_effect=prometheus_operation,
+                ) as prometheus,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "2d", root)
+
+            call = prometheus.call_args
+
+        self.assertEqual(status, 0)
+        self.assertEqual(events, ["node", "kubernetes", "prometheus"])
+        self.assertEqual(call.kwargs["url"], "http://127.0.0.1:19090/prometheus")
+        self.assertEqual(call.kwargs["since_seconds"], 172800)
+        self.assertEqual(call.kwargs["request_timeout_seconds"], 7)
+        self.assertEqual(call.kwargs["metrics_filter_regex"], "^node_.+_total$")
+        self.assertEqual(call.kwargs["query_step"], "45s")
+        self.assertEqual(call.kwargs["staging_directory"].name, "prometheus")
+        self.assertEqual(call.kwargs["contribution_directory"].name, "prometheus")
+        self.assertTrue(stdout.getvalue().endswith(" (partial)\n"))
+        self.assertIn("Prometheus buildinfo request failed", stderr.getvalue())
+
+    def test_unexpected_prometheus_exception_keeps_private_staging_out_of_bundle(
+        self,
+    ) -> None:
+        def failed_prometheus(*args: object, **kwargs: object) -> list[str]:
+            staging = Path(str(kwargs["staging_directory"]))
+            capture = staging / "incomplete" / "buildinfo"
+            capture.mkdir(parents=True)
+            (capture / "response").write_bytes(b"must stay private")
+            raise RuntimeError("HTTP boundary failed\nsecond line")
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(PROMETHEUS_INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
+                patch("ceph_incident_bundle.collect.collect_kubernetes", return_value=[]),
+                patch(
+                    "ceph_incident_bundle.collect.collect_prometheus",
+                    side_effect=failed_prometheus,
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            bundle = next(root.glob("ceph-incident-bundle-*.tar.gz"))
+            with tarfile.open(bundle, "r:gz") as archive:
+                root_name = bundle.name.removesuffix(".tar.gz")
+                metadata_file = archive.extractfile(f"{root_name}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+                prometheus_members = [
+                    member.name
+                    for member in archive.getmembers()
+                    if member.name.startswith(f"{root_name}/prometheus")
+                ]
+                private_members = [
+                    member.name
+                    for member in archive.getmembers()
+                    if "incomplete" in member.name or "/private/" in member.name
+                ]
+
+        self.assertEqual(status, 0)
+        self.assertEqual(outcome, "partial")
+        self.assertEqual(prometheus_members, [f"{root_name}/prometheus"])
+        self.assertEqual(private_members, [])
+        self.assertTrue(stdout.getvalue().endswith(" (partial)\n"))
+        self.assertIn(
+            "Prometheus: unexpected collection failure: "
+            "HTTP boundary failed\\x0asecond line",
+            stderr.getvalue(),
+        )
+
+    def test_absent_kubernetes_context_skips_capability_cleanly(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
+                patch(
+                    "ceph_incident_bundle.collect.collect_kubernetes"
+                ) as kubernetes_operation,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            bundle = next(root.glob("ceph-incident-bundle-*.tar.gz"))
+            with tarfile.open(bundle, "r:gz") as archive:
+                root_name = bundle.name.removesuffix(".tar.gz")
+                kubernetes_members = [
+                    member.name
+                    for member in archive.getmembers()
+                    if member.name.startswith(f"{root_name}/kubernetes")
+                ]
+
+        self.assertEqual(status, 0)
+        kubernetes_operation.assert_not_called()
+        self.assertEqual(kubernetes_members, [f"{root_name}/kubernetes"])
+        self.assertTrue(stdout.getvalue().endswith(" (complete)\n"))
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_configured_kubernetes_runs_after_nodes_and_returns_partial_problems(
+        self,
+    ) -> None:
+        events: list[str] = []
+
+        def node_operation(*args: object, **kwargs: object) -> list[str]:
+            events.append("node")
+            return []
+
+        def kubernetes_operation(*args: object, **kwargs: object) -> list[str]:
+            events.append("kubernetes")
+            contribution = Path(str(kwargs["contribution_directory"]))
+            (contribution / "probes").mkdir(parents=True)
+            return ["Kubernetes consumer-events Probe failed: outcome=exited exit_code=7"]
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(KUBERNETES_INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.collect_node",
+                    side_effect=node_operation,
+                ),
+                patch(
+                    "ceph_incident_bundle.collect.collect_kubernetes",
+                    side_effect=kubernetes_operation,
+                ) as kubernetes,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            bundle = next(root.glob("ceph-incident-bundle-*.tar.gz"))
+            call = kubernetes.call_args
+
+        self.assertEqual(status, 0)
+        self.assertEqual(events, ["node", "kubernetes"])
+        self.assertEqual(call.kwargs["context"], "lab-blue")
+        self.assertEqual(call.kwargs["consumer_namespace"], "rook-consumer")
+        self.assertEqual(call.kwargs["operator_namespace"], "rook-operator")
+        self.assertEqual(call.kwargs["probe_timeout_seconds"], 420)
+        self.assertEqual(call.kwargs["staging_directory"].name, "kubernetes")
+        self.assertEqual(call.kwargs["contribution_directory"].name, "kubernetes")
+        self.assertTrue(stdout.getvalue().endswith(" (partial)\n"))
+        self.assertIn("consumer-events Probe failed", stderr.getvalue())
+        self.assertNotIn("FAIL: no Incident Bundle delivered", stderr.getvalue())
+
+    def test_unexpected_kubernetes_exception_keeps_publication_isolated(self) -> None:
+        def failed_kubernetes(*args: object, **kwargs: object) -> list[str]:
+            staging = Path(str(kwargs["staging_directory"]))
+            (staging / "incomplete" / "probes" / "private-capture").mkdir(
+                parents=True
+            )
+            (staging / "incomplete" / "probes" / "private-capture" / "stdout").write_bytes(
+                b"must stay private"
+            )
+            raise RuntimeError("kubectl boundary failed\nsecond line")
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(KUBERNETES_INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
+                patch(
+                    "ceph_incident_bundle.collect.collect_kubernetes",
+                    side_effect=failed_kubernetes,
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            bundle = next(root.glob("ceph-incident-bundle-*.tar.gz"))
+            with tarfile.open(bundle, "r:gz") as archive:
+                root_name = bundle.name.removesuffix(".tar.gz")
+                metadata_file = archive.extractfile(f"{root_name}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+                kubernetes_members = [
+                    member.name
+                    for member in archive.getmembers()
+                    if member.name.startswith(f"{root_name}/kubernetes")
+                ]
+                private_members = [
+                    member.name
+                    for member in archive.getmembers()
+                    if "private-capture" in member.name or "/private/" in member.name
+                ]
+
+        self.assertEqual(status, 0)
+        self.assertEqual(outcome, "partial")
+        self.assertEqual(kubernetes_members, [f"{root_name}/kubernetes"])
+        self.assertEqual(private_members, [])
+        self.assertTrue(stdout.getvalue().endswith(" (partial)\n"))
+        self.assertIn(
+            "Kubernetes: unexpected collection failure: "
+            "kubectl boundary failed\\x0asecond line",
+            stderr.getvalue(),
+        )
+
+    def test_node_problems_are_accumulated_in_inventory_order_after_an_exception(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(MULTI_NODE_INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.collect_node",
+                    side_effect=[
+                        ["Target Node node-a: connection failed"],
+                        RuntimeError("receive failed\nsecond line"),
+                    ],
+                ) as node_operation,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            bundles = list(root.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            with tarfile.open(bundles[0], "r:gz") as archive:
+                root_name = bundles[0].name.removesuffix(".tar.gz")
+                metadata_file = archive.extractfile(f"{root_name}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+
+        self.assertEqual(status, 0)
+        self.assertEqual(outcome, "partial")
+        self.assertEqual(
+            [call.args[0].inventory_name for call in node_operation.call_args_list],
+            ["node-a", "node-b"],
+        )
+        self.assertTrue(node_operation.call_args_list[0].kwargs["ceph_allowed"])
+        self.assertFalse(node_operation.call_args_list[1].kwargs["ceph_allowed"])
+        self.assertIn("Target Node node-a: connection failed", stderr.getvalue())
+        self.assertIn(
+            "Target Node node-b: unexpected collection failure: "
+            "receive failed\\x0asecond line",
+            stderr.getvalue(),
+        )
+        self.assertEqual(stdout.getvalue(), f"{bundles[0].resolve()} (partial)\n")
+
+    def test_unexpected_node_exception_still_publishes_truthful_partial_bundle(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.collect_node",
+                    side_effect=RuntimeError("receive failed\nsecond line"),
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            bundles = list(root.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            with tarfile.open(bundles[0], "r:gz") as archive:
+                root_name = bundles[0].name.removesuffix(".tar.gz")
+                metadata_file = archive.extractfile(f"{root_name}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+                node_members = [
+                    member.name
+                    for member in archive.getmembers()
+                    if member.name.startswith(f"{root_name}/nodes/")
+                ]
+
+        self.assertEqual(status, 0)
+        self.assertEqual(outcome, "partial")
+        self.assertEqual(node_members, [])
+        self.assertEqual(stdout.getvalue(), f"{bundles[0].resolve()} (partial)\n")
+        self.assertIn("receive failed\\x0asecond line", stderr.getvalue())
+        self.assertNotIn("FAIL: no Incident Bundle delivered", stderr.getvalue())
+
+    def test_invalid_startup_never_reaches_the_ssh_boundary(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            missing_output = root / "missing"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch("ceph_incident_bundle.collect.collect_node") as node_operation,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "yesterday", missing_output)
+
+        self.assertNotEqual(status, 0)
+        node_operation.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("invalid evidence window", stderr.getvalue())
+        self.assertIn("cannot use output directory", stderr.getvalue())
+        self.assertTrue(
+            stderr.getvalue().endswith("FAIL: no Incident Bundle delivered\n")
+        )
+
+    def test_enormous_since_is_controlled_before_workspace_creation(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("ceph_incident_bundle.collect.tempfile.mkdtemp") as make_workspace,
+                patch("ceph_incident_bundle.collect.collect_node") as node_operation,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, f"{'9' * 5000}h", root)
+
+        self.assertNotEqual(status, 0)
+        make_workspace.assert_not_called()
+        node_operation.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("invalid evidence window", stderr.getvalue())
+        self.assertTrue(
+            stderr.getvalue().endswith("FAIL: no Incident Bundle delivered\n")
+        )
+
+    def test_exact_timestamp_collision_preserves_destination_before_collection(
+        self,
+    ) -> None:
+        started_at = datetime(2026, 8, 15, 1, 2, 3, tzinfo=timezone.utc)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            final_path = root / "ceph-incident-bundle-20260815T010203Z.tar.gz"
+            final_path.write_bytes(b"existing bundle bytes")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("ceph_incident_bundle.collect.datetime") as clock,
+                patch(
+                    "ceph_incident_bundle.collect.tempfile.mkdtemp"
+                ) as make_workspace,
+                patch("ceph_incident_bundle.collect.collect_node") as node_operation,
+                patch("ceph_incident_bundle.collect.publish_bundle") as publication,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                clock.now.return_value = started_at
+                status = run(inventory, "24h", root)
+
+            final_bytes = final_path.read_bytes()
+            candidates = list(root.glob(".*.candidate.*"))
+
+        self.assertNotEqual(status, 0)
+        self.assertEqual(final_bytes, b"existing bundle bytes")
+        make_workspace.assert_not_called()
+        node_operation.assert_not_called()
+        publication.assert_not_called()
+        self.assertEqual(candidates, [])
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("final destination already exists", stderr.getvalue())
+        self.assertTrue(
+            stderr.getvalue().endswith("FAIL: no Incident Bundle delivered\n")
+        )
+
+    def test_publication_failure_is_controlled_after_workspace_handoff(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            workspace = root / "owned-workspace"
+            workspace.mkdir()
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.tempfile.mkdtemp",
+                    return_value=str(workspace),
+                ),
+                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
+                patch(
+                    "ceph_incident_bundle.collect.publish_bundle",
+                    side_effect=BundlePublicationError(
+                        "injected archive write failure"
+                    ),
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            workspace_still_exists = workspace.exists()
+
+        self.assertNotEqual(status, 0)
+        self.assertTrue(workspace_still_exists)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "cannot publish Incident Bundle: injected archive write failure",
+            stderr.getvalue(),
+        )
+        self.assertTrue(
+            stderr.getvalue().endswith("FAIL: no Incident Bundle delivered\n")
+        )
+
+    def test_prehandoff_cleanup_never_removes_a_replacement_workspace(self) -> None:
+        real_write_bytes = Path.write_bytes
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.ini"
+            inventory.write_bytes(INVENTORY)
+            workspace = root / "owned-workspace"
+            moved_workspace = root / "moved-owned-workspace"
+            replacement_sentinel = workspace / "replacement-sentinel"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            def swap_workspace_before_snapshot(path: Path, data: bytes) -> int:
+                if path.name == "inventory.ini" and path.parent.name == "admitted":
+                    workspace.rename(moved_workspace)
+                    workspace.mkdir()
+                    (workspace / ".ceph-incident-bundle-owned").write_text(
+                        str(workspace.resolve()) + "\n", encoding="utf-8"
+                    )
+                    replacement_sentinel.write_bytes(b"replacement stays")
+                    raise OSError("injected Inventory Snapshot write failure")
+                return real_write_bytes(path, data)
+
+            def make_workspace(*, prefix: str) -> str:
+                self.assertEqual(prefix, "ceph-incident-work.")
+                workspace.mkdir()
+                return str(workspace)
+
+            with (
+                patch(
+                    "ceph_incident_bundle.collect.tempfile.mkdtemp",
+                    side_effect=make_workspace,
+                ),
+                patch.object(Path, "write_bytes", new=swap_workspace_before_snapshot),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
+
+            replacement_exists = workspace.exists()
+            replacement_bytes = (
+                replacement_sentinel.read_bytes()
+                if replacement_sentinel.exists()
+                else None
+            )
+            moved_exists = moved_workspace.exists()
+
+        self.assertNotEqual(status, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertTrue(replacement_exists, stderr.getvalue())
+        self.assertEqual(replacement_bytes, b"replacement stays")
+        self.assertTrue(moved_exists)
+        self.assertIn("refusing to clean replaced workstation workspace", stderr.getvalue())
+        self.assertTrue(
+            stderr.getvalue().endswith("FAIL: no Incident Bundle delivered\n")
+        )
+
+if __name__ == "__main__":
+    unittest.main()

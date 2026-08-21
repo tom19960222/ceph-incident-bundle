@@ -1,0 +1,3 @@
+# Use a hard cutover to a Python-only production surface
+
+After the complete V1 collection and cleanup path is implemented, remove the historical shell collector and verifier, public shell entry points and compatibility wrappers, historical shell-only implementation tests and fixtures, and active build or documentation references. Do not retain a wrapper or `legacy/` source copy; Git history, tags, and previously published releases provide rollback. Preserve required behavior coverage in the Python suite. Historical records and unrelated maintainer shell tooling may remain only when they are not active product paths. Final whole-system review and offline qualification cover the exact post-cutover production surface.

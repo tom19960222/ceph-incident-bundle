@@ -1,101 +1,121 @@
-# Ceph Incident Evidence Collection
+# Ceph Incident Evidence
 
-這個 context 定義從 Ceph 或 Rook 環境收集唯讀事故證據，並組裝成可攜式 incident bundle 時使用的共同語言。
+This context defines the language for preserving evidence during Ceph incident investigation without changing the operational state being investigated.
 
 ## Language
 
 **Incident Bundle**:
-一次收集作業產生的事故證據封存檔，包含 cluster evidence、node evidence、metadata 與 manifest。
-_Avoid_: Report, package
+A portable record of one incident-time collection containing its Inventory Snapshot, collection metadata, and whatever Raw Evidence was preserved. It may contain no Raw Evidence when every requested evidence attempt fails; it is not a backup, a repair payload, or a claim that evidence is complete or safe to share.
+_Avoid_: Diagnostic dump, backup
 
-**工作機（Workstation）**:
-由操作人員控制、負責發起收集並組裝最終 incident bundle 的機器。
-_Avoid_: Client, local host, control node
+**Raw Evidence**:
+Evidence preserved without redaction, secret detection, semantic content validation, sensitivity classification, or content-dependent handling. Credentials may be present, but the collector does not treat the evidence differently because of them.
+_Avoid_: Sanitized evidence, shareable evidence
 
-**Node**:
-被收集 node evidence 的 Ceph 或 Rook 主機。
-_Avoid_: Remote host, target server
+**Admissible Artifact**:
+A regular file or ordinary directory represented at one unique, safe relative path inside collector output. Link semantics, special filesystem objects, and paths that escape or collide within the output root are not admissible evidence.
+_Avoid_: Arbitrary filesystem object
 
-**Supported Node**:
-具備受支援的 production runtime，符合完整 node evidence 收集執行條件的 node。
-_Avoid_: Compatible node, healthy node
+**Evidence Probe**:
+A built-in read-only command invocation whose raw standard output, standard error, and exit status are preserved as evidence. One Probe is independent of every other Probe.
+_Avoid_: Check, assertion, user command
 
-**Skipped Node**:
-因執行條件不符或收集失敗而沒有完整 node evidence，但其失敗原因仍被記錄在 incident bundle 中的 node。
-_Avoid_: Failed host, unsupported server
+**Probe Capture**:
+The directory produced by one attempted Evidence Probe. It keeps byte-for-byte `stdout` and `stderr` files separate from collector-authored execution facts in `result.json`, including a nullable exit code and an explicit outcome such as exited, failed to start, or timed out.
+_Avoid_: Combined transcript, annotated command output
 
-**Cluster Evidence**:
-描述 Ceph、Rook 或 Prometheus 共享狀態，且不歸屬於單一 node 的事故證據。
-_Avoid_: Global evidence, cluster logs
+**Best-effort Collection**:
+A collection that attempts independent evidence sources and preserves whatever succeeds instead of requiring all requested evidence to succeed together.
+_Avoid_: All-or-nothing collection
 
-**Node Evidence**:
-歸屬於單一 node 的主機層級事故證據。
-_Avoid_: Remote evidence, host dump
+**Operationally Read-only Collection**:
+A collection run that leaves persistent configuration, services, packages, mounts, Ceph desired state, and Kubernetes objects or workloads unchanged. Collector-owned ephemeral work and unavoidable observation side effects are allowed. Any residue known to the collector is reported; an uncatchable termination can prevent both cleanup and knowledge of residue.
+_Avoid_: Zero-write collection, non-invasive collection
 
-**Node Collector Payload**:
-由工作機透過 SSH stdin 串流給 supported node 執行的自足 Python 原始碼。
-_Avoid_: Deploy package, uploaded script, node bundle
+**Collection Workstation**:
+The operator-controlled machine that starts collection, coordinates Target Nodes, and owns the resulting Incident Bundle.
+_Avoid_: Collector node, control node
+
+**Target Node**:
+A remote server selected for node-local evidence collection and reached from the Collection Workstation over SSH.
+_Avoid_: Local node, managed agent
+
+**Node Baseline**:
+The default point-in-time evidence about a Target Node's identity, clock, operating system, load, compute, processes, storage, network, kernel, failed services, and container runtime state.
+_Avoid_: Health check, node validation
+
+**Time Synchronization Evidence**:
+Raw status and configuration evidence from the common time synchronization implementations that may exist on a Target Node. Collection attempts every supported implementation without choosing an active one first.
+_Avoid_: Time validation, clock health result
+
+**Log Evidence Window**:
+One relative duration shared by filesystem-log and journal collection. Filesystem eligibility is an intentionally approximate decision based on file modification time, while journald applies the duration through its own time query.
+_Avoid_: Exact incident boundary, per-log window
+
+**Journal Evidence**:
+One all-system human-readable journal capture for the Log Evidence Window, together with any raw journal regular files admitted by the ordinary `/var/log` rules.
+_Avoid_: Per-service journal set, journal health report
+
+**Ceph Cluster Evidence**:
+Raw point-in-time output from the fixed direct `ceph` query set, collected once for a Ceph cluster. It describes cluster state without repairing or changing that state.
+_Avoid_: cephadm evidence, Ceph health result
+
+**Node-local Ceph Evidence**:
+Raw Ceph configuration files collected from each Target Node. It excludes daemon databases, block data, recursive state-path metadata listings, and all `cephadm` command output.
+_Avoid_: Ceph Cluster Evidence, Ceph data backup
+
+**Rook Cluster Evidence**:
+Raw Kubernetes object, event, and Pod/container log output collected from the Collection Workstation in the configured external-consumer and operator namespaces. It uses only read operations and never starts a process inside a workload.
+_Avoid_: Kubernetes backup, toolbox evidence
+
+**Prometheus Evidence**:
+Optional raw Prometheus API evidence collected directly from the Collection Workstation for the shared Log Evidence Window. It is absent when no Prometheus endpoint is configured.
+_Avoid_: Metrics analysis, monitoring health result
+
+**Prometheus Capture**:
+The directory produced by one attempted Prometheus HTTP GET. It keeps the byte-for-byte response body in `response` and collector-authored request facts in `result.json`; it is not a Probe Capture and has no artificial standard streams or process exit code.
+_Avoid_: HTTP Probe, parsed metrics result
+
+**Metrics Filter**:
+An optional regular expression applied to discovered Prometheus metric names before range queries are scheduled. An empty filter admits every discovered metric name.
+_Avoid_: Job selector, metrics validation
+
+**Collection Scope**:
+The exact set of named Target Nodes explicitly selected by the operator for one collection. Cluster observations never expand this set implicitly.
+_Avoid_: Discovered fleet, inferred targets
+
+**Inventory Name (`inventory_name`)**:
+The stable operator-facing name on the left side of one `[nodes]` entry. It identifies that Target Node throughout collection and names its directory below `nodes/`; it is distinct from the address used as the SSH destination.
+_Avoid_: SSH address, discovered node name
+
+**Inventory Name Collision**:
+Two Node Inventory entries whose `inventory_name` values have the same portable NFC-normalized and case-folded path key. A collision means the inventory requires operator editing and cannot define a Collection Scope.
+_Avoid_: Duplicate host, automatically renamed node
+
+**SSH Address (`ssh_address`)**:
+The hostname, IPv4 address, or IPv6 address on the right side of one `[nodes]` entry. Together with the common SSH user, it identifies the OpenSSH destination but never controls the node's evidence directory name.
+_Avoid_: Inventory Name, `user@host`, host-and-port string
+
+**Node Inventory**:
+A declarative file that defines one common SSH user, maps each `inventory_name` to a Target Node `ssh_address`, and may select one Target Node as the Ceph query source. The nodes present in this file are the Collection Scope.
+_Avoid_: Shell inventory, discovered targets
+
+**Inventory Snapshot**:
+The byte-for-byte copy of the accepted Node Inventory stored in an Incident Bundle as collection context. It is neither normalized nor redacted and receives no content-dependent handling.
+_Avoid_: Effective configuration, sanitized inventory
+
+**Remote Node Collector**:
+An ephemeral collector executed on a Target Node to preserve node-local incident evidence. It is transferred for one collection run and is not installed as a persistent agent.
+_Avoid_: Agent, daemon, installed collector
 
 **Node Evidence Archive**:
-單一 node collector 透過 SSH stdout 回傳給工作機的壓縮 evidence 封存檔；它是 incident bundle 的輸入，不是最終 incident bundle。
-_Avoid_: Node bundle, remote tarball
+The transient gzip-compressed tar stream emitted by one Remote Node Collector to transport that Target Node's evidence to the Collection Workstation. It is untrusted transport input, not an Incident Bundle, and always remains private workstation staging; successful admission creates a separate admitted contribution. Failed cleanup may leave the archive as reported collector-owned residue.
+_Avoid_: Incident Bundle, remote bundle, trusted archive
 
-**Evidence Manifest**:
-列出 Node Evidence Archive 或 incident bundle 內每一份 evidence 及其來源、狀態與時間的索引；archive 內每一份 evidence 都必須在索引中有一筆對應紀錄。
-_Avoid_: Command log, 執行紀錄
+**Skipped Node**:
+A Target Node for which no Node Evidence Archive was admitted because collection could not proceed or complete safely. The collection command prints the reason for the operator, while the Incident Bundle represents the requested node only through its Inventory Snapshot and contains no node directory or failure record.
+_Avoid_: Ignored node, missing node
 
-**Collect**:
-從指定環境取得 cluster evidence 與 node evidence，並產生一份經驗證的 incident bundle。
-_Avoid_: Run, gather, dump
-
-**Verify**:
-檢查既有 incident bundle 是否符合 structural verification 契約；content safety 尚未移除前，也會執行其機密材料檢查。
-_Avoid_: Check, validate, scan
-
-**Structural Verification**:
-確認 incident bundle 的封存格式、必要 metadata、manifest 與 evidence 結構完整且可讀。
-_Avoid_: Content scan, secret check
-
-**Content Safety**:
-對 incident bundle 執行既有 redaction 與已知機密材料檢查的暫時性政策；它降低誤分享風險，但不是完整 DLP 保證。
-_Avoid_: Structural verification, sanitization, DLP
-
-**Real-Lab Canary**:
-在 production-like Ceph 或 Rook 環境執行的唯讀 collect 驗證，除了檢查 incident bundle，也會比較收集前後的穩定狀態並確認 node 沒有殘留暫存資源。
-_Avoid_: Smoke test, production test
-
-**Stable State Snapshot**:
-Real-lab canary 用來證明 collect 沒有改變系統狀態的一組穩定 identity 與 configuration 欄位；不包含會自然變動的 counters、epochs 或時間資料。
-_Avoid_: Full state dump, health snapshot
-
-**Full Collect**:
-在同一個 lab、同一次 collect 中，Ceph、Rook、Prometheus 與所有 inventory nodes（包含 `/var/log`）四條 collector path 全部成功走完，沒有任何一條 partial、missing 或 skipped 的 collect。它描述的是 coverage 完整，不是 evidence 收到底；每條 path 收多少由設定的界線決定。
-_Avoid_: Collector smoke test, split canaries, partial collect, 完整 evidence
-
-**Evidence Window**:
-界定一次 collect 要取得哪些 evidence 的時間範圍。每條 collector path 以自己的資料所能達到的精度遵守它：能逐筆過濾的（如 journal 查詢）取窗口內的記錄，只能整檔取捨的（如 `/var/log` 的輪替檔與 binary journal）取窗口內的檔案，外加跨越窗口起點的那一個最新檔——因為證據可能落在那個檔裡。
-_Avoid_: Since, retention, 保留期限, 時間範圍
-
-**Lab Profile**:
-描述 real-lab canary 連線入口、預期 cluster identity 與必要 collector coverage 的本機 TOML 設定；它只引用憑證路徑，不保存憑證內容。
-_Avoid_: Connection document, inventory, lab credentials
-
-**Lab Profile Candidate**:
-由唯讀 discovery 產生、包含新 lab identity 但尚未經操作人員確認的 Lab Profile；它不能直接用於 real-lab canary。
-_Avoid_: Active profile, trusted profile
-
-**Lab Validation Report**:
-一次 real-lab gate 的持久化結果，包含 code/profile identity、保存的 shell baseline provenance、本次 Python full collect coverage、bundle comparison、stable-state diff、residue 與下一步；同時提供人讀與 machine-readable 格式。
-_Avoid_: Test log, bundle report, chat summary
-
-**Operationally Read-Only Collect**:
-不刻意改變 persistent configuration、service state、package state、mount state、Ceph desired state 或 Kubernetes objects/workloads 的 collect。只允許 collector-owned workspace、最終 incident bundle 與可清理的 node 暫存輸出；查詢自然造成的 audit/access log、request counter 或 cache 變化不屬於 desired-state mutation，但必須在驗證報告中誠實區分。
-_Avoid_: Zero-write collect, side-effect-free query, harmless collect
-
-**Collector-Owned Workspace**:
-由 collector 自己建立並驗證 ownership/containment、唯一允許建立、覆寫、rename 或刪除 evidence artifacts 的目錄。來自 inventory、Node Evidence Archive 或外部 command 的資料不能擴張這個寫入邊界。
-_Avoid_: Temp path, output directory, arbitrary path
-
-**Read-Only Proof**:
-以 command-policy assertions、source filesystem invariants、Stable State Snapshot 與 remote residue checks 證明 collect 符合 Operationally Read-Only Collect 的驗收證據；不是只憑 command 名稱或操作者宣稱。
-_Avoid_: Safety assumption, smoke-test result, no-error run
+**Partial Collection**:
+A completed collection that publishes an Incident Bundle while reporting skipped or failed requested evidence, or collector-owned residue that could not be removed. It does not require any requested evidence outcome to have succeeded.
+_Avoid_: Complete collection

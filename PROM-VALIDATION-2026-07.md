@@ -1,5 +1,12 @@
 # `--prom-url` Prometheus metrics dump — 真機驗證證據（2026-07-10）
 
+> **歷史紀錄，不能當成現行操作步驟。** 本頁記錄已由 #115 移除的 shell
+> implementation 當時做過的驗證，內文中的 command、path、flag、layout 與 exit code
+> 都不是現行產品介面，請勿執行。現行產品只有 installed Python
+> `ceph-incident-bundle`；操作方式以 [`README.md`](README.md) 與
+> [`docs/python-rewrite-spec.md`](docs/python-rewrite-spec.md) 為準。需要 rollback 時使用
+> Git history、release tag 或先前發布的 artifact，不可從本頁重建舊 runtime。
+
 > 背景：`--prom-url` 功能落地時 README 註明「尚未對真 Prometheus 驗證」。先前一次
 > 口頭記錄的驗證沒有留下任何可稽核 artifacts（bundle 已隨被清掉的 worktree 消失），
 > 因此 2026-07-10 重跑一次完整收集並把證據落在本檔。raw bundle 本體被 `.gitignore`

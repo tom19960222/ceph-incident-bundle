@@ -1,183 +1,129 @@
 # Ceph Incident Bundle
 
-`ceph-incident-bundle` 是 operationally read-only 的事故證據收集器。它從工作機經
-SSH 收集 Ceph node、Ceph、Rook、Prometheus 與 `/var/log` 證據，產生可獨立驗證的
-`.tar.gz` bundle；它不會修復叢集、變更設定、重啟服務或建立 Kubernetes workload。
+`ceph-incident-bundle` 從明確列在 Node Inventory 的主機收集事故當下的 Raw Evidence，
+並在工作機產生一個 `.tar.gz` Incident Bundle。正式產品只有 Python 3.10+ 的
+`ceph-incident-bundle` console command；公開 subcommand 只有
+`generate-inventory` 與 `collect`。
 
-CPython 3.10 以上是 production runtime 的最低正式支援版本；validation 與 real-lab
-tooling 仍需要 Python 3.11 以上。Shell reference、相容 wrapper 與
-`/etc/hosts` 轉 inventory 的 shell helper 已在完成 offline 與 real-lab qualification
-後移除。
+收集器不修復叢集，也不修改 persistent configuration、service、package、mount、
+Ceph desired state 或 Kubernetes object/workload。它會建立並清除本次 invocation
+擁有的暫存 workspace；SSH、API 與檔案讀取仍可能自然留下 audit/access record。
 
-## 最短操作流程
+## 安裝
 
-在 repo root 執行：
-
-```bash
-python3 ceph_incident_bundle.py collect \
-  --inventory inventory/ceph-lab.example.env \
-  --ssh-key .ssh/id_ed25519 \
-  --seed ikaros@192.168.18.166 \
-  --mode cephadm \
-  --since 24h
-```
-
-成功後 stdout 只有 bundle 路徑：
-
-```text
-bundle: results/ceph-incident-YYYYMMDDTHHMMSSZ.tar.gz
-```
-
-驗證 bundle：
+用操作人員自己管理的 virtual environment 安裝，不要改系統 Python：
 
 ```bash
-python3 ceph_incident_bundle.py verify \
-  results/ceph-incident-YYYYMMDDTHHMMSSZ.tar.gz
+python3.10 -m venv .venv
+.venv/bin/python -m pip install .
+.venv/bin/ceph-incident-bundle --help
 ```
+
+Production package 只使用 Python 3.10 standard library。安裝後不會提供第二個
+collector、verifier、direct-on-node command 或相容入口。
+
+## 最短流程
+
+先產生草稿：
+
+```bash
+ceph-incident-bundle generate-inventory
+```
+
+這會讀 `/etc/hosts` 並寫出 `inventory.ini`。開始收集前一定要人工確認 scope、SSH
+address、Ceph source、Kubernetes context 與 Prometheus URL。Repository 內的
+[`inventory/example.ini`](inventory/example.ini) 是完整格式範例。
+
+確認後執行：
+
+```bash
+ceph-incident-bundle collect
+```
+
+常用 override：
+
+```bash
+ceph-incident-bundle collect \
+  --inventory /absolute/path/to/inventory.ini \
+  --since 24h \
+  --output-dir /absolute/path/to/results
+```
+
+SSH key、port、jump host、known hosts 等連線設定交給 system OpenSSH config 管理。
+Collector 使用 `BatchMode=yes`、不開 pseudo-terminal，也不會自動接受新 host key。
 
 ## Inventory
 
-Inventory 是宣告式資料，不會被當成 shell 執行：
+Inventory 是 INI，不是可執行 shell。`[common]` 與非空的 `[nodes]` 必填；V1 只接受
+`ssh_user = root`。`[ceph] source` 必須指向一個已列出的 inventory name。
+Kubernetes 沒有明確 `context` 就完全不收；Prometheus 沒有明確 `url` 也完全不連線。
 
-```bash
-SSH_USER="ikaros"
-SEED_HOST="192.168.18.166"
-ROOK_NAMESPACE="rook-ceph"
-ROOK_OPERATOR_NAMESPACE="rook-ceph"
-HOSTS=(
-  "monitor01=192.168.18.166"
-  "mon02=192.168.18.167"
-  "osd01=192.168.18.169"
-)
-```
+`inventory_name` 會直接成為 bundle 裡 `nodes/<inventory_name>/` 的目錄名稱；
+`ssh_address` 只負責連線。Ceph、Kubernetes 與 Prometheus observation 不會偷偷擴張
+SSH target 清單。
 
-- `SSH_USER`：登入每台 node 的 Linux 帳號。
-- `SEED_HOST`：選填；指定 cluster-level Ceph query 的 seed。
-- `ROOK_NAMESPACE`／`ROOK_OPERATOR_NAMESPACE`：Rook namespaces。
-- `HOSTS`：`alias=host`；alias 會成為 bundle 的 `nodes/<alias>/`。
+## 收集結果
 
-只接受 quoted scalar 與 `HOSTS` array。Command substitution、額外 shell statement、
-不安全 alias/target 都會在 SSH 或 output write 前被拒絕。原本的
-`run/hosts-to-inventory.sh` 是 shell-only convenience surface，不屬於 collect contract；
-cutover 選擇移除它而不增加第三個 production CLI。Inventory 語言本身沒有改變。
-
-## 收集模式
-
-`--mode auto`（預設）會逐台以 read-only probe 找可用來源：
-
-- Ceph：直接 `ceph`，必要時 `sudo -n ceph`。
-- Rook：`--kube-mode remote` 透過 SSH 使用 node 上的 `kubectl`，或
-  `--kube-mode local` 使用工作機的 `kubectl`；可配 `--kube-context`。
-- Node：每個 inventory node 都會收集。
-- Prometheus：只有給 `--prom-url` 才使用 HTTP GET 收集。
-
-Python implementation 沒有 `cephadm shell` 或 `kubectl exec` opt-in；這兩條會建立
-額外 runtime process 的路徑已在 cutover 前撤掉，不能作為 fallback。
-
-常用範例：
-
-```bash
-python3 ceph_incident_bundle.py collect \
-  --inventory inventory/external.env \
-  --ssh-key ~/.ssh/id_ed25519 \
-  --mode auto \
-  --kube-mode local \
-  --kube-context my-cluster \
-  --prom-url http://192.168.18.166:9095 \
-  --since 24h
-```
-
-完整 collect 介面：
+成功交付時 stdout 只有一行 bundle path 與 `(complete)` 或 `(partial)`。兩種已交付
+結果都是 exit 0；`partial` 表示至少一個實際嘗試的 evidence source、cleanup 或 Probe
+失敗，但已完成的 evidence 仍被保留。Startup rejection 或工作機錯誤導致沒有 bundle
+時，stdout 為空、exit 非 0，stderr 最後一行是：
 
 ```text
-ceph_incident_bundle.py collect --inventory PATH --ssh-key PATH
-  [--seed USER@HOST] [--out DIR] [--mode auto|cephadm|rook]
-  [--since N[smhdw]] [--timeout SECONDS] [--node-timeout SECONDS]
-  [--skip-logs] [--keep-original-logs]
-  [--var-log-max-bytes BYTES|unlimited]
-  [--trust-ssh-host-key|--no-trust-ssh-host-key]
-  [--kube-mode local|remote] [--kube-context CTX]
-  [--prom-url URL] [--prom-job-regex RE] [--prom-step SECONDS]
-  [--prom-timeout SECONDS] [--redact|--no-redact]
-  [--quiet] [--keep-workdir]
+FAIL: no Incident Bundle delivered
 ```
 
-## Evidence Window 與 `/var/log`
+Ctrl-C 不交付 bundle，完成可做的 cleanup 後 exit 130。
 
-- `--timeout`（預設 20s）界定單一 command／SSH；`--node-timeout`（預設 600s）
-  界定單一 node 的整輪收集。
-- `--since` 對 `/var/log` 必須是 `N`、`Ns`、`Nm`、`Nh`、`Nd` 或 `Nw`。
-- 會收窗口內檔案，加上每個 rotated family 跨過窗口起點的最新一份；排除項仍寫入
-  `INDEX.tsv`，避免把「存在但在窗口外」誤讀成「不存在」。
-- Regular files 以 no-atime/no-follow 路徑讀取；無法證明安全時記 partial，不退回一般
-  `open`／`cat`。
-- `.gz`、`.xz`、`.bz2`、`.zst` 可合併；opaque/binary evidence 留在 `raw/`。
-- 預設每台 log payload 上限 10 GiB；超限時保留 bounded index/原因並 exit 2，不產生
-  看似完整的半套 evidence。
+Bundle 根目錄固定包含：
 
-## Output 與 exit code
+```text
+inventory.ini
+collection.json
+nodes/
+ceph/
+kubernetes/
+prometheus/
+```
 
-主要成員：
+每個 Probe Capture 分開保存 `stdout`、`stderr` 與 `result.json`。Prometheus Capture
+保存原始 `response` 與 `result.json`。Node Evidence Archive 在任何 extraction 前都會
+完整檢查 member；absolute/traversal path、link、special object、collision 或不完整結構
+會讓整份 node archive fail closed。
 
-- `README-FIRST.txt`、`CONTENTS.md`、`summary.txt`、`environment.txt`
-- `manifest.jsonl`、`errors.log`、`redactions.log`
-- `cluster/{ceph,rook,prometheus}/`
-- `nodes/<alias>/`
+## Raw Evidence 與安全界線
 
-Exit code：
+Collector 不遮蔽、不掃描 secret、不做內容驗證，也不宣稱 bundle 適合分享。
+`/etc/ceph` 的一般檔案包含 keyring 在內都可能進入 bundle，Prometheus URL 的 credentials
+也不會被特別處理。對外提供前由操作人員自行依組織政策保管與審查。
 
-- `0`：收集完成，沒有已知 collector failure。
-- `2`：partial；bundle 仍產生，先讀 `errors.log` 與 `summary.txt`。
-- `1`：usage/input/verification failure。驗證失敗時保留 owned workdir 供調查。
+Remote Node Collector 只使用固定的 `python3 -`；缺少 CPython 3.10+ 時該 node 被略過，
+不安裝 runtime、不切換 interpreter，也不回退到其他 collector。Ceph 只跑 direct
+`ceph`；Kubernetes 只在工作機跑固定的 `kubectl get` 與 `kubectl logs`；不會啟動
+container 或進入 workload。
 
-進度寫 stderr；stdout 保持只有 `bundle:`。`--quiet` 可停用正常進度訊息。
+## 常見問題
 
-## 安全界線
+- Inventory 被拒絕：一次修完 stderr 列出的 unknown key、duplicate、duration、regex、
+  unresolved reference 或 portable name collision；收集尚未開始。
+- Node 被略過：先檢查 system OpenSSH 設定、`root@ssh_address`、host key 與該 node 的
+  fixed `python3` 是否為 CPython 3.10+。
+- 結果是 `partial`：先保留 bundle 與 stderr，再針對被點名的 source 處理；不要把
+  `partial` 誤當成沒有交付。
+- Output 已存在：換 output directory 或等待下一個 UTC second；collector 不覆寫既有
+  destination。
 
-- 只允許 collector-owned local/remote workspace 與 final bundle writes。
-- 不修改 persistent configuration、service、package、mount、Ceph desired state 或
-  Kubernetes object/workload。
-- Node Evidence Archive 在 extraction 前完整驗證 gzip/tar EOF、payload cap、member
-  name/type、collision、manifest mapping；拒絕 traversal、absolute path、links、device、
-  FIFO、socket 與任何 workspace 外 write。
-- SSH host key 預設 accept-new 只寫本次 workdir；已知 key mismatch 仍拒絕。
-- Redaction 預設開啟，但不是完整 DLP；分享前仍需人工檢查內部 IP、hostname、帳號與
-  其他敏感資訊。
+## 開發驗證與 rollback
 
-完整契約見 [`docs/read-only-safety.md`](docs/read-only-safety.md) 與
-[`docs/behavior-contract.md`](docs/behavior-contract.md)。
-
-## 驗證
-
-離線 gate 要用絕對路徑明確提供彼此獨立的 production 與 tooling interpreter；production
-gate 要求 exact CPython 3.10.x，tooling gate 為 Python 3.11+。入口會先
-解析並列出兩者的 executable、
-implementation 與 structured version，再依序執行 production test gate 和既有完整
-suite。Repository 不會下載或安裝 runtime／package，也不會修改 system Python、global
-site-packages、shell 或 version-manager default：
+離線驗證會 build wheel、安裝到隔離環境，再從 installed console command 跑完整 Python
+suite。請明確選預先準備好的 CPython 3.10.x：
 
 ```bash
-make validate \
-  PRODUCTION_PYTHON=/absolute/path/to/production-python \
-  TOOLING_PYTHON=/absolute/path/to/tooling-python \
-  TEST_JOBS=8
+make validate PYTHON=/absolute/path/to/cpython3.10
 ```
 
-post-cutover real-lab gate 不再執行 shell。它先驗證保存的 #21 PASS report 與 shell
-baseline bundle/hash，再對同一 active Lab Profile 執行一次 Python 四路 full collect，
-比較 normalized contract，並檢查 stable state、workstation cleanup 與 remote residue：
+驗證不連 real lab、不下載 dependency，也不改全域 Python。Real-lab acceptance 是另一個
+明確授權流程。
 
-```bash
-make validate-lab \
-  LAB_PROFILE=/absolute/path/to/lab.toml \
-  LAB_BASELINE_REPORT=/absolute/path/to/20260805T155047Z/report.json \
-  PRODUCTION_PYTHON=/absolute/path/to/cpython3.10 \
-  TOOLING_PYTHON=/absolute/path/to/python3.11 \
-  CEPH_INCIDENT_LAB_CONFIRM=1
-```
-
-Harness 由 tooling interpreter 執行；workstation `collect`／`verify` 只由 production
-interpreter 執行。只有 schema-v3 final `report.md`／`report.json` 的 `status: pass`，連同
-每台 node 的 pre/post runtime facts 與 CPython 3.10 witness，才是 3.10 qualification
-proof。既有 schema-v2 PASS 保留原本 post-cutover proof 的意義，但不能被當成 3.10
-proof。詳細流程見 [`docs/lab-validation-runbook.md`](docs/lab-validation-runbook.md)。
+需要退回舊版本時，使用 Git history、release tag 或先前發布的 artifact；repository
+不保留舊 runtime 或相容 wrapper。

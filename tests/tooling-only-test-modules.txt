@@ -1,3 +1,0 @@
-# Non-lab-named test modules that belong only to the complete tooling gate.
-# Keep sorted; production membership checks include this explicit classification.
-test_python_cutover.py
