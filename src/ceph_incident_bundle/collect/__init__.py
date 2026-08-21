@@ -327,7 +327,7 @@ def _cleanup_owned_workspace(
 
 
 def _delivered_bundle_outcome(final_path: Path) -> str | None:
-    """Read the completed bundle's outcome after publication owns the lifecycle."""
+    """Return the final bundle outcome, conservatively partial if unreadable."""
     try:
         final_facts = final_path.stat(follow_symlinks=False)
     except OSError:
@@ -343,8 +343,8 @@ def _delivered_bundle_outcome(final_path: Path) -> str | None:
             with metadata_file:
                 outcome = json.load(metadata_file).get("outcome")
     except (OSError, tarfile.TarError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    return outcome if outcome in {"complete", "partial"} else None
+        return "partial"
+    return outcome if outcome in {"complete", "partial"} else "partial"
 
 
 def _terminal_safe(value: str) -> str:

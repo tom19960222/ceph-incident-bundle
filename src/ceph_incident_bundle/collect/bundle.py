@@ -38,22 +38,32 @@ def cleanup_owned_workspace_before_publication(
     try:
         _require_posix_file_protection()
         workspace_parent_descriptor = _open_workspace_parent(workspace)
-        workspace_descriptor = _open_directory_at(
-            workspace_parent_descriptor,
-            workspace.name,
-            "owned workstation workspace",
-        )
-        if _file_identity(os.fstat(workspace_descriptor)) != expected_identity:
-            cleanup_problem = (
-                f"refusing to clean replaced workstation workspace {workspace}"
+        workspace_absent = False
+        try:
+            os.stat(
+                workspace.name,
+                dir_fd=workspace_parent_descriptor,
+                follow_symlinks=False,
             )
-        else:
-            cleanup_problem = _cleanup_workspace(
-                workspace,
+        except FileNotFoundError:
+            workspace_absent = True
+        if not workspace_absent:
+            workspace_descriptor = _open_directory_at(
                 workspace_parent_descriptor,
-                workspace_descriptor,
-                str(workspace.resolve()),
+                workspace.name,
+                "owned workstation workspace",
             )
+            if _file_identity(os.fstat(workspace_descriptor)) != expected_identity:
+                cleanup_problem = (
+                    f"refusing to clean replaced workstation workspace {workspace}"
+                )
+            else:
+                cleanup_problem = _cleanup_workspace(
+                    workspace,
+                    workspace_parent_descriptor,
+                    workspace_descriptor,
+                    str(workspace.resolve()),
+                )
     except FileNotFoundError:
         cleanup_problem = None
     except (BundlePublicationError, OSError) as error:

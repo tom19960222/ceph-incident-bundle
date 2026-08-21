@@ -2,6 +2,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 import io
 import json
+import os
 from pathlib import Path
 import tarfile
 from tempfile import TemporaryDirectory
@@ -160,7 +161,12 @@ class TopLevelCollectionTests(unittest.TestCase):
 
     def test_interrupt_after_publication_is_reported_as_delivered(self) -> None:
         class InterruptingResultStream(io.StringIO):
+            def __init__(self, unreadable_metadata) -> None:
+                super().__init__()
+                self.unreadable_metadata = unreadable_metadata
+
             def write(self, value: str) -> int:
+                self.unreadable_metadata.start()
                 raise KeyboardInterrupt
 
         with TemporaryDirectory() as directory:
@@ -168,19 +174,44 @@ class TopLevelCollectionTests(unittest.TestCase):
             inventory = root / "inventory.ini"
             inventory.write_bytes(INVENTORY)
             stderr = io.StringIO()
-            with (
-                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
-                redirect_stdout(InterruptingResultStream()),
-                redirect_stderr(stderr),
-            ):
-                status = run(inventory, "24h", root)
+
+            def publish_with_restrictive_umask(*args, **kwargs) -> str | None:
+                previous_umask = os.umask(0o777)
+                try:
+                    return publish_incident_bundle(*args, **kwargs)
+                finally:
+                    os.umask(previous_umask)
+
+            unreadable_metadata = patch(
+                "ceph_incident_bundle.collect.tarfile.open",
+                side_effect=PermissionError("injected unreadable delivered bundle"),
+            )
+            try:
+                with (
+                    patch(
+                        "ceph_incident_bundle.collect.collect_node", return_value=[]
+                    ),
+                    patch(
+                        "ceph_incident_bundle.collect.publish_bundle",
+                        side_effect=publish_with_restrictive_umask,
+                    ),
+                    redirect_stdout(InterruptingResultStream(unreadable_metadata)),
+                    redirect_stderr(stderr),
+                ):
+                    status = run(inventory, "24h", root)
+            finally:
+                unreadable_metadata.stop()
 
             bundles = list(root.glob("ceph-incident-bundle-*.tar.gz"))
+            bundle_mode = bundles[0].stat().st_mode & 0o777
 
         self.assertEqual(status, 0)
         self.assertEqual(len(bundles), 1)
+        self.assertEqual(bundle_mode, 0)
         self.assertIn("Incident Bundle delivered at", stderr.getvalue())
+        self.assertIn("(partial)", stderr.getvalue())
         self.assertIn("result was interrupted", stderr.getvalue())
+        self.assertNotIn("cannot remove workstation workspace", stderr.getvalue())
         self.assertNotIn("FAIL: no Incident Bundle delivered", stderr.getvalue())
 
     def test_node_process_group_exit_race_preserves_interrupt(self) -> None:
