@@ -46,6 +46,9 @@ class _InstalledPrometheusHandler(BaseHTTPRequestHandler):
         server = self.server
         assert isinstance(server, _InstalledPrometheusServer)
         server.requests.append((self.command, self.path))
+        if server.event_log is not None:
+            with server.event_log.open("a", encoding="utf-8") as events:
+                events.write(f"prometheus {urlsplit(self.path).path}\n")
         path = urlsplit(self.path).path
         bodies = {
             "/api/v1/status/buildinfo": b'{"status":"success","data":{"version":"3.0"}}',
@@ -66,12 +69,14 @@ class _InstalledPrometheusHandler(BaseHTTPRequestHandler):
 
 class _InstalledPrometheusServer(ThreadingHTTPServer):
     requests: list[tuple[str, str]]
+    event_log: Path | None
 
 
 @contextmanager
-def _installed_prometheus_server():
+def _installed_prometheus_server(event_log: Path | None = None):
     server = _InstalledPrometheusServer(("127.0.0.1", 0), _InstalledPrometheusHandler)
     server.requests = []
+    server.event_log = event_log
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
     try:
@@ -1048,6 +1053,91 @@ source = node-b
         self.assertEqual(range_result["outcome"], "received")
         self.assertEqual(outcome, "complete")
         self.assertIn(f"{root_name}/prometheus/buildinfo/response", names)
+
+    def test_installed_cli_runs_all_configured_sources_in_one_fixed_order(
+        self,
+    ) -> None:
+        """One public invocation keeps all four evidence paths independent."""
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            event_log = cwd / "events"
+            with _installed_prometheus_server(event_log) as (
+                server,
+                prometheus_url,
+            ):
+                fake_bin = cwd / "bin"
+                fake_bin.mkdir()
+                self._write_aggregate_fake_ssh(fake_bin / "ssh")
+                self._write_fake_kubectl(fake_bin / "kubectl")
+                (cwd / "inventory.ini").write_text(
+                    "[common]\n"
+                    "ssh_user = root\n"
+                    "[nodes]\n"
+                    "node-a = node-a.example.test\n"
+                    "node-b = node-b.example.test\n"
+                    "[ceph]\n"
+                    "source = node-a\n"
+                    "[kubernetes]\n"
+                    "context = lab-context\n"
+                    "consumer_namespace = rook-shared\n"
+                    "operator_namespace = rook-shared\n"
+                    "[prometheus]\n"
+                    f"url = {prometheus_url}\n",
+                    encoding="utf-8",
+                )
+                environment = os.environ.copy()
+                environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+                environment["FAKE_EVENT_LOG"] = str(event_log)
+                environment["FAKE_KUBECTL_RECORD"] = str(cwd / "kubectl-record")
+
+                completed = self.run_cli("collect", cwd=cwd, env=environment)
+
+                bundle = next(cwd.glob("ceph-incident-bundle-*.tar.gz"))
+                root = bundle.name.removesuffix(".tar.gz")
+                with tarfile.open(bundle, "r:gz") as archive:
+                    names = {member.name for member in archive.getmembers()}
+                    metadata_file = archive.extractfile(f"{root}/collection.json")
+                    assert metadata_file is not None
+                    outcome = json.load(metadata_file)["outcome"]
+                with event_log.open("a", encoding="utf-8") as event_stream:
+                    event_stream.write("packaging delivered\n")
+                events = event_log.read_text(encoding="utf-8").splitlines()
+                prometheus_requests = list(server.requests)
+
+        kubernetes_events = [
+            event for event in events if event.startswith("kubernetes ")
+        ]
+        prometheus_events = [
+            event for event in events if event.startswith("prometheus ")
+        ]
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stderr, b"")
+        self.assertEqual(completed.stdout, f"{bundle.resolve()} (complete)\n".encode())
+        self.assertEqual(
+            events[:2],
+            [
+                "node root@node-a.example.test ceph",
+                "node root@node-b.example.test",
+            ],
+        )
+        self.assertTrue(kubernetes_events)
+        self.assertTrue(prometheus_events)
+        self.assertEqual(
+            events,
+            [
+                *events[:2],
+                *kubernetes_events,
+                *prometheus_events,
+                "packaging delivered",
+            ],
+        )
+        self.assertEqual(len(prometheus_requests), 5)
+        self.assertEqual(outcome, "complete")
+        self.assertIn(f"{root}/nodes/node-a/probes", names)
+        self.assertIn(f"{root}/nodes/node-b/probes", names)
+        self.assertIn(f"{root}/ceph/probes", names)
+        self.assertIn(f"{root}/kubernetes/probes", names)
+        self.assertIn(f"{root}/prometheus/buildinfo/response", names)
 
     def test_installed_collect_captures_configured_kubernetes_get_snapshot(self) -> None:
         inventory = b"""\
@@ -2121,6 +2211,36 @@ raise SystemExit(7)
         self.assertIn(b"Inventory Name collision", completed.stderr)
 
     @staticmethod
+    def _write_aggregate_fake_ssh(path: Path) -> None:
+        path.write_text(
+            f"""#!{sys.executable}
+import io
+import os
+import sys
+import tarfile
+
+destination = sys.argv[sys.argv.index("python3") - 1]
+collects_ceph = "--collect-ceph" in sys.argv
+with open(os.environ["FAKE_EVENT_LOG"], "a", encoding="utf-8") as events:
+    events.write(f"node {{destination}}{{' ceph' if collects_ceph else ''}}\\n")
+
+archive_bytes = io.BytesIO()
+with tarfile.open(fileobj=archive_bytes, mode="w:gz") as archive:
+    members = ["node", "node/probes", "node/files"]
+    if collects_ceph:
+        members.extend(["ceph", "ceph/probes"])
+    for name in members:
+        member = tarfile.TarInfo(name)
+        member.type = tarfile.DIRTYPE
+        member.mode = 0o700
+        archive.addfile(member)
+sys.stdout.buffer.write(archive_bytes.getvalue())
+""",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+    @staticmethod
     def _write_fake_ssh(path: Path) -> None:
         path.write_text(
             f"""#!{sys.executable}
@@ -2318,6 +2438,10 @@ import sys
 record = Path(os.environ["FAKE_KUBECTL_RECORD"])
 with record.open("a", encoding="utf-8") as stream:
     stream.write(json.dumps(sys.argv[1:]) + "\\n")
+event_log = os.environ.get("FAKE_EVENT_LOG")
+if event_log:
+    with Path(event_log).open("a", encoding="utf-8") as events:
+        events.write("kubernetes " + " ".join(sys.argv[1:]) + "\\n")
 if sys.argv[3:4] == ["logs"]:
     sys.stdout.buffer.write(b"pod log raw bytes\\x00\\xff")
 elif sys.argv[-2:] == ["pods", "--output=json"]:
