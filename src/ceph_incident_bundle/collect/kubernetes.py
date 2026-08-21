@@ -72,9 +72,30 @@ def collect_kubernetes(
         capture = probes_directory / probe.name
         try:
             succeeded, process_residue = _run_probe(
-                probe, capture, probe_timeout_seconds=probe_timeout_seconds
+                probe,
+                capture,
+                probe_timeout_seconds=probe_timeout_seconds,
             )
         except OSError as error:
+            cleanup_errors = [str(error)]
+            interrupted = error.__context__
+            while interrupted is not None and not isinstance(
+                interrupted, KeyboardInterrupt
+            ):
+                if isinstance(interrupted, OSError):
+                    cleanup_errors.append(str(interrupted))
+                interrupted = interrupted.__context__
+            if isinstance(interrupted, KeyboardInterrupt):
+                details: list[str] = []
+                if isinstance(interrupted.__cause__, OSError):
+                    details.append(str(interrupted.__cause__))
+                details.extend(
+                    f"Kubernetes {probe.name}: interruption cleanup failed: {message}"
+                    for message in reversed(cleanup_errors)
+                )
+                # Preserve the interrupt as the outcome; the standard cause is
+                # only the concrete cleanup detail the top-level owner reports.
+                raise KeyboardInterrupt from OSError("; ".join(details))
             return [
                 *problems,
                 _with_residue(
@@ -196,7 +217,10 @@ def _probe_catalog(
 
 
 def _run_probe(
-    probe: _KubernetesProbe, capture: Path, *, probe_timeout_seconds: int
+    probe: _KubernetesProbe,
+    capture: Path,
+    *,
+    probe_timeout_seconds: int,
 ) -> tuple[bool, str | None]:
     capture.mkdir()
     started_at = _utc_now()
@@ -226,6 +250,13 @@ def _run_probe(
         else:
             try:
                 exit_code = process.wait(timeout=probe_timeout_seconds or None)
+            except KeyboardInterrupt:
+                process_residue = _terminate_process_group(process)
+                if process_residue is not None:
+                    raise KeyboardInterrupt from OSError(
+                        f"Kubernetes {probe.name}: {process_residue}"
+                    )
+                raise
             except subprocess.TimeoutExpired:
                 outcome = "timed_out"
                 process_residue = _terminate_process_group(process)

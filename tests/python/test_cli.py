@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import signal
 import stat
 import subprocess
 import sys
@@ -134,6 +135,137 @@ class InstalledCliTests(unittest.TestCase):
         self.assertEqual(sys.implementation.name, "cpython")
         self.assertEqual(sys.version_info[:2], (3, 10))
         self.assertEqual(console_script_shebang, f"#!{sys.executable}".encode("utf-8"))
+
+    def test_ctrl_c_requests_remote_cleanup_and_delivers_no_bundle(self) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (root / "inventory.ini").write_bytes(inventory)
+            output = root / "output"
+            output.mkdir()
+            temporary_root = root / "temporary"
+            temporary_root.mkdir()
+            remote_workspace = root / "remote-owned-workspace"
+            ready = root / "ssh-ready"
+            events = root / "boundary-events"
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+            environment["FAKE_SSH_RECORD"] = str(root / "ssh-record")
+            environment["FAKE_SSH_INTERRUPT_READY"] = str(ready)
+            environment["FAKE_SSH_REMOTE_WORKSPACE"] = str(remote_workspace)
+            environment["FAKE_EVENT_LOG"] = str(events)
+            command = COMMAND
+            assert command is not None
+
+            process = subprocess.Popen(
+                [command, "collect", "--output-dir", str(output)],
+                cwd=root,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                for _attempt in range(200):
+                    if ready.exists():
+                        break
+                    threading.Event().wait(0.01)
+                else:
+                    self.fail("fake SSH did not reach its interrupt boundary")
+                child_pid = int(ready.read_text(encoding="ascii"))
+                process.send_signal(signal.SIGINT)
+                stdout, stderr = process.communicate(timeout=10)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+            bundles = list(output.glob("ceph-incident-bundle-*.tar.gz"))
+            candidates = list(output.glob(".*.candidate.*"))
+            local_workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+            boundary_events = events.read_text(encoding="utf-8").splitlines()
+            remote_workspace_exists = remote_workspace.exists()
+            child_is_running = True
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                child_is_running = False
+
+        self.assertEqual(process.returncode, 130)
+        self.assertEqual(stdout, b"")
+        self.assertTrue(stderr.endswith(b"FAIL: no Incident Bundle delivered\n"))
+        self.assertIn(b"normal remote cleanup requested", stderr)
+        self.assertFalse(child_is_running)
+        self.assertFalse(remote_workspace_exists)
+        self.assertEqual(local_workspaces, [])
+        self.assertEqual(candidates, [])
+        self.assertEqual(bundles, [])
+        self.assertEqual(boundary_events, ["ssh-start", "remote-cleanup-request"])
+
+    def test_ctrl_c_during_publication_reports_owned_cleanup_residue(self) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (root / "inventory.ini").write_bytes(inventory)
+            output = root / "output"
+            output.mkdir()
+            temporary_root = root / "temporary"
+            temporary_root.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+            environment["FAKE_SSH_RECORD"] = str(root / "ssh-record")
+            environment["FAKE_SSH_LARGE_EVIDENCE_BYTES"] = str(32 * 1024 * 1024)
+            environment["FAKE_SSH_LOCK_WORKSPACE_PARENT_AFTER_REMOTE"] = "1"
+            command = COMMAND
+            assert command is not None
+
+            process = subprocess.Popen(
+                [command, "collect", "--output-dir", str(output)],
+                cwd=root,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                for _attempt in range(3000):
+                    if list(output.glob(".*.candidate.*")):
+                        break
+                    if process.poll() is not None:
+                        self.fail("collection exited before publication could be interrupted")
+                    threading.Event().wait(0.01)
+                else:
+                    self.fail("publication candidate was not observed")
+                process.send_signal(signal.SIGINT)
+                stdout, stderr = process.communicate(timeout=10)
+            finally:
+                temporary_root.chmod(0o755)
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+
+            bundles = list(output.glob("ceph-incident-bundle-*.tar.gz"))
+            candidates = list(output.glob(".*.candidate.*"))
+            local_workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+
+        self.assertEqual(process.returncode, 130)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(bundles, [])
+        self.assertEqual(candidates, [])
+        self.assertEqual(len(local_workspaces), 1)
+        self.assertIn(str(local_workspaces[0]).encode("utf-8"), stderr)
+        self.assertIn(b"cannot remove workstation workspace", stderr)
+        self.assertTrue(stderr.endswith(b"FAIL: no Incident Bundle delivered\n"))
 
     def test_generate_inventory_does_not_resolve_collect_default_from_deleted_cwd(
         self,
@@ -1494,6 +1626,59 @@ node-a = node-a.example.test
         # must survive, not merely a no-op hook.
         self.assertEqual(len(workspaces), 1)
 
+    def test_workstation_cleanup_residue_is_a_truthful_partial_delivery(self) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (root / "inventory.ini").write_bytes(inventory)
+            output = root / "output"
+            output.mkdir()
+            temporary_root = root / "temporary"
+            temporary_root.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+            environment["FAKE_SSH_RECORD"] = str(root / "ssh-record")
+            environment["FAKE_SSH_LOCK_WORKSPACE_PARENT_AFTER_REMOTE"] = "1"
+
+            try:
+                completed = self.run_cli(
+                    "collect",
+                    "--output-dir",
+                    str(output),
+                    cwd=root,
+                    env=environment,
+                    timeout=20,
+                )
+            finally:
+                temporary_root.chmod(0o755)
+
+            bundles = list(output.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            bundle = bundles[0]
+            with tarfile.open(bundle, "r:gz") as archive:
+                root_name = bundle.name.removesuffix(".tar.gz")
+                metadata_file = archive.extractfile(f"{root_name}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+            output_entries = list(output.iterdir())
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stdout,
+            f"{bundle.resolve()} (partial)\n".encode("utf-8"),
+        )
+        self.assertEqual(outcome, "partial")
+        self.assertEqual(output_entries, [bundle])
+        self.assertEqual(len(workspaces), 1)
+        self.assertIn(str(workspaces[0]).encode("utf-8"), completed.stderr)
+        self.assertIn(b"cannot remove workstation workspace", completed.stderr)
+        self.assertNotIn(b"FAIL: no Incident Bundle delivered", completed.stderr)
+
     def test_complete_archive_is_admitted_when_ssh_diagnostics_cannot_be_written(
         self,
     ) -> None:
@@ -1778,6 +1963,96 @@ raise SystemExit(7)
         self.assertIn(f"{root}/nodes/node-a/files", member_names)
         self.assertNotIn(f"{root}/nodes/node-a/files/etc/hosts", member_names)
         self.assertFalse(any("diagnostic" in name for name in member_names))
+
+    def test_remote_cleanup_failure_preserves_evidence_and_reports_residue(
+        self,
+    ) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (root / "inventory.ini").write_bytes(inventory)
+            output = root / "output"
+            output.mkdir()
+            temporary_root = root / "temporary"
+            temporary_root.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+            environment["FAKE_SSH_RECORD"] = str(root / "ssh-record")
+            environment["FAKE_REMOTE_CLEANUP_FAILURE"] = "1"
+
+            completed = self.run_cli(
+                "collect",
+                "--output-dir",
+                str(output),
+                cwd=root,
+                env=environment,
+                timeout=20,
+            )
+
+            bundles = list(output.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            bundle = bundles[0]
+            with tarfile.open(bundle, "r:gz") as archive:
+                root_name = bundle.name.removesuffix(".tar.gz")
+                names = {member.name for member in archive.getmembers()}
+                metadata_file = archive.extractfile(f"{root_name}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+            remote_residue = list(temporary_root.glob("ceph-incident-node.*"))
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stdout,
+            f"{bundle.resolve()} (partial)\n".encode("utf-8"),
+        )
+        self.assertEqual(outcome, "partial")
+        self.assertEqual(len(remote_residue), 1, completed.stderr)
+        self.assertIn(str(remote_residue[0]).encode("utf-8"), completed.stderr)
+        self.assertIn(
+            b"cannot remove Remote Node Collector workspace", completed.stderr
+        )
+        self.assertIn(f"{root_name}/nodes/node-a/probes/hostname/stdout", names)
+        self.assertFalse(any("/private/" in name for name in names))
+
+    def test_connection_failure_delivers_metadata_only_partial_bundle(self) -> None:
+        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self._write_fake_ssh(fake_bin / "ssh")
+            (root / "inventory.ini").write_bytes(inventory)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["FAKE_SSH_RECORD"] = str(root / "ssh-record")
+            environment["FAKE_SSH_CONNECTION_FAILURE"] = "1"
+
+            completed = self.run_cli("collect", cwd=root, env=environment, timeout=20)
+            bundles = list(root.glob("ceph-incident-bundle-*.tar.gz"))
+            self.assertEqual(len(bundles), 1)
+            bundle = bundles[0]
+            with tarfile.open(bundle, "r:gz") as archive:
+                root_name = bundle.name.removesuffix(".tar.gz")
+                names = {member.name for member in archive.getmembers()}
+                metadata_file = archive.extractfile(f"{root_name}/collection.json")
+                assert metadata_file is not None
+                outcome = json.load(metadata_file)["outcome"]
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stdout,
+            f"{bundle.resolve()} (partial)\n".encode("utf-8"),
+        )
+        self.assertEqual(outcome, "partial")
+        self.assertIn(b"[node-a] ssh: connection refused", completed.stderr)
+        self.assertIn(b"Node Evidence Archive rejected", completed.stderr)
+        self.assertFalse(
+            any(name.startswith(f"{root_name}/nodes/node-a") for name in names)
+        )
 
     def test_corrupt_ssh_stdout_publishes_partial_without_a_node_contribution(
         self,
@@ -2249,6 +2524,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -2266,6 +2542,32 @@ argv = json.dumps(sys.argv[1:])
 source = sys.stdin.buffer.read()
 (record / "stdin.py").write_bytes(source)
 (record / f"stdin.{{count}}.py").write_bytes(source)
+interrupt_ready = os.environ.get("FAKE_SSH_INTERRUPT_READY")
+if interrupt_ready:
+    remote_workspace = Path(os.environ["FAKE_SSH_REMOTE_WORKSPACE"])
+    remote_workspace.mkdir()
+    event_log = Path(os.environ["FAKE_EVENT_LOG"])
+    with event_log.open("a", encoding="utf-8") as events:
+        events.write("ssh-start\\n")
+    Path(interrupt_ready).write_text(str(os.getpid()), encoding="ascii")
+    def handle_interrupt(_signal, _frame):
+        shutil.rmtree(remote_workspace)
+        with event_log.open("a", encoding="utf-8") as events:
+            events.write("remote-cleanup-request\\n")
+        sys.stderr.write("normal remote cleanup requested\\n")
+        raise SystemExit(130)
+    def handle_termination(_signal, _frame):
+        sys.stderr.write(
+            f"remote cleanup not requested; known residue {{remote_workspace}}\\n"
+        )
+        raise SystemExit(143)
+    signal.signal(signal.SIGINT, handle_interrupt)
+    signal.signal(signal.SIGTERM, handle_termination)
+    while True:
+        signal.pause()
+if os.environ.get("FAKE_SSH_CONNECTION_FAILURE"):
+    sys.stderr.write("ssh: connection refused\\n")
+    raise SystemExit(255)
 precreate_extraction = os.environ.get("FAKE_SSH_PRECREATE_EXTRACTION")
 if precreate_extraction:
     temporary_root = Path(os.environ["TMPDIR"])
@@ -2334,16 +2636,28 @@ remote_support = Path(tempfile.mkdtemp(prefix="fake-ssh-remote-support."))
 remote_source_root = remote_support / "source"
 remote_log = remote_source_root / "var/log/fake.log"
 remote_log.parent.mkdir(parents=True)
-remote_log.write_bytes(b"fake remote var log bytes\\x00\\xff")
+large_evidence_bytes = int(os.environ.get("FAKE_SSH_LARGE_EVIDENCE_BYTES", "0"))
+if large_evidence_bytes:
+    remote_log.write_bytes(os.urandom(large_evidence_bytes))
+else:
+    remote_log.write_bytes(b"fake remote var log bytes\\x00\\xff")
 (remote_support / "sitecustomize.py").write_text(
     "import os\\n"
+    "import shutil\\n"
     "_source_root = os.environ['FAKE_REMOTE_SOURCE_ROOT']\\n"
     "_original_open = os.open\\n"
     "def open(path, flags, *args, **kwargs):\\n"
     "    if os.fspath(path) == '/' and flags & os.O_DIRECTORY:\\n"
     "        return _original_open(_source_root, flags, *args, **kwargs)\\n"
     "    return _original_open(path, flags, *args, **kwargs)\\n"
-    "os.open = open\\n",
+    "os.open = open\\n"
+    "_original_rmtree = shutil.rmtree\\n"
+    "def rmtree(path, *args, **kwargs):\\n"
+    "    if (os.environ.get('FAKE_REMOTE_CLEANUP_FAILURE') and "
+    "os.path.basename(os.fspath(path)).startswith('ceph-incident-node.')):\\n"
+    "        raise OSError('injected remote cleanup failure')\\n"
+    "    return _original_rmtree(path, *args, **kwargs)\\n"
+    "shutil.rmtree = rmtree\\n",
     encoding="utf-8",
 )
 probe_script = f"#!{sys.executable}\\nimport os\\nprint(os.path.basename(__file__))\\n"
@@ -2411,6 +2725,8 @@ try:
 finally:
     shutil.rmtree(probe_bin)
     shutil.rmtree(remote_support)
+if os.environ.get("FAKE_SSH_LOCK_WORKSPACE_PARENT_AFTER_REMOTE"):
+    Path(os.environ["TMPDIR"]).chmod(0o555)
 archive_bytes = completed.stdout
 if os.environ.get("FAKE_SSH_TRUNCATE"):
     archive_bytes = archive_bytes[:-8]

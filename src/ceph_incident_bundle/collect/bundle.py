@@ -27,6 +27,59 @@ class BundlePublicationError(Exception):
     """The final Incident Bundle was not delivered."""
 
 
+def cleanup_owned_workspace_before_publication(
+    workspace: Path, expected_identity: tuple[int, int]
+) -> str | None:
+    """Remove the exact workspace while the top-level flow still owns it."""
+    workspace = Path(workspace)
+    workspace_parent_descriptor: int | None = None
+    workspace_descriptor: int | None = None
+    cleanup_problem: str | None = None
+    try:
+        _require_posix_file_protection()
+        workspace_parent_descriptor = _open_workspace_parent(workspace)
+        workspace_absent = False
+        try:
+            os.stat(
+                workspace.name,
+                dir_fd=workspace_parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            workspace_absent = True
+        if not workspace_absent:
+            workspace_descriptor = _open_directory_at(
+                workspace_parent_descriptor,
+                workspace.name,
+                "owned workstation workspace",
+            )
+            if _file_identity(os.fstat(workspace_descriptor)) != expected_identity:
+                cleanup_problem = (
+                    f"refusing to clean replaced workstation workspace {workspace}"
+                )
+            else:
+                cleanup_problem = _cleanup_workspace(
+                    workspace,
+                    workspace_parent_descriptor,
+                    workspace_descriptor,
+                    str(workspace.resolve()),
+                )
+    except FileNotFoundError:
+        cleanup_problem = None
+    except (BundlePublicationError, OSError) as error:
+        cleanup_problem = f"cannot remove workstation workspace {workspace}: {error}"
+    finally:
+        if workspace_descriptor is not None:
+            close_problem = _close_workspace_input(workspace_descriptor)
+            if close_problem is not None:
+                cleanup_problem = _combine_problems(cleanup_problem, close_problem)
+        if workspace_parent_descriptor is not None:
+            close_problem = _close_workspace_parent(workspace_parent_descriptor)
+            if close_problem is not None:
+                cleanup_problem = _combine_problems(cleanup_problem, close_problem)
+    return cleanup_problem
+
+
 def publish_bundle(
     workspace: Path,
     final_path: Path,
@@ -48,12 +101,16 @@ def publish_bundle(
 
     The caller owns the workspace until this function is called.  At that handoff,
     publication assumes responsibility for workspace cleanup and exact residue
-    reporting on every return or raised publication error.
+    reporting on every return or raised publication error.  Interrupt cleanup
+    problems are attached as the standard exception cause so the top-level owner
+    can report them after this function has closed all publication inputs.
     """
     workspace = Path(workspace)
     final_path = Path(final_path)
     candidate: Path | None = None
     candidate_name: str | None = None
+    candidate_identity: tuple[int, int] | None = None
+    interruption_problems: list[str] = []
     cleanup_problem: str | None = None
     workspace_cleanup_attempted = False
     workspace_marker_path: str | None = None
@@ -159,6 +216,7 @@ def publish_bundle(
             # no-replace hard link makes the inode visible under the published name.
             os.fchmod(candidate_anchor, published_mode)
             os.fsync(candidate_anchor)
+            candidate_identity = _file_identity(os.fstat(candidate_anchor))
         finally:
             if candidate_anchor is not None:
                 anchor_to_close = candidate_anchor
@@ -187,30 +245,53 @@ def publish_bundle(
             ) from cleanup_error
         return cleanup_problem
     except KeyboardInterrupt:
+        if candidate_identity is not None and output_descriptor is not None:
+            final_cleanup_problem = _remove_owned_final_at(
+                output_descriptor,
+                final_path.name,
+                final_path,
+                candidate_identity,
+            )
+            if final_cleanup_problem is not None:
+                interruption_problems.append(final_cleanup_problem)
         if (
             not workspace_cleanup_attempted
             and workspace_parent_descriptor is not None
             and workspace_descriptor is not None
             and workspace_marker_path is not None
         ):
-            _cleanup_workspace(
+            cleanup_problem = _cleanup_workspace(
                 workspace,
                 workspace_parent_descriptor,
                 workspace_descriptor,
                 workspace_marker_path,
             )
+        if cleanup_problem is not None:
+            interruption_problems.append(cleanup_problem)
         if workspace_descriptor is not None:
-            _close_workspace_input(workspace_descriptor)
+            workspace_close_problem = _close_workspace_input(workspace_descriptor)
+            if workspace_close_problem is not None:
+                interruption_problems.append(workspace_close_problem)
             workspace_descriptor = None
         if workspace_parent_descriptor is not None:
-            _close_workspace_parent(workspace_parent_descriptor)
+            parent_close_problem = _close_workspace_parent(
+                workspace_parent_descriptor
+            )
+            if parent_close_problem is not None:
+                interruption_problems.append(parent_close_problem)
             workspace_parent_descriptor = None
         if (
             candidate is not None
             and candidate_name is not None
             and output_descriptor is not None
         ):
-            _remove_candidate_at(output_descriptor, candidate_name, candidate)
+            candidate_cleanup_problem = _remove_candidate_at(
+                output_descriptor, candidate_name, candidate
+            )
+            if candidate_cleanup_problem is not None:
+                interruption_problems.append(candidate_cleanup_problem)
+        if interruption_problems:
+            raise KeyboardInterrupt from OSError("; ".join(interruption_problems))
         raise
     except Exception as error:
         if not workspace_cleanup_attempted:
@@ -262,10 +343,15 @@ def publish_bundle(
         raise BundlePublicationError(message) from error
     finally:
         if output_descriptor is not None:
-            # Issue #100 owns the post-link close-failure delivery/residue matrix.
-            # Keep #87's existing propagation instead of guessing whether a linked
-            # final path should be rolled back or reported as delivered.
-            os.close(output_descriptor)
+            try:
+                os.close(output_descriptor)
+            except (OSError, KeyboardInterrupt):
+                # This descriptor owns no evidence bytes or filesystem object.
+                # Once the final hard link is visible, a close report cannot turn
+                # actual delivery into nondelivery or rewrite final metadata.  On
+                # earlier failures, workspace/candidate cleanup above has already
+                # handled every path owned by the invocation.
+                pass
 
 
 def _validate_lifecycle_paths(
@@ -1095,5 +1181,37 @@ def _remove_candidate_at(
     return None
 
 
+def _remove_owned_final_at(
+    output_descriptor: int,
+    final_name: str,
+    final_path: Path,
+    expected_identity: tuple[int, int],
+) -> str | None:
+    try:
+        current_facts = os.stat(
+            final_name,
+            dir_fd=output_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return f"cannot inspect interrupted final destination {final_path}: {error}"
+    if (
+        not stat.S_ISREG(current_facts.st_mode)
+        or _file_identity(current_facts) != expected_identity
+    ):
+        return f"refusing to remove replaced final destination {final_path}"
+    try:
+        os.unlink(final_name, dir_fd=output_descriptor)
+    except OSError as error:
+        return f"cannot remove interrupted final destination {final_path}: {error}"
+    return None
+
+
 def _rfc3339(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _combine_problems(first: str | None, second: str) -> str:
+    return second if first is None else f"{first}; {second}"

@@ -50,6 +50,8 @@ def collect_node(
     )
 
     start_error: OSError | None = None
+    interrupted = False
+    interruption_problems: list[str] = []
     try:
         # Regular files let OpenSSH read and write without pipe backpressure.  The
         # lexical scope also proves stdin, the complete stdout archive, and stderr
@@ -72,19 +74,55 @@ def collect_node(
                 try:
                     return_code = process.wait()
                 except KeyboardInterrupt:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    process.wait()
-                    raise
+                    # The SSH process owns a separate group, so the operator's
+                    # Ctrl-C reaches only the workstation flow.  Forward SIGINT
+                    # to request the remote Python collector's normal ``finally``
+                    # cleanup while the connection is still reachable.
+                    interrupted = True
+                    try:
+                        os.killpg(process.pid, signal.SIGINT)
+                    except ProcessLookupError:
+                        # The group already completed its cleanup and exited.
+                        pass
+                    except OSError as error:
+                        interruption_problems.append(
+                            f"Target Node {node.inventory_name}: cannot request "
+                            f"cleanup from process group {process.pid}: {error}"
+                        )
+                    try:
+                        process.wait()
+                    except OSError as error:
+                        interruption_problems.append(
+                            f"Target Node {node.inventory_name}: cannot wait for "
+                            f"interrupted process group {process.pid}: {error}"
+                        )
     except OSError as error:
-        return [
-            f"Target Node {node.inventory_name}: "
-            f"cannot complete one-SSH stream files: {error}"
-        ]
+        if interrupted:
+            interruption_problems.append(
+                f"Target Node {node.inventory_name}: cannot close interrupted "
+                f"SSH protocol streams: {error}"
+            )
+        else:
+            return [
+                f"Target Node {node.inventory_name}: "
+                f"cannot complete one-SSH stream files: {error}"
+            ]
 
     if start_error is not None:
         return [
             f"Target Node {node.inventory_name}: cannot start SSH: {start_error}"
         ]
+
+    if interrupted:
+        try:
+            _print_diagnostics(node.inventory_name, diagnostics_path)
+        except Exception:
+            pass
+        if interruption_problems:
+            # The top-level interrupt owner reports this standard chained cause
+            # after all three protocol streams have left their context managers.
+            raise KeyboardInterrupt from OSError("; ".join(interruption_problems))
+        raise KeyboardInterrupt
 
     try:
         _print_diagnostics(node.inventory_name, diagnostics_path)
