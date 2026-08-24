@@ -1162,7 +1162,7 @@ raise SystemExit(9)
                     "--since-seconds",
                     "60",
                     "--probe-timeout-seconds",
-                    "0",
+                    "30",
                     "--collect-ceph",
                 ],
                 env=environment,
@@ -1244,7 +1244,7 @@ raise SystemExit(9)
                     "--since-seconds",
                     "60",
                     "--probe-timeout-seconds",
-                    "0",
+                    "30",
                     "--collect-ceph",
                 ],
                 env=environment,
@@ -1281,7 +1281,7 @@ raise SystemExit(9)
                 "--since-seconds",
                 "60",
                 "--probe-timeout-seconds",
-                "0",
+                "30",
                 "--collect-ceph",
                 environment=environment,
             )
@@ -1344,7 +1344,7 @@ raise SystemExit(9)
                 "--since-seconds",
                 "60",
                 "--probe-timeout-seconds",
-                "0",
+                "30",
                 "--collect-ceph",
                 environment=environment,
             )
@@ -1390,7 +1390,7 @@ raise SystemExit(9)
                 "--since-seconds",
                 "60",
                 "--probe-timeout-seconds",
-                "0",
+                "30",
                 "--collect-ceph",
                 environment=environment,
             )
@@ -1440,7 +1440,7 @@ raise SystemExit(9)
                 "--since-seconds",
                 "60",
                 "--probe-timeout-seconds",
-                "0",
+                "30",
                 "--collect-ceph",
                 environment=environment,
             )
@@ -1478,7 +1478,7 @@ raise SystemExit(9)
                 "--since-seconds",
                 "60",
                 "--probe-timeout-seconds",
-                "0",
+                "30",
                 "--collect-ceph",
                 environment=environment,
             )
@@ -1519,6 +1519,12 @@ raise SystemExit(9)
 
     def test_noncanonical_or_repeated_remote_controls_are_rejected(self) -> None:
         invalid_arguments = (
+            (
+                "--since-seconds",
+                "60",
+                "--probe-timeout-seconds",
+                "0",
+            ),
             (
                 "--since-seconds",
                 "01",
@@ -1827,43 +1833,6 @@ time.sleep(30)
         self.assertEqual(current_utc_result["outcome"], "exited")
         self.assertEqual(current_utc_result["exit_code"], 0)
         self.assertEqual(residue, [])
-
-    def test_zero_probe_timeout_disables_only_that_probe_timeout(self) -> None:
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            fake_bin = root / "bin"
-            fake_bin.mkdir()
-            self.write_successful_node_probe_commands(fake_bin)
-            hostname = fake_bin / "hostname"
-            hostname.write_text(
-                f"""#!{sys.executable}
-import time
-time.sleep(1.1)
-print("hostname after delay")
-""",
-                encoding="utf-8",
-            )
-            hostname.chmod(0o755)
-            environment = os.environ.copy()
-            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
-
-            completed = self.run_remote_collector(
-                "--since-seconds",
-                "60",
-                "--probe-timeout-seconds",
-                "0",
-                environment=environment,
-            )
-            _, probe_stdout, probe_stderr, result = self.read_hostname_capture(
-                completed.stdout, root
-            )
-
-        self.assertEqual(completed.returncode, 0)
-        self.assertEqual(probe_stdout, b"hostname after delay\n")
-        self.assertEqual(probe_stderr, b"")
-        self.assertEqual(result["outcome"], "exited")
-        self.assertEqual(result["exit_code"], 0)
-        self.assertIsNone(result["error"])
 
     def test_failed_probe_does_not_stop_the_next_fixed_probe(self) -> None:
         with TemporaryDirectory() as directory:

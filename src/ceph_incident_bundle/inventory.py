@@ -349,8 +349,6 @@ def _duration_seconds(
     *,
     problems: list[str],
 ) -> int:
-    if value == "0":
-        return 0
     match = re.fullmatch(r"([1-9][0-9]*)([a-z])", value, re.ASCII)
     if match is None or match.group(2) not in units:
         problems.append(f"invalid {key} '{value}'")
@@ -358,9 +356,6 @@ def _duration_seconds(
     try:
         magnitude = int(match.group(1))
         seconds = magnitude * _SECONDS_PER_UNIT[match.group(2)]
-        # Downstream controls use canonical decimal seconds.  Form that value
-        # here so CPython's integer digit limit cannot fail after startup.
-        str(seconds)
     except ValueError:
         problems.append(f"invalid {key} '{value}'")
         return 0

@@ -502,13 +502,13 @@ url =
     def test_valid_duration_overrides_are_converted_to_seconds(self) -> None:
         inventory_bytes = b"""\
 [common]
-probe_timeout = 0
+probe_timeout = 3h
 ssh_connect_timeout = 2m
 [nodes]
 node = node.example
 [prometheus]
 query_step = 1w
-request_timeout = 0
+request_timeout = 4m
 """
         with TemporaryDirectory() as directory:
             path = Path(directory) / "inventory.ini"
@@ -516,10 +516,54 @@ request_timeout = 0
 
             inventory = load_inventory(path)
 
-        self.assertEqual(inventory.probe_timeout_seconds, 0)
+        self.assertEqual(inventory.probe_timeout_seconds, 10800)
         self.assertEqual(inventory.ssh_connect_timeout_seconds, 120)
         self.assertEqual(inventory.query_step, "1w")
-        self.assertEqual(inventory.request_timeout_seconds, 0)
+        self.assertEqual(inventory.request_timeout_seconds, 240)
+
+    def test_zero_inventory_durations_are_rejected(self) -> None:
+        inventory_bytes = b"""\
+[common]
+probe_timeout = 0
+ssh_connect_timeout = 0
+[nodes]
+node = node.example
+[prometheus]
+request_timeout = 0
+"""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertEqual(
+            caught.exception.problems,
+            (
+                "invalid probe_timeout '0'",
+                "invalid ssh_connect_timeout '0'",
+                "invalid request_timeout '0'",
+            ),
+        )
+
+    def test_probe_timeout_accepts_values_wider_than_signed_64_bit(self) -> None:
+        inventory_bytes = b"""\
+[common]
+probe_timeout = 9223372036854775808m
+[nodes]
+node = node.example
+"""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            inventory = load_inventory(path)
+
+        self.assertEqual(
+            inventory.probe_timeout_seconds,
+            553402322211286548480,
+        )
 
     def test_enormous_duration_is_a_focused_inventory_rejection(self) -> None:
         enormous = "9" * 5000
@@ -566,7 +610,7 @@ request_timeout = 0
         )
 
     def test_ssh_connect_timeout_accepts_openssh_boundaries(self) -> None:
-        boundaries = (("0", 0), ("2147483647s", 2147483647))
+        boundaries = (("1s", 1), ("2147483647s", 2147483647))
         for value, expected_seconds in boundaries:
             with self.subTest(value=value), TemporaryDirectory() as directory:
                 path = Path(directory) / "inventory.ini"

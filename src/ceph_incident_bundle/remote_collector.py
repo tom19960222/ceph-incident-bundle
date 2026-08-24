@@ -805,15 +805,13 @@ def _parse_arguments() -> argparse.Namespace:
     ):
         parser.error("each fixed Remote Node Collector switch may appear only once")
     arguments = parser.parse_args()
-    if arguments.since_seconds <= 0:
-        parser.error("since seconds must be positive")
     if not _fits_process_wait_timeout(arguments.probe_timeout_seconds):
         parser.error("probe timeout exceeds the supported range")
     return arguments
 
 
 def _canonical_seconds(value: str) -> int:
-    if re.fullmatch(r"0|[1-9][0-9]*", value, re.ASCII) is None:
+    if re.fullmatch(r"[1-9][0-9]*", value, re.ASCII) is None:
         raise argparse.ArgumentTypeError(
             "control values must use canonical ASCII decimal seconds"
         )
