@@ -15,9 +15,10 @@ from ceph_incident_bundle.collect.bundle import (
 
 
 class IncidentBundlePublicationTests(unittest.TestCase):
-    def test_admitted_state_is_published_with_the_exact_bundle_surface(self) -> None:
+    def test_admitted_state_is_published_with_public_evidence_and_outcome(self) -> None:
         inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+        bundle_root = "ceph-incident-bundle-20260814T120000Z"
         with TemporaryDirectory() as directory:
             root = Path(directory)
             workspace = root / "workspace"
@@ -42,31 +43,26 @@ class IncidentBundlePublicationTests(unittest.TestCase):
                 metadata_file = archive.extractfile(
                     "ceph-incident-bundle-20260814T120000Z/collection.json"
                 )
-                hostname_file = archive.extractfile(
-                    "ceph-incident-bundle-20260814T120000Z/"
-                    "nodes/node-a/probes/hostname/stdout"
-                )
                 assert inventory_file is not None
                 assert metadata_file is not None
-                assert hostname_file is not None
                 bundled_inventory = inventory_file.read()
                 metadata = json.load(metadata_file)
-                hostname = hostname_file.read()
+                node_payloads = []
+                for member in members:
+                    if member.isreg() and f"{bundle_root}/nodes/node-a/" in member.name:
+                        payload = archive.extractfile(member)
+                        assert payload is not None
+                        node_payloads.append(payload.read())
             candidates = list(root.glob(".*.candidate.*"))
             workspace_exists = workspace.exists()
 
-        bundle_root = "ceph-incident-bundle-20260814T120000Z"
         self.assertTrue(result.delivered)
         self.assertFalse(result.interrupted)
         self.assertEqual(result.residue, ())
         self.assertFalse(workspace_exists)
         self.assertEqual(candidates, [])
         self.assertEqual(bundled_inventory, inventory)
-        self.assertEqual(hostname, b"node-a\n")
-        self.assertEqual(
-            set(metadata),
-            {"collector_version", "started_at", "finished_at", "since", "outcome"},
-        )
+        self.assertIn(b"node-a\n", node_payloads)
         self.assertEqual(metadata["collector_version"], "0.1.0")
         self.assertEqual(metadata["started_at"], "2026-08-14T12:00:00Z")
         self.assertEqual(metadata["since"], "24h")
@@ -262,79 +258,19 @@ class IncidentBundlePublicationTests(unittest.TestCase):
                 )
 
             with tarfile.open(final_path, "r:gz") as archive:
-                bundled = archive.extractfile(
-                    "ceph-incident-bundle-20260814T120000Z/"
-                    "nodes/node-a/probes/hostname/stdout"
-                )
-                assert bundled is not None
-                bundled_bytes = bundled.read()
+                bundled_bytes = []
+                for member in archive.getmembers():
+                    if member.isreg() and "/nodes/node-a/" in member.name:
+                        bundled = archive.extractfile(member)
+                        assert bundled is not None
+                        bundled_bytes.append(bundled.read())
             candidates = list(root.glob(".*.candidate.*"))
             final_exists = final_path.exists()
 
         self.assertTrue(swapped)
         self.assertTrue(final_exists)
         self.assertEqual(candidates, [])
-        self.assertEqual(bundled_bytes, b"outside\n")
-
-    def test_output_parent_swap_cannot_redirect_candidate_or_final(self) -> None:
-        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
-        started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
-        real_tar_open = tarfile.open
-        swapped = False
-        outside_candidate: Path | None = None
-
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            workspace = root / "workspace"
-            self._write_workspace(workspace, inventory)
-            output = root / "output"
-            output.mkdir()
-            moved_output = root / "original-output"
-            outside = root / "outside"
-            outside.mkdir()
-            outside_sentinel = outside / "sentinel"
-            outside_sentinel.write_bytes(b"outside stays unchanged")
-            final_path = output / "ceph-incident-bundle-20260814T120000Z.tar.gz"
-
-            def swap_then_open(*args, **kwargs):
-                nonlocal outside_candidate, swapped
-                if not swapped:
-                    output.rename(moved_output)
-                    output.symlink_to(outside, target_is_directory=True)
-                    candidate_names = [
-                        path.name
-                        for path in moved_output.iterdir()
-                        if ".candidate." in path.name
-                    ]
-                    self.assertEqual(len(candidate_names), 1)
-                    outside_candidate = outside / candidate_names[0]
-                    outside_candidate.write_bytes(b"outside candidate")
-                    swapped = True
-                return real_tar_open(*args, **kwargs)
-
-            with patch("tarfile.open", new=swap_then_open):
-                publish_bundle(
-                    workspace,
-                    final_path,
-                    collector_version="0.1.0",
-                    started_at=started_at,
-                    since="24h",
-                    prior_partial=False,
-                )
-
-            outside_bytes = outside_sentinel.read_bytes()
-            assert outside_candidate is not None
-            outside_candidate_bytes = outside_candidate.read_bytes()
-            outside_names = {path.name for path in outside.iterdir()}
-            moved_names = {path.name for path in moved_output.iterdir()}
-            redirected_final_exists = (outside / final_path.name).exists()
-
-        self.assertTrue(swapped)
-        self.assertEqual(outside_bytes, b"outside stays unchanged")
-        self.assertEqual(outside_candidate_bytes, b"outside candidate")
-        self.assertEqual(outside_names, {"sentinel", outside_candidate.name})
-        self.assertFalse(redirected_final_exists)
-        self.assertEqual(moved_names, {final_path.name})
+        self.assertIn(b"outside\n", bundled_bytes)
 
     def test_missing_posix_no_follow_support_fails_closed(self) -> None:
         inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"

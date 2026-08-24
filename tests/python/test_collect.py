@@ -121,14 +121,13 @@ class TopLevelCollectionTests(unittest.TestCase):
         )
 
     def test_late_candidate_cleanup_residue_preserves_delivered_bundle(self) -> None:
-        real_unlink = os.unlink
+        real_unlink = Path.unlink
 
-        def refuse_candidate_unlink(path, *args, **kwargs) -> None:
-            if ".candidate." in os.fspath(path):
+        def refuse_candidate_unlink(path: Path, *args, **kwargs) -> None:
+            if ".candidate." in path.name:
                 raise OSError("injected retained candidate")
             real_unlink(path, *args, **kwargs)
 
-        supported_dir_fd = os.supports_dir_fd | {refuse_candidate_unlink}
         with TemporaryDirectory() as directory:
             root = Path(directory)
             inventory = root / "inventory.ini"
@@ -138,12 +137,8 @@ class TopLevelCollectionTests(unittest.TestCase):
             with (
                 patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
                 patch(
-                    "ceph_incident_bundle.collect.bundle.os.unlink",
+                    "ceph_incident_bundle.collect.bundle.Path.unlink",
                     new=refuse_candidate_unlink,
-                ),
-                patch(
-                    "ceph_incident_bundle.collect.bundle.os.supports_dir_fd",
-                    supported_dir_fd,
                 ),
                 redirect_stdout(stdout),
                 redirect_stderr(stderr),

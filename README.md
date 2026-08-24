@@ -68,7 +68,8 @@ Ceph、Kubernetes 與 Prometheus observation 不會偷偷擴張 SSH target 清�
 但已完成的 evidence 仍被保留。Startup rejection 或工作機錯誤導致沒有 bundle 時，
 stdout 為空、exit 非 0，stderr 會提供 diagnosis。
 
-Ctrl-C 不交付 bundle，完成可做的 cleanup 後 exit 130。
+Ctrl-C 若發生在 publication 前，不交付 bundle，完成可做的 cleanup 後 exit 130；若發生在
+publication 後，則保留已交付的 bundle 並回報中斷。
 
 Bundle 保存 Inventory Snapshot、collection context 與各個已 admit source 的 Raw Evidence。
 Probe 的原始 stdout/stderr、Prometheus response 與相應的 collector facts 會保持可區分；

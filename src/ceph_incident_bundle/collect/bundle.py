@@ -86,13 +86,11 @@ def publish_bundle(
     workspace = Path(workspace)
     final_path = Path(final_path)
     candidate: Path | None = None
-    candidate_name: str | None = None
     published = False
     residue: list[str] = []
     cleanup_problem: str | None = None
     workspace_cleanup_attempted = False
     workspace_descriptor: int | None = None
-    output_descriptor: int | None = None
     entries: list[_ArchiveEntry] = []
     try:
         _require_posix_file_protection()
@@ -106,89 +104,62 @@ def publish_bundle(
         finally:
             os.close(workspace_parent_descriptor)
         bundle_root = _validate_lifecycle_paths(workspace, final_path, started_at)
-        output_descriptor = _open_output_directory(final_path.parent)
-        _require_final_absent_at(output_descriptor, final_path)
         _validated_entries(workspace_descriptor, bundle_root, entries)
-        descriptor, candidate_name, candidate = _create_private_candidate(
-            output_descriptor, final_path
-        )
-        candidate_anchor: int | None = None
-        try:
-            with os.fdopen(descriptor, "wb") as candidate_file:
-                with tarfile.open(fileobj=candidate_file, mode="w:gz") as archive:
-                    for archive_name, source, is_directory in entries:
-                        _add_validated_entry(
-                            archive,
-                            workspace,
-                            archive_name,
-                            source,
-                            is_directory,
-                            started_at,
-                        )
-                    # Close workspace-backed inputs before removing the exact
-                    # invocation-created workspace.  Residue determines whether
-                    # delivery is complete or partial.
-                    workspace_close_problem = _close_workspace_input(
-                        workspace_descriptor
-                    )
-                    workspace_descriptor = None
-                    cleanup_problem = cleanup_owned_workspace(workspace)
-                    workspace_cleanup_attempted = True
-                    if workspace_close_problem is not None:
-                        raise BundlePublicationError(workspace_close_problem)
-                    metadata = {
-                        "collector_version": collector_version,
-                        "started_at": _rfc3339(started_at),
-                        "finished_at": _rfc3339(datetime.now(timezone.utc)),
-                        "since": since,
-                        "outcome": "partial"
-                        if prior_partial or cleanup_problem is not None
-                        else "complete",
-                    }
-                    _add_bytes(
+        descriptor, candidate = _create_private_candidate(final_path)
+        with os.fdopen(descriptor, "wb") as candidate_file:
+            with tarfile.open(fileobj=candidate_file, mode="w:gz") as archive:
+                for archive_name, source, is_directory in entries:
+                    _add_validated_entry(
                         archive,
-                        f"{bundle_root}/collection.json",
-                        (
-                            json.dumps(
-                                metadata, sort_keys=True, separators=(",", ":")
-                            )
-                            + "\n"
-                        ).encode("utf-8"),
+                        workspace,
+                        archive_name,
+                        source,
+                        is_directory,
                         started_at,
                     )
-                candidate_file.flush()
-                os.fsync(candidate_file.fileno())
-                candidate_anchor = os.dup(candidate_file.fileno())
-            assert candidate_anchor is not None
-            # Python 3.10 has no read-only umask query.  Use the most restrictive
-            # value during this brief lookup, then restore the process setting even
-            # if the calculation is interrupted.
-            current_umask = os.umask(0o777)
-            try:
-                published_mode = 0o666 & ~current_umask
-            finally:
-                os.umask(current_umask)
-            # The candidate remains private while bytes are written.  Only this
-            # complete, closed stream receives its ordinary mode before the final
-            # no-replace hard link makes the inode visible under the published name.
-            os.fchmod(candidate_anchor, published_mode)
-            os.fsync(candidate_anchor)
+                # Close workspace-backed inputs before removing the exact
+                # invocation-created workspace.  Residue determines whether
+                # delivery is complete or partial.
+                workspace_close_problem = _close_workspace_input(workspace_descriptor)
+                workspace_descriptor = None
+                cleanup_problem = cleanup_owned_workspace(workspace)
+                workspace_cleanup_attempted = True
+                if workspace_close_problem is not None:
+                    raise BundlePublicationError(workspace_close_problem)
+                metadata = {
+                    "collector_version": collector_version,
+                    "started_at": _rfc3339(started_at),
+                    "finished_at": _rfc3339(datetime.now(timezone.utc)),
+                    "since": since,
+                    "outcome": "partial"
+                    if prior_partial or cleanup_problem is not None
+                    else "complete",
+                }
+                _add_bytes(
+                    archive,
+                    f"{bundle_root}/collection.json",
+                    (
+                        json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+                        + "\n"
+                    ).encode("utf-8"),
+                    started_at,
+                )
+            candidate_file.flush()
+            os.fsync(candidate_file.fileno())
+        # Python 3.10 has no read-only umask query.  Use the most restrictive
+        # value during this brief lookup, then restore the process setting even
+        # if the calculation is interrupted.
+        current_umask = os.umask(0o777)
+        try:
+            published_mode = 0o666 & ~current_umask
         finally:
-            if candidate_anchor is not None:
-                anchor_to_close = candidate_anchor
-                candidate_anchor = None
-                os.close(anchor_to_close)
-        os.link(
-            candidate_name,
-            final_path.name,
-            src_dir_fd=output_descriptor,
-            dst_dir_fd=output_descriptor,
-            follow_symlinks=False,
-        )
+            os.umask(current_umask)
+        # The candidate is private while written and closed before its ordinary
+        # mode is set and the no-replace hard link publishes it atomically.
+        candidate.chmod(published_mode)
+        os.link(candidate, final_path)
         published = True
-        candidate_cleanup_problem = _remove_candidate_at(
-            output_descriptor, candidate_name, candidate
-        )
+        candidate_cleanup_problem = _remove_candidate(candidate)
         if candidate_cleanup_problem is not None:
             residue.append(candidate_cleanup_problem)
         if cleanup_problem is not None:
@@ -204,14 +175,8 @@ def publish_bundle(
             if workspace_close_problem is not None:
                 residue.append(workspace_close_problem)
             workspace_descriptor = None
-        if (
-            candidate is not None
-            and candidate_name is not None
-            and output_descriptor is not None
-        ):
-            candidate_cleanup_problem = _remove_candidate_at(
-                output_descriptor, candidate_name, candidate
-            )
+        if candidate is not None:
+            candidate_cleanup_problem = _remove_candidate(candidate)
             if candidate_cleanup_problem is not None:
                 residue.append(candidate_cleanup_problem)
         state = (
@@ -229,14 +194,8 @@ def publish_bundle(
             workspace_close_problem = _close_workspace_input(workspace_descriptor)
             workspace_descriptor = None
         candidate_cleanup_problem = None
-        if (
-            candidate is not None
-            and candidate_name is not None
-            and output_descriptor is not None
-        ):
-            candidate_cleanup_problem = _remove_candidate_at(
-                output_descriptor, candidate_name, candidate
-            )
+        if candidate is not None:
+            candidate_cleanup_problem = _remove_candidate(candidate)
         message = str(error)
         if workspace_close_problem:
             message = f"{message}; {workspace_close_problem}"
@@ -245,17 +204,6 @@ def publish_bundle(
         if cleanup_problem:
             message = f"{message}; {cleanup_problem}"
         raise BundlePublicationError(message) from error
-    finally:
-        if output_descriptor is not None:
-            try:
-                os.close(output_descriptor)
-            except (OSError, KeyboardInterrupt):
-                # This descriptor owns no evidence bytes or filesystem object.
-                # Once the final hard link is visible, a close report cannot turn
-                # actual delivery into nondelivery or rewrite final metadata.  On
-                # earlier failures, workspace/candidate cleanup above has already
-                # handled every path owned by the invocation.
-                pass
 
 
 def _validate_lifecycle_paths(
@@ -557,9 +505,6 @@ def _require_posix_file_protection() -> None:
         or os.open not in os.supports_dir_fd
         or os.stat not in os.supports_dir_fd
         or os.stat not in os.supports_follow_symlinks
-        or os.link not in os.supports_dir_fd
-        or os.link not in os.supports_follow_symlinks
-        or os.unlink not in os.supports_dir_fd
         or os.listdir not in os.supports_fd
     ):
         raise BundlePublicationError(
@@ -567,64 +512,18 @@ def _require_posix_file_protection() -> None:
         )
 
 
-def _open_output_directory(output_directory: Path) -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    try:
-        descriptor = os.open(output_directory, flags)
-    except OSError as error:
-        raise BundlePublicationError(
-            f"cannot pin final destination parent without following links: {error}"
-        ) from error
-    try:
-        facts = os.fstat(descriptor)
-    except OSError as error:
-        os.close(descriptor)
-        raise BundlePublicationError(
-            f"cannot inspect pinned final destination parent: {error}"
-        ) from error
-    if not stat.S_ISDIR(facts.st_mode):
-        os.close(descriptor)
-        raise BundlePublicationError(
-            "final destination parent must be an ordinary directory"
-        )
-    return descriptor
-
-
-def _require_final_absent_at(
-    output_descriptor: int, final_path: Path
-) -> None:
-    _require_safe_component(final_path.name)
-    try:
-        os.stat(
-            final_path.name,
-            dir_fd=output_descriptor,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        raise BundlePublicationError(
-            f"cannot inspect final destination {final_path}: {error}"
-        ) from error
-    raise BundlePublicationError(f"final destination already exists: {final_path}")
-
-
-def _create_private_candidate(
-    output_descriptor: int, final_path: Path
-) -> tuple[int, str, Path]:
+def _create_private_candidate(final_path: Path) -> tuple[int, Path]:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     flags |= getattr(os, "O_CLOEXEC", 0)
     for _attempt in range(100):
-        candidate_name = (
+        candidate = final_path.parent / (
             f".{final_path.name}.candidate.{secrets.token_hex(16)}"
         )
         try:
             descriptor = os.open(
-                candidate_name,
+                candidate,
                 flags,
                 0o600,
-                dir_fd=output_descriptor,
             )
         except FileExistsError:
             continue
@@ -632,7 +531,7 @@ def _create_private_candidate(
             raise BundlePublicationError(
                 f"cannot create private Incident Bundle candidate: {error}"
             ) from error
-        return descriptor, candidate_name, final_path.parent / candidate_name
+        return descriptor, candidate
     raise BundlePublicationError(
         "cannot choose a unique private Incident Bundle candidate name"
     )
@@ -828,17 +727,15 @@ def _add_bytes(
     archive.addfile(member, io.BytesIO(contents))
 
 
-def _remove_candidate_at(
-    output_descriptor: int, candidate_name: str, candidate_path: Path
-) -> str | None:
+def _remove_candidate(candidate: Path) -> str | None:
     try:
-        os.unlink(candidate_name, dir_fd=output_descriptor)
+        candidate.unlink()
     except FileNotFoundError:
         return None
     except OSError as error:
         return (
             "cannot remove private Incident Bundle candidate "
-            f"{candidate_path}: {error}"
+            f"{candidate}: {error}"
         )
     return None
 
