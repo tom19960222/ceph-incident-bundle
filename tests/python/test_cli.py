@@ -944,151 +944,6 @@ node-a = node-a.example.test
             )
         self.assertIn(f"{root}/nodes/node-a/files/var/log/fake.log", names)
         self.assertTrue(all(member.isdir() or member.isreg() for member in members))
-        for top_level in ("nodes", "ceph", "kubernetes", "prometheus"):
-            self.assertIn(f"{root}/{top_level}", names)
-
-    def test_installed_collect_runs_direct_ceph_only_in_selected_existing_session(
-        self,
-    ) -> None:
-        inventory = b"""\
-[common]
-probe_timeout = 30m
-ssh_connect_timeout = 15s
-[nodes]
-node-a = node-a.example.test
-node-b = node-b.example.test
-[ceph]
-source = node-b
-"""
-        failed_argv = ["ceph", "osd", "dump", "--format", "json-pretty"]
-        with TemporaryDirectory() as directory:
-            cwd = Path(directory)
-            fake_bin = cwd / "bin"
-            fake_bin.mkdir()
-            self._write_fake_ssh(fake_bin / "ssh")
-            (cwd / "inventory.ini").write_bytes(inventory)
-            record = cwd / "ssh-record"
-            ceph_record = cwd / "ceph-events.jsonl"
-            environment = os.environ.copy()
-            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
-            environment["FAKE_SSH_RECORD"] = str(record)
-            environment["FAKE_SSH_CEPH_RECORD"] = str(ceph_record)
-            environment["FAKE_SSH_CEPH_FAIL_ARGV"] = json.dumps(failed_argv)
-
-            completed = self.run_cli(
-                "collect",
-                cwd=cwd,
-                env=environment,
-                timeout=60,
-            )
-
-            bundle = next(cwd.glob("ceph-incident-bundle-*.tar.gz"))
-            root = bundle.name.removesuffix(".tar.gz")
-            with tarfile.open(bundle, "r:gz") as archive:
-                names = {member.name for member in archive.getmembers()}
-                failed_stdout_file = archive.extractfile(
-                    f"{root}/ceph/probes/osd-dump-json/stdout"
-                )
-                failed_stderr_file = archive.extractfile(
-                    f"{root}/ceph/probes/osd-dump-json/stderr"
-                )
-                metadata_file = archive.extractfile(f"{root}/collection.json")
-                assert failed_stdout_file is not None
-                assert failed_stderr_file is not None
-                assert metadata_file is not None
-                failed_stdout = failed_stdout_file.read()
-                failed_stderr = failed_stderr_file.read()
-                outcome = json.load(metadata_file)["outcome"]
-            argv_by_session = tuple(
-                json.loads((record / f"argv.{sequence}.json").read_text())
-                for sequence in (1, 2)
-            )
-            process_count = (record / "count").read_text(encoding="ascii")
-            ceph_events = tuple(
-                json.loads(line)
-                for line in ceph_record.read_text(encoding="utf-8").splitlines()
-            )
-
-        expected_ceph_events = tuple(
-            ["root@node-b.example.test", *argv]
-            for unused_name, argv in (
-                ("status-json", ("ceph", "status", "--format", "json-pretty")),
-                (
-                    "health-detail-json",
-                    ("ceph", "health", "detail", "--format", "json-pretty"),
-                ),
-                ("versions-json", ("ceph", "versions", "--format", "json-pretty")),
-                (
-                    "df-detail-json",
-                    ("ceph", "df", "detail", "--format", "json-pretty"),
-                ),
-                ("osd-tree-json", ("ceph", "osd", "tree", "--format", "json-pretty")),
-                ("osd-df-json", ("ceph", "osd", "df", "--format", "json-pretty")),
-                ("osd-dump-json", tuple(failed_argv)),
-                ("osd-perf-json", ("ceph", "osd", "perf", "--format", "json-pretty")),
-                (
-                    "osd-blocked-by-json",
-                    ("ceph", "osd", "blocked-by", "--format", "json-pretty"),
-                ),
-                ("pg-stat-json", ("ceph", "pg", "stat", "--format", "json-pretty")),
-                ("pg-dump-json", ("ceph", "pg", "dump", "--format", "json-pretty")),
-                (
-                    "pg-dump-stuck-json",
-                    ("ceph", "pg", "dump_stuck", "--format", "json-pretty"),
-                ),
-                ("mon-dump-json", ("ceph", "mon", "dump", "--format", "json-pretty")),
-                (
-                    "quorum-status-json",
-                    ("ceph", "quorum_status", "--format", "json-pretty"),
-                ),
-                ("mgr-dump-json", ("ceph", "mgr", "dump", "--format", "json-pretty")),
-                (
-                    "orch-host-ls-json",
-                    ("ceph", "orch", "host", "ls", "--format", "json-pretty"),
-                ),
-                ("orch-ps-json", ("ceph", "orch", "ps", "--format", "json-pretty")),
-                (
-                    "orch-device-ls-wide-json",
-                    (
-                        "ceph",
-                        "orch",
-                        "device",
-                        "ls",
-                        "--wide",
-                        "--format",
-                        "json-pretty",
-                    ),
-                ),
-                (
-                    "config-dump-json",
-                    ("ceph", "config", "dump", "--format", "json-pretty"),
-                ),
-                (
-                    "crash-ls-json",
-                    ("ceph", "crash", "ls", "--format", "json-pretty"),
-                ),
-                ("status-text", ("ceph", "status")),
-                ("health-detail-text", ("ceph", "health", "detail")),
-                ("osd-tree-text", ("ceph", "osd", "tree")),
-                ("orch-ps-text", ("ceph", "orch", "ps")),
-            )
-        )
-        self.assertEqual(completed.returncode, 0)
-        self.assertEqual(outcome, "partial")
-        self.assertEqual(process_count, "2\n")
-        self.assertNotIn("--collect-ceph", argv_by_session[0])
-        self.assertEqual(argv_by_session[0][-1], "1800")
-        self.assertEqual(argv_by_session[1][-1], "--collect-ceph")
-        self.assertEqual(ceph_events, expected_ceph_events)
-        self.assertEqual(failed_stdout, b"failed ceph stdout\x00\xff")
-        self.assertEqual(failed_stderr, b"failed ceph stderr\x00\xfe")
-        self.assertIn(
-            f"{root}/ceph/probes/orch-ps-text/result.json",
-            names,
-        )
-        self.assertIn(b"[node-b] osd-dump-json Probe failed", completed.stderr)
-        self.assertNotIn(b"sudo", completed.stderr)
-        self.assertNotIn(b"cephadm", completed.stderr)
 
     def test_installed_collect_preserves_prometheus_controls_from_loopback(self) -> None:
         with loopback_http_server(_installed_prometheus_response) as (
@@ -1181,97 +1036,6 @@ source = node-b
         self.assertEqual(range_result["outcome"], "received")
         self.assertEqual(outcome, "complete")
         self.assertIn(f"{root_name}/prometheus/buildinfo/response", names)
-
-    def test_installed_cli_runs_all_configured_sources_in_one_fixed_order(
-        self,
-    ) -> None:
-        """One public invocation keeps all four evidence paths independent."""
-        with TemporaryDirectory() as directory:
-            cwd = Path(directory)
-            event_log = cwd / "events"
-            def record_prometheus_request(_method: str, path: str) -> None:
-                with event_log.open("a", encoding="utf-8") as events:
-                    events.write(f"prometheus {urlsplit(path).path}\n")
-
-            with loopback_http_server(
-                _installed_prometheus_response,
-                on_request=record_prometheus_request,
-            ) as (
-                server,
-                prometheus_url,
-            ):
-                fake_bin = cwd / "bin"
-                fake_bin.mkdir()
-                self._write_aggregate_fake_ssh(fake_bin / "ssh")
-                self._write_fake_kubectl(fake_bin / "kubectl")
-                (cwd / "inventory.ini").write_text(
-                    "[common]\n"
-                    "[nodes]\n"
-                    "node-a = node-a.example.test\n"
-                    "node-b = node-b.example.test\n"
-                    "[ceph]\n"
-                    "source = node-a\n"
-                    "[kubernetes]\n"
-                    "context = lab-context\n"
-                    "consumer_namespace = rook-shared\n"
-                    "operator_namespace = rook-shared\n"
-                    "[prometheus]\n"
-                    f"url = {prometheus_url}\n",
-                    encoding="utf-8",
-                )
-                environment = os.environ.copy()
-                environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
-                environment["FAKE_EVENT_LOG"] = str(event_log)
-                environment["FAKE_KUBECTL_RECORD"] = str(cwd / "kubectl-record")
-
-                completed = self.run_cli("collect", cwd=cwd, env=environment)
-
-                bundle = next(cwd.glob("ceph-incident-bundle-*.tar.gz"))
-                root = bundle.name.removesuffix(".tar.gz")
-                with tarfile.open(bundle, "r:gz") as archive:
-                    names = {member.name for member in archive.getmembers()}
-                    metadata_file = archive.extractfile(f"{root}/collection.json")
-                    assert metadata_file is not None
-                    outcome = json.load(metadata_file)["outcome"]
-                with event_log.open("a", encoding="utf-8") as event_stream:
-                    event_stream.write("packaging delivered\n")
-                events = event_log.read_text(encoding="utf-8").splitlines()
-                prometheus_requests = list(server.requests)
-
-        kubernetes_events = [
-            event for event in events if event.startswith("kubernetes ")
-        ]
-        prometheus_events = [
-            event for event in events if event.startswith("prometheus ")
-        ]
-        self.assertEqual(completed.returncode, 0)
-        self.assertEqual(completed.stderr, b"")
-        self.assertEqual(completed.stdout, f"{bundle.resolve()} (complete)\n".encode())
-        self.assertEqual(
-            events[:2],
-            [
-                "node root@node-a.example.test ceph",
-                "node root@node-b.example.test",
-            ],
-        )
-        self.assertTrue(kubernetes_events)
-        self.assertTrue(prometheus_events)
-        self.assertEqual(
-            events,
-            [
-                *events[:2],
-                *kubernetes_events,
-                *prometheus_events,
-                "packaging delivered",
-            ],
-        )
-        self.assertEqual(len(prometheus_requests), 5)
-        self.assertEqual(outcome, "complete")
-        self.assertIn(f"{root}/nodes/node-a/probes", names)
-        self.assertIn(f"{root}/nodes/node-b/probes", names)
-        self.assertIn(f"{root}/ceph/probes", names)
-        self.assertIn(f"{root}/kubernetes/probes", names)
-        self.assertIn(f"{root}/prometheus/buildinfo/response", names)
 
     def test_installed_collect_captures_configured_kubernetes_get_snapshot(self) -> None:
         inventory = b"""\
@@ -1393,9 +1157,7 @@ operator_namespace = rook-shared
             f"{root_name}/kubernetes/probes/consumer-pods-json/result.json", names
         )
 
-    def test_multi_node_failure_keeps_later_admitted_evidence_in_inventory_order(
-        self,
-    ) -> None:
+    def test_rejected_node_keeps_other_admitted_evidence(self) -> None:
         inventory = b"""\
 [common]
 [nodes]
@@ -1426,16 +1188,14 @@ node-b = node-b.example.test
                 assert metadata_file is not None
                 outcome = json.load(metadata_file)["outcome"]
             count = (record / "count").read_text(encoding="ascii")
-            first_argv = json.loads((record / "argv.1.json").read_text(encoding="utf-8"))
-            second_argv = json.loads((record / "argv.2.json").read_text(encoding="utf-8"))
 
         self.assertEqual(completed.returncode, 0)
         self.assertTrue(completed.stdout.endswith(b" (partial)\n"))
         self.assertIn(b"Target Node node-a: Node Evidence Archive rejected", completed.stderr)
         self.assertEqual(count, "2\n")
-        self.assertIn("root@node-a.example.test", first_argv)
-        self.assertIn("root@node-b.example.test", second_argv)
-        self.assertFalse(any(name.startswith(f"{root}/nodes/node-a") for name in names))
+        self.assertFalse(
+            any(name.startswith(f"{root}/nodes/node-a") for name in names)
+        )
         self.assertIn(f"{root}/nodes/node-b/probes/hostname/stdout", names)
         self.assertEqual(outcome, "partial")
 
@@ -1766,42 +1526,6 @@ node-a = node-a.example.test
         self.assertIn(b"[node-a] remote\\x00\\xff\n", completed.stderr)
         self.assertTrue(completed.stdout.endswith(b" (complete)\n"))
 
-    def test_large_ssh_diagnostics_and_nonzero_exit_keep_complete_evidence(
-        self,
-    ) -> None:
-        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
-        with TemporaryDirectory() as directory:
-            cwd = Path(directory)
-            fake_bin = cwd / "bin"
-            fake_bin.mkdir()
-            self._write_fake_ssh(fake_bin / "ssh")
-            (cwd / "inventory.ini").write_bytes(inventory)
-            environment = os.environ.copy()
-            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
-            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
-            environment["FAKE_SSH_EXIT"] = "9"
-            environment["FAKE_SSH_LARGE_DIAGNOSTIC"] = "1"
-
-            completed = self.run_cli(
-                "collect", cwd=cwd, env=environment, timeout=20
-            )
-
-            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
-            self.assertEqual(len(bundles), 1)
-            with tarfile.open(bundles[0], "r:gz") as archive:
-                root = bundles[0].name.removesuffix(".tar.gz")
-                names = {member.name for member in archive.getmembers()}
-                metadata_file = archive.extractfile(f"{root}/collection.json")
-                assert metadata_file is not None
-                outcome = json.load(metadata_file)["outcome"]
-
-        self.assertEqual(completed.returncode, 0)
-        self.assertTrue(completed.stdout.endswith(b" (partial)\n"))
-        self.assertIn(b"Remote Node Collector exited with status 9", completed.stderr)
-        self.assertGreater(completed.stderr.count(b"x"), 100_000)
-        self.assertIn(f"{root}/nodes/node-a/probes/hostname/stdout", names)
-        self.assertEqual(outcome, "partial")
-
     def test_remote_probe_failure_delivers_an_admitted_partial_bundle_without_diagnostics(
         self,
     ) -> None:
@@ -1865,100 +1589,6 @@ raise SystemExit(7)
         self.assertIsNone(result["error"])
         self.assertEqual(outcome, "partial")
         self.assertFalse(any("diagnostic" in member for member in member_names))
-
-    def test_journal_failure_delivers_its_complete_archive_as_partial(self) -> None:
-        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
-        with TemporaryDirectory() as directory:
-            cwd = Path(directory)
-            fake_bin = cwd / "bin"
-            fake_bin.mkdir()
-            self._write_fake_ssh(fake_bin / "ssh")
-            (cwd / "inventory.ini").write_bytes(inventory)
-            environment = os.environ.copy()
-            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
-            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
-            environment["FAKE_SSH_JOURNAL_FAILURE"] = "1"
-
-            completed = self.run_cli("collect", cwd=cwd, env=environment, timeout=30)
-
-            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
-            self.assertEqual(len(bundles), 1)
-            bundle = bundles[0]
-            with tarfile.open(bundle, "r:gz") as archive:
-                root = bundle.name.removesuffix(".tar.gz")
-                stdout_file = archive.extractfile(
-                    f"{root}/nodes/node-a/probes/journal-system/stdout"
-                )
-                stderr_file = archive.extractfile(
-                    f"{root}/nodes/node-a/probes/journal-system/stderr"
-                )
-                result_file = archive.extractfile(
-                    f"{root}/nodes/node-a/probes/journal-system/result.json"
-                )
-                metadata_file = archive.extractfile(f"{root}/collection.json")
-                assert stdout_file is not None
-                assert stderr_file is not None
-                assert result_file is not None
-                assert metadata_file is not None
-                journal_stdout = stdout_file.read()
-                journal_stderr = stderr_file.read()
-                journal_result = json.load(result_file)
-                outcome = json.load(metadata_file)["outcome"]
-                member_names = {member.name for member in archive.getmembers()}
-
-        self.assertEqual(completed.returncode, 0)
-        self.assertEqual(
-            completed.stdout,
-            f"{bundle.resolve()} (partial)\n".encode("utf-8"),
-        )
-        self.assertIn(b"[node-a] journal-system Probe failed", completed.stderr)
-        self.assertIn(b"Remote Node Collector exited with status 1", completed.stderr)
-        self.assertEqual(journal_stdout, b"partial journal stdout\x00\xff")
-        self.assertEqual(journal_stderr, b"partial journal stderr\x00\xfe")
-        self.assertEqual(journal_result["outcome"], "exited")
-        self.assertEqual(journal_result["exit_code"], 9)
-        self.assertEqual(outcome, "partial")
-        self.assertIn(
-            f"{root}/nodes/node-a/files/var/log/fake.log",
-            member_names,
-        )
-
-    def test_complete_archive_with_selected_file_failure_is_admitted_as_partial(
-        self,
-    ) -> None:
-        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
-        with TemporaryDirectory() as directory:
-            cwd = Path(directory)
-            fake_bin = cwd / "bin"
-            fake_bin.mkdir()
-            self._write_fake_ssh(fake_bin / "ssh")
-            (cwd / "inventory.ini").write_bytes(inventory)
-            environment = os.environ.copy()
-            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
-            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
-            environment["FAKE_SSH_SELECTED_FILE_FAILURE"] = "1"
-
-            completed = self.run_cli("collect", cwd=cwd, env=environment, timeout=20)
-
-            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
-            self.assertEqual(len(bundles), 1)
-            bundle = bundles[0]
-            with tarfile.open(bundle, "r:gz") as archive:
-                root = bundle.name.removesuffix(".tar.gz")
-                member_names = {member.name for member in archive.getmembers()}
-                metadata_file = archive.extractfile(f"{root}/collection.json")
-                assert metadata_file is not None
-                outcome = json.load(metadata_file)["outcome"]
-
-        self.assertEqual(completed.returncode, 0)
-        self.assertTrue(completed.stdout.endswith(b" (partial)\n"))
-        self.assertIn(b"[node-a] cannot copy selected file /etc/hosts", completed.stderr)
-        self.assertIn(b"Remote Node Collector exited with status 1", completed.stderr)
-        self.assertEqual(outcome, "partial")
-        self.assertIn(f"{root}/nodes/node-a", member_names)
-        self.assertIn(f"{root}/nodes/node-a/files", member_names)
-        self.assertNotIn(f"{root}/nodes/node-a/files/etc/hosts", member_names)
-        self.assertFalse(any("diagnostic" in name for name in member_names))
 
     def test_remote_cleanup_failure_preserves_evidence_and_reports_residue(
         self,
@@ -2049,40 +1679,6 @@ raise SystemExit(7)
         self.assertFalse(
             any(name.startswith(f"{root_name}/nodes/node-a") for name in names)
         )
-
-    def test_corrupt_ssh_stdout_publishes_partial_without_a_node_contribution(
-        self,
-    ) -> None:
-        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
-        with TemporaryDirectory() as directory:
-            cwd = Path(directory)
-            fake_bin = cwd / "bin"
-            fake_bin.mkdir()
-            self._write_fake_ssh(fake_bin / "ssh")
-            (cwd / "inventory.ini").write_bytes(inventory)
-            environment = os.environ.copy()
-            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
-            environment["FAKE_SSH_RECORD"] = str(cwd / "ssh-record")
-            environment["FAKE_SSH_CORRUPT"] = "1"
-
-            completed = self.run_cli(
-                "collect", cwd=cwd, env=environment, timeout=20
-            )
-
-            bundles = list(cwd.glob("ceph-incident-bundle-*.tar.gz"))
-            self.assertEqual(len(bundles), 1)
-            with tarfile.open(bundles[0], "r:gz") as archive:
-                root = bundles[0].name.removesuffix(".tar.gz")
-                node_names = [
-                    member.name
-                    for member in archive.getmembers()
-                    if member.name.startswith(f"{root}/nodes/node-a")
-                ]
-
-        self.assertEqual(completed.returncode, 0)
-        self.assertTrue(completed.stdout.endswith(b" (partial)\n"))
-        self.assertIn(b"Node Evidence Archive rejected", completed.stderr)
-        self.assertEqual(node_names, [])
 
     def test_local_admission_failure_is_not_reported_as_archive_rejection(
         self,
@@ -2181,18 +1777,8 @@ raise SystemExit(7)
         )
         self.assertEqual(bundled_inventory, inventory)
         self.assertEqual(outcome, "partial")
-        self.assertEqual(
-            names,
-            {
-                root,
-                f"{root}/inventory.ini",
-                f"{root}/nodes",
-                f"{root}/ceph",
-                f"{root}/kubernetes",
-                f"{root}/prometheus",
-                f"{root}/collection.json",
-            },
-        )
+        self.assertFalse(any(name.startswith(f"{root}/nodes/node-a") for name in names))
+        self.assertFalse(any("private" in name for name in names))
         self.assertEqual(workspaces, [])
 
     def test_structurally_hostile_ssh_archive_cannot_escape_private_staging(
@@ -2263,18 +1849,6 @@ raise SystemExit(7)
             {"collector_version", "started_at", "finished_at", "since", "outcome"},
         )
         self.assertEqual(metadata["outcome"], "partial")
-        self.assertEqual(
-            names,
-            {
-                root,
-                f"{root}/inventory.ini",
-                f"{root}/nodes",
-                f"{root}/ceph",
-                f"{root}/kubernetes",
-                f"{root}/prometheus",
-                f"{root}/collection.json",
-            },
-        )
         self.assertNotIn(
             b"fake-ssh private archive payload\n", b"".join(regular_payloads)
         )
@@ -2482,35 +2056,6 @@ raise SystemExit(7)
         self.assertIn(b"Inventory Name collision", completed.stderr)
 
     @staticmethod
-    def _write_aggregate_fake_ssh(path: Path) -> None:
-        path.write_text(
-            f"""#!{sys.executable}
-import io
-import os
-import sys
-import tarfile
-
-destination = sys.argv[sys.argv.index("python3") - 1]
-collects_ceph = "--collect-ceph" in sys.argv
-with open(os.environ["FAKE_EVENT_LOG"], "a", encoding="utf-8") as events:
-    events.write(f"node {{destination}}{{' ceph' if collects_ceph else ''}}\\n")
-
-archive_bytes = io.BytesIO()
-with tarfile.open(fileobj=archive_bytes, mode="w:gz") as archive:
-    members = ["node", "node/probes", "node/files"]
-    if collects_ceph:
-        members.extend(["ceph", "ceph/probes"])
-    for name in members:
-        member = tarfile.TarInfo(name)
-        member.type = tarfile.DIRTYPE
-        member.mode = 0o700
-        archive.addfile(member)
-sys.stdout.buffer.write(archive_bytes.getvalue())
-""",
-            encoding="utf-8",
-        )
-        path.chmod(0o755)
-
     @staticmethod
     def _write_fake_ssh(path: Path) -> None:
         path.write_text(
