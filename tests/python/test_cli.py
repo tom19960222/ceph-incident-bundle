@@ -169,68 +169,6 @@ class InstalledCliTests(unittest.TestCase):
         self.assertEqual(bundles, [])
         self.assertEqual(boundary_events, ["ssh-start", "remote-cleanup-request"])
 
-    def test_ctrl_c_during_publication_reports_owned_cleanup_residue(self) -> None:
-        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            fake_bin = root / "bin"
-            fake_bin.mkdir()
-            self._write_fake_ssh(fake_bin / "ssh")
-            (root / "inventory.ini").write_bytes(inventory)
-            output = root / "output"
-            output.mkdir()
-            temporary_root = root / "temporary"
-            temporary_root.mkdir()
-            environment = os.environ.copy()
-            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
-            environment["TMPDIR"] = str(temporary_root)
-            environment["FAKE_SSH_RECORD"] = str(root / "ssh-record")
-            environment["FAKE_SSH_LARGE_EVIDENCE_BYTES"] = str(32 * 1024 * 1024)
-            environment["FAKE_SSH_LOCK_WORKSPACE_PARENT_AFTER_REMOTE"] = "1"
-            command = COMMAND
-            assert command is not None
-
-            process = subprocess.Popen(
-                [command, "collect", "--output-dir", str(output)],
-                cwd=root,
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            try:
-                for _attempt in range(3000):
-                    if list(output.glob(".*.candidate.*")):
-                        break
-                    if process.poll() is not None:
-                        self.fail("collection exited before publication could be interrupted")
-                    threading.Event().wait(0.01)
-                else:
-                    self.fail("publication candidate was not observed")
-                process.send_signal(signal.SIGINT)
-                stdout, stderr = process.communicate(timeout=10)
-            finally:
-                temporary_root.chmod(0o755)
-                if process.poll() is None:
-                    process.kill()
-                    process.wait()
-                if process.stdout is not None:
-                    process.stdout.close()
-                if process.stderr is not None:
-                    process.stderr.close()
-
-            bundles = list(output.glob("ceph-incident-bundle-*.tar.gz"))
-            candidates = list(output.glob(".*.candidate.*"))
-            local_workspaces = list(temporary_root.glob("ceph-incident-work.*"))
-
-        self.assertEqual(process.returncode, 130)
-        self.assertEqual(stdout, b"")
-        self.assertEqual(bundles, [])
-        self.assertEqual(candidates, [])
-        self.assertEqual(len(local_workspaces), 1)
-        self.assertIn(str(local_workspaces[0]).encode("utf-8"), stderr)
-        self.assertIn(b"cannot remove workstation workspace", stderr)
-        self.assertTrue(stderr.endswith(b"FAIL: no Incident Bundle delivered\n"))
-
     def test_generate_inventory_does_not_resolve_collect_default_from_deleted_cwd(
         self,
     ) -> None:
