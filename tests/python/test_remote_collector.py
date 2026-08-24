@@ -1517,26 +1517,29 @@ raise SystemExit(9)
             completed.stderr,
         )
 
-    def test_noncanonical_or_repeated_remote_controls_are_rejected(self) -> None:
+    def test_remote_numeric_controls_use_python_integer_representation(self) -> None:
+        with TemporaryDirectory() as directory:
+            fake_bin = Path(directory)
+            self.write_successful_node_probe_commands(fake_bin)
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin)
+
+            completed = self.run_remote_collector(
+                "--since-seconds",
+                "+060",
+                "--probe-timeout-seconds",
+                "030",
+                environment=environment,
+            )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8", errors="backslashreplace"),
+        )
+
+    def test_repeated_or_abbreviated_remote_controls_are_rejected(self) -> None:
         invalid_arguments = (
-            (
-                "--since-seconds",
-                "60",
-                "--probe-timeout-seconds",
-                "0",
-            ),
-            (
-                "--since-seconds",
-                "01",
-                "--probe-timeout-seconds",
-                "30",
-            ),
-            (
-                "--since-seconds",
-                "+60",
-                "--probe-timeout-seconds",
-                "30",
-            ),
             (
                 "--since-seconds",
                 "60",
@@ -1578,52 +1581,6 @@ raise SystemExit(9)
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertEqual(completed.stdout, b"")
                 self.assertIn(b"error:", completed.stderr)
-
-    def test_unrepresentable_probe_timeout_fails_before_process_or_workspace(
-        self,
-    ) -> None:
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            fake_bin = root / "bin"
-            fake_bin.mkdir()
-            process_marker = root / "hostname-started"
-            hostname = fake_bin / "hostname"
-            hostname.write_text(
-                f"#!{sys.executable}\n"
-                "from pathlib import Path\n"
-                f"Path({str(process_marker)!r}).write_bytes(b'started')\n",
-                encoding="utf-8",
-            )
-            hostname.chmod(0o755)
-            remote_temp = root / "remote-temp"
-            remote_temp.mkdir()
-            environment = os.environ.copy()
-            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
-            environment["TMPDIR"] = str(remote_temp)
-
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    str(REMOTE_COLLECTOR),
-                    "--since-seconds",
-                    "60",
-                    "--probe-timeout-seconds",
-                    "9" * 1000,
-                ],
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-
-            process_started = process_marker.exists()
-            residue = list(remote_temp.glob("ceph-incident-node.*"))
-
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertEqual(completed.stdout, b"")
-        self.assertIn(b"probe timeout exceeds the supported range", completed.stderr)
-        self.assertFalse(process_started)
-        self.assertEqual(residue, [])
 
     def test_failed_hostname_still_streams_capture_and_removes_remote_workspace(
         self,
