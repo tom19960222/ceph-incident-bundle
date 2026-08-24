@@ -85,6 +85,43 @@ EXPECTED_CEPH_PROBES = (
 
 
 class RemoteCollectorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._default_fixture = TemporaryDirectory()
+        fixture_root = Path(self._default_fixture.name)
+        (fixture_root / "var/log").mkdir(parents=True)
+        (fixture_root / "sitecustomize.py").write_text(
+            """import os
+
+_source_root = os.environ["REMOTE_COLLECTOR_FILE_FIXTURES"]
+_original_open = os.open
+
+def open(path, flags, *args, **kwargs):
+    if os.fspath(path) == "/" and flags & os.O_DIRECTORY:
+        return _original_open(_source_root, flags, *args, **kwargs)
+    return _original_open(path, flags, *args, **kwargs)
+
+os.open = open
+""",
+            encoding="utf-8",
+        )
+        self._previous_pythonpath = os.environ.get("PYTHONPATH")
+        self._previous_fixture_root = os.environ.get(
+            "REMOTE_COLLECTOR_FILE_FIXTURES"
+        )
+        os.environ["PYTHONPATH"] = str(fixture_root)
+        os.environ["REMOTE_COLLECTOR_FILE_FIXTURES"] = str(fixture_root)
+
+    def tearDown(self) -> None:
+        for name, value in (
+            ("PYTHONPATH", self._previous_pythonpath),
+            ("REMOTE_COLLECTOR_FILE_FIXTURES", self._previous_fixture_root),
+        ):
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        self._default_fixture.cleanup()
+
     @staticmethod
     def write_successful_node_probe_commands(directory: Path) -> None:
         script = f"""#!{sys.executable}
@@ -464,24 +501,22 @@ Path.open = path_open
             )
 
     @staticmethod
-    def expected_node_probe_catalog() -> tuple[tuple[str, str, tuple[str, ...]], ...]:
+    def expected_node_probe_catalog() -> tuple[tuple[str, tuple[str, ...]], ...]:
         """Return the hand-written #90 contract, independent of production."""
         expected = (
-            ("hostname", "node", ("hostname",)),
+            ("hostname", ("hostname",)),
             (
                 "current-utc",
-                "node",
                 ("date", "-u", "+%Y-%m-%dT%H:%M:%SZ"),
             ),
-            ("uname", "node", ("uname", "-a")),
-            ("uptime", "node", ("uptime",)),
-            ("lscpu", "node", ("lscpu",)),
-            ("free", "node", ("free", "-h")),
-            ("processes", "node", ("ps", "auxfww")),
-            ("df", "node", ("df", "-hT")),
+            ("uname", ("uname", "-a")),
+            ("uptime", ("uptime",)),
+            ("lscpu", ("lscpu",)),
+            ("free", ("free", "-h")),
+            ("processes", ("ps", "auxfww")),
+            ("df", ("df", "-hT")),
             (
                 "lsblk",
-                "node",
                 (
                     "lsblk",
                     "-a",
@@ -489,36 +524,32 @@ Path.open = path_open
                     "NAME,MAJ:MIN,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,SERIAL",
                 ),
             ),
-            ("iostat", "node", ("iostat", "-xz", "1", "3")),
-            ("pvs", "node", ("pvs", "--noheadings", "--separator", " ")),
-            ("vgs", "node", ("vgs", "--noheadings", "--separator", " ")),
-            ("lvs", "node", ("lvs", "--noheadings", "--separator", " ")),
-            ("ip-address", "node", ("ip", "addr", "show")),
-            ("dmesg", "node", ("dmesg", "-T")),
+            ("iostat", ("iostat", "-xz", "1", "3")),
+            ("pvs", ("pvs", "--noheadings", "--separator", " ")),
+            ("vgs", ("vgs", "--noheadings", "--separator", " ")),
+            ("lvs", ("lvs", "--noheadings", "--separator", " ")),
+            ("ip-address", ("ip", "addr", "show")),
+            ("dmesg", ("dmesg", "-T")),
             (
                 "failed-units",
-                "node",
                 ("systemctl", "--failed", "--no-pager", "--plain"),
             ),
-            ("podman-ps", "node", ("podman", "ps", "-a")),
-            ("docker-ps", "node", ("docker", "ps", "-a")),
-            ("chronyc-tracking", "node", ("chronyc", "tracking")),
-            ("chronyc-sources", "node", ("chronyc", "sources", "-v")),
-            ("ntpq-peers", "node", ("ntpq", "-pn")),
-            ("timedatectl-status", "node", ("timedatectl", "status")),
+            ("podman-ps", ("podman", "ps", "-a")),
+            ("docker-ps", ("docker", "ps", "-a")),
+            ("chronyc-tracking", ("chronyc", "tracking")),
+            ("chronyc-sources", ("chronyc", "sources", "-v")),
+            ("ntpq-peers", ("ntpq", "-pn")),
+            ("timedatectl-status", ("timedatectl", "status")),
             (
                 "timedatectl-show-timesync",
-                "node",
                 ("timedatectl", "show-timesync", "--all"),
             ),
             (
                 "timedatectl-timesync-status",
-                "node",
                 ("timedatectl", "timesync-status"),
             ),
             (
                 "systemd-timesyncd-status",
-                "node",
                 (
                     "systemctl",
                     "status",
@@ -626,7 +657,7 @@ Path.open = path_open
 
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(
-            executed[:-1], tuple(argv for _, _, argv in expected_catalog)
+            executed[:-1], tuple(argv for _, argv in expected_catalog)
         )
         self.assertEqual(executed[-1][0], "journalctl")
         self.assertEqual(executed[-1][1], "--since")
@@ -635,7 +666,7 @@ Path.open = path_open
             executed[-1][3:],
             ("--no-pager", "--utc", "--output=short-iso-precise"),
         )
-        for probe_name, _, _ in expected_catalog:
+        for probe_name, _ in expected_catalog:
             self.assertIn(f"node/probes/{probe_name}/result.json", member_names)
         self.assertIn("node/probes/journal-system/result.json", member_names)
 

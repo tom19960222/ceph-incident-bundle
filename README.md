@@ -54,8 +54,8 @@ Collector 使用 `BatchMode=yes`、不開 pseudo-terminal，也不會自動接�
 
 ## Inventory
 
-Inventory 是 INI，不是可執行 shell。`[common]` 與非空的 `[nodes]` 必填；V1 只接受
-`ssh_user = root`。`[ceph] source` 必須指向一個已列出的 inventory name。
+Inventory 是 INI，不是可執行 shell。`[common]` 與非空的 `[nodes]` 必填；每個 node 都以
+固定的 `root@ssh_address` 連線。`[ceph] source` 必須指向一個已列出的 inventory name。
 Kubernetes 沒有明確 `context` 就完全不收；Prometheus 沒有明確 `url` 也完全不連線。
 
 `inventory_name` 會直接成為 bundle 裡 `nodes/<inventory_name>/` 的目錄名稱；

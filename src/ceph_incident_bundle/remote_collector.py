@@ -34,7 +34,7 @@ def _epoch_nanoseconds(moment: datetime) -> int:
 
 
 class Probe(NamedTuple):
-    """One built-in Evidence Probe: a stable name, area, and fixed argv.
+    """One built-in Evidence Probe: a stable name and fixed argv.
 
     The Remote Node Collector is a self-contained payload streamed unchanged
     over SSH, so this catalog is declared here rather than imported from the
@@ -42,28 +42,25 @@ class Probe(NamedTuple):
     """
 
     name: str
-    area: str
     argv: tuple[str, ...]
 
 
 # Fixed Target Node Probe catalog. See docs/python-rewrite-spec.md's "Fixed
 # Target Node Probe catalog" table for the built-in name/argv contract.
 NODE_PROBE_CATALOG: tuple[Probe, ...] = (
-    Probe(name="hostname", area="node", argv=("hostname",)),
+    Probe(name="hostname", argv=("hostname",)),
     Probe(
         name="current-utc",
-        area="node",
         argv=("date", "-u", "+%Y-%m-%dT%H:%M:%SZ"),
     ),
-    Probe(name="uname", area="node", argv=("uname", "-a")),
-    Probe(name="uptime", area="node", argv=("uptime",)),
-    Probe(name="lscpu", area="node", argv=("lscpu",)),
-    Probe(name="free", area="node", argv=("free", "-h")),
-    Probe(name="processes", area="node", argv=("ps", "auxfww")),
-    Probe(name="df", area="node", argv=("df", "-hT")),
+    Probe(name="uname", argv=("uname", "-a")),
+    Probe(name="uptime", argv=("uptime",)),
+    Probe(name="lscpu", argv=("lscpu",)),
+    Probe(name="free", argv=("free", "-h")),
+    Probe(name="processes", argv=("ps", "auxfww")),
+    Probe(name="df", argv=("df", "-hT")),
     Probe(
         name="lsblk",
-        area="node",
         argv=(
             "lsblk",
             "-a",
@@ -71,36 +68,32 @@ NODE_PROBE_CATALOG: tuple[Probe, ...] = (
             "NAME,MAJ:MIN,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,SERIAL",
         ),
     ),
-    Probe(name="iostat", area="node", argv=("iostat", "-xz", "1", "3")),
-    Probe(name="pvs", area="node", argv=("pvs", "--noheadings", "--separator", " ")),
-    Probe(name="vgs", area="node", argv=("vgs", "--noheadings", "--separator", " ")),
-    Probe(name="lvs", area="node", argv=("lvs", "--noheadings", "--separator", " ")),
-    Probe(name="ip-address", area="node", argv=("ip", "addr", "show")),
-    Probe(name="dmesg", area="node", argv=("dmesg", "-T")),
+    Probe(name="iostat", argv=("iostat", "-xz", "1", "3")),
+    Probe(name="pvs", argv=("pvs", "--noheadings", "--separator", " ")),
+    Probe(name="vgs", argv=("vgs", "--noheadings", "--separator", " ")),
+    Probe(name="lvs", argv=("lvs", "--noheadings", "--separator", " ")),
+    Probe(name="ip-address", argv=("ip", "addr", "show")),
+    Probe(name="dmesg", argv=("dmesg", "-T")),
     Probe(
         name="failed-units",
-        area="node",
         argv=("systemctl", "--failed", "--no-pager", "--plain"),
     ),
-    Probe(name="podman-ps", area="node", argv=("podman", "ps", "-a")),
-    Probe(name="docker-ps", area="node", argv=("docker", "ps", "-a")),
-    Probe(name="chronyc-tracking", area="node", argv=("chronyc", "tracking")),
-    Probe(name="chronyc-sources", area="node", argv=("chronyc", "sources", "-v")),
-    Probe(name="ntpq-peers", area="node", argv=("ntpq", "-pn")),
-    Probe(name="timedatectl-status", area="node", argv=("timedatectl", "status")),
+    Probe(name="podman-ps", argv=("podman", "ps", "-a")),
+    Probe(name="docker-ps", argv=("docker", "ps", "-a")),
+    Probe(name="chronyc-tracking", argv=("chronyc", "tracking")),
+    Probe(name="chronyc-sources", argv=("chronyc", "sources", "-v")),
+    Probe(name="ntpq-peers", argv=("ntpq", "-pn")),
+    Probe(name="timedatectl-status", argv=("timedatectl", "status")),
     Probe(
         name="timedatectl-show-timesync",
-        area="node",
         argv=("timedatectl", "show-timesync", "--all"),
     ),
     Probe(
         name="timedatectl-timesync-status",
-        area="node",
         argv=("timedatectl", "timesync-status"),
     ),
     Probe(
         name="systemd-timesyncd-status",
-        area="node",
         argv=(
             "systemctl",
             "status",
@@ -116,90 +109,73 @@ NODE_PROBE_CATALOG: tuple[Probe, ...] = (
 # because the Remote Node Collector invokes each command directly, without a
 # shell, runner discovery, privilege escalation, or fallback path.
 CEPH_PROBE_CATALOG: tuple[Probe, ...] = (
-    Probe("status-json", "ceph", ("ceph", "status", "--format", "json-pretty")),
+    Probe("status-json", ("ceph", "status", "--format", "json-pretty")),
     Probe(
         "health-detail-json",
-        "ceph",
         ("ceph", "health", "detail", "--format", "json-pretty"),
     ),
     Probe(
         "versions-json",
-        "ceph",
         ("ceph", "versions", "--format", "json-pretty"),
     ),
     Probe(
         "df-detail-json",
-        "ceph",
         ("ceph", "df", "detail", "--format", "json-pretty"),
     ),
     Probe(
         "osd-tree-json",
-        "ceph",
         ("ceph", "osd", "tree", "--format", "json-pretty"),
     ),
     Probe(
         "osd-df-json",
-        "ceph",
         ("ceph", "osd", "df", "--format", "json-pretty"),
     ),
     Probe(
         "osd-dump-json",
-        "ceph",
         ("ceph", "osd", "dump", "--format", "json-pretty"),
     ),
     Probe(
         "osd-perf-json",
-        "ceph",
         ("ceph", "osd", "perf", "--format", "json-pretty"),
     ),
     Probe(
         "osd-blocked-by-json",
-        "ceph",
         ("ceph", "osd", "blocked-by", "--format", "json-pretty"),
     ),
     Probe(
         "pg-stat-json",
-        "ceph",
         ("ceph", "pg", "stat", "--format", "json-pretty"),
     ),
     Probe(
         "pg-dump-json",
-        "ceph",
         ("ceph", "pg", "dump", "--format", "json-pretty"),
     ),
     Probe(
         "pg-dump-stuck-json",
-        "ceph",
         ("ceph", "pg", "dump_stuck", "--format", "json-pretty"),
     ),
     Probe(
         "mon-dump-json",
-        "ceph",
         ("ceph", "mon", "dump", "--format", "json-pretty"),
     ),
     Probe(
         "quorum-status-json",
-        "ceph",
         ("ceph", "quorum_status", "--format", "json-pretty"),
     ),
     Probe(
         "mgr-dump-json",
-        "ceph",
         ("ceph", "mgr", "dump", "--format", "json-pretty"),
     ),
     Probe(
         "orch-host-ls-json",
-        "ceph",
         ("ceph", "orch", "host", "ls", "--format", "json-pretty"),
     ),
     Probe(
         "orch-ps-json",
-        "ceph",
         ("ceph", "orch", "ps", "--format", "json-pretty"),
     ),
     Probe(
         "orch-device-ls-wide-json",
-        "ceph",
         (
             "ceph",
             "orch",
@@ -212,18 +188,16 @@ CEPH_PROBE_CATALOG: tuple[Probe, ...] = (
     ),
     Probe(
         "config-dump-json",
-        "ceph",
         ("ceph", "config", "dump", "--format", "json-pretty"),
     ),
     Probe(
         "crash-ls-json",
-        "ceph",
         ("ceph", "crash", "ls", "--format", "json-pretty"),
     ),
-    Probe("status-text", "ceph", ("ceph", "status")),
-    Probe("health-detail-text", "ceph", ("ceph", "health", "detail")),
-    Probe("osd-tree-text", "ceph", ("ceph", "osd", "tree")),
-    Probe("orch-ps-text", "ceph", ("ceph", "orch", "ps")),
+    Probe("status-text", ("ceph", "status")),
+    Probe("health-detail-text", ("ceph", "health", "detail")),
+    Probe("osd-tree-text", ("ceph", "osd", "tree")),
+    Probe("orch-ps-text", ("ceph", "orch", "ps")),
 )
 
 
@@ -471,11 +445,13 @@ def _copy_configuration_files(files_directory: Path) -> bool:
         ETC_CEPH_DIRECTORY,
         files_directory,
         lambda unused_name: True,
+        "node-local Ceph",
     ) and succeeded
     succeeded = _copy_regular_file_tree(
         VAR_LIB_CEPH_DIRECTORY,
         files_directory,
         _is_ceph_state_configuration_name,
+        "node-local Ceph",
     ) and succeeded
     return succeeded
 
@@ -488,13 +464,15 @@ def _copy_regular_file_tree(
     source_root: str,
     files_directory: Path,
     includes_basename: Callable[[str], bool],
+    source_kind: str,
+    minimum_mtime_ns: int | None = None,
 ) -> bool:
     """Copy selected regular files below one fixed root without following links."""
     try:
         directory_descriptor = _open_directory_without_links(source_root)
     except OSError as inspect_error:
         print(
-            f"cannot inspect node-local Ceph directory {source_root}: "
+            f"cannot inspect {source_kind} directory {source_root}: "
             f"{inspect_error}",
             file=sys.stderr,
         )
@@ -507,6 +485,8 @@ def _copy_regular_file_tree(
             source_root,
             files_directory,
             includes_basename,
+            source_kind,
+            minimum_mtime_ns,
         )
     finally:
         try:
@@ -520,6 +500,8 @@ def _copy_regular_file_directory(
     source_directory: str,
     files_directory: Path,
     includes_basename: Callable[[str], bool],
+    source_kind: str,
+    minimum_mtime_ns: int | None,
 ) -> bool:
     succeeded = True
     try:
@@ -527,7 +509,7 @@ def _copy_regular_file_directory(
             entries = tuple(sorted(scanner, key=lambda entry: entry.name))
     except OSError as inspect_error:
         print(
-            f"cannot inspect node-local Ceph directory {source_directory}: "
+            f"cannot inspect {source_kind} directory {source_directory}: "
             f"{inspect_error}",
             file=sys.stderr,
         )
@@ -541,7 +523,7 @@ def _copy_regular_file_directory(
             continue
         except OSError as inspect_error:
             print(
-                f"cannot inspect node-local Ceph source {source}: "
+                f"cannot inspect {source_kind} source {source}: "
                 f"{inspect_error}",
                 file=sys.stderr,
             )
@@ -549,11 +531,15 @@ def _copy_regular_file_directory(
             continue
 
         if stat.S_ISREG(inspected.st_mode):
-            if includes_basename(entry.name):
+            if includes_basename(entry.name) and (
+                minimum_mtime_ns is None
+                or inspected.st_mtime_ns >= minimum_mtime_ns
+            ):
                 copied = _copy_selected_file(
                     source,
                     files_directory,
                     was_selected=True,
+                    minimum_mtime_ns=minimum_mtime_ns,
                 )
                 succeeded = copied and succeeded
             continue
@@ -572,7 +558,7 @@ def _copy_regular_file_directory(
             ):
                 continue
             print(
-                f"cannot open node-local Ceph directory {source}: {open_error}",
+                f"cannot open {source_kind} directory {source}: {open_error}",
                 file=sys.stderr,
             )
             succeeded = False
@@ -585,7 +571,7 @@ def _copy_regular_file_directory(
             ):
                 continue
             print(
-                f"cannot open node-local Ceph directory {source}: {open_error}",
+                f"cannot open {source_kind} directory {source}: {open_error}",
                 file=sys.stderr,
             )
             succeeded = False
@@ -596,6 +582,8 @@ def _copy_regular_file_directory(
                 source,
                 files_directory,
                 includes_basename,
+                source_kind,
+                minimum_mtime_ns,
             )
             succeeded = copied and succeeded
         finally:
@@ -608,28 +596,13 @@ def _copy_regular_file_directory(
 
 def _copy_log_files(files_directory: Path, cutoff_epoch_ns: int) -> bool:
     """Copy every regular /var/log file selected by one node-local cutoff."""
-    try:
-        directory_descriptor = _open_directory_without_links(VAR_LOG_DIRECTORY)
-    except OSError as inspect_error:
-        print(
-            f"cannot inspect log directory {VAR_LOG_DIRECTORY}: {inspect_error}",
-            file=sys.stderr,
-        )
-        return False
-    if directory_descriptor is None:
-        return True
-    try:
-        return _copy_log_directory(
-            directory_descriptor,
-            VAR_LOG_DIRECTORY,
-            files_directory,
-            cutoff_epoch_ns,
-        )
-    finally:
-        try:
-            os.close(directory_descriptor)
-        except OSError:
-            pass
+    return _copy_regular_file_tree(
+        VAR_LOG_DIRECTORY,
+        files_directory,
+        lambda unused_name: True,
+        "log",
+        cutoff_epoch_ns,
+    )
 
 
 def _directory_became_an_omitted_object(
@@ -651,96 +624,6 @@ def _directory_became_an_omitted_object(
             return False
         return True
     return not stat.S_ISDIR(inspected.st_mode)
-
-
-def _copy_log_directory(
-    directory_descriptor: int,
-    source_directory: str,
-    files_directory: Path,
-    cutoff_epoch_ns: int,
-) -> bool:
-    succeeded = True
-    try:
-        with os.scandir(directory_descriptor) as scanner:
-            entries = tuple(sorted(scanner, key=lambda entry: entry.name))
-    except OSError as inspect_error:
-        print(
-            f"cannot inspect log directory {source_directory}: {inspect_error}",
-            file=sys.stderr,
-        )
-        return False
-
-    for entry in entries:
-        source = f"{source_directory}/{entry.name}"
-        try:
-            inspected = entry.stat(follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        except OSError as inspect_error:
-            print(
-                f"cannot inspect log source {source}: {inspect_error}",
-                file=sys.stderr,
-            )
-            succeeded = False
-            continue
-
-        if stat.S_ISREG(inspected.st_mode):
-            if inspected.st_mtime_ns >= cutoff_epoch_ns:
-                copied = _copy_selected_file(
-                    source,
-                    files_directory,
-                    was_selected=True,
-                    minimum_mtime_ns=cutoff_epoch_ns,
-                )
-                succeeded = copied and succeeded
-            continue
-        if not stat.S_ISDIR(inspected.st_mode):
-            continue
-
-        try:
-            child_descriptor = os.open(
-                entry.name,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=directory_descriptor,
-            )
-        except (FileNotFoundError, NotADirectoryError) as open_error:
-            if _directory_became_an_omitted_object(
-                directory_descriptor, entry.name
-            ):
-                continue
-            print(
-                f"cannot open log directory {source}: {open_error}",
-                file=sys.stderr,
-            )
-            succeeded = False
-            continue
-        except OSError as open_error:
-            if open_error.errno in (errno.ELOOP, errno.EPERM) and (
-                _directory_became_an_omitted_object(
-                    directory_descriptor, entry.name
-                )
-            ):
-                continue
-            print(
-                f"cannot open log directory {source}: {open_error}",
-                file=sys.stderr,
-            )
-            succeeded = False
-            continue
-        try:
-            copied = _copy_log_directory(
-                child_descriptor,
-                source,
-                files_directory,
-                cutoff_epoch_ns,
-            )
-            succeeded = copied and succeeded
-        finally:
-            try:
-                os.close(child_descriptor)
-            except OSError:
-                pass
-    return succeeded
 
 
 def _run_probe(probe: Probe, capture: Path, timeout_seconds: int) -> bool:
@@ -867,7 +750,6 @@ def _run_ceph_probes(probes_directory: Path, timeout_seconds: int) -> bool:
     for sequence, crash_id in enumerate(crash_ids, start=1):
         probe = Probe(
             name=f"crash-info-{sequence:06d}",
-            area="ceph",
             argv=("ceph", "crash", "info", crash_id),
         )
         probe_succeeded = _run_ceph_probe(
@@ -988,7 +870,6 @@ def main() -> int:
         )
         journal_probe = Probe(
             name="journal-system",
-            area="node",
             argv=(
                 "journalctl",
                 "--since",

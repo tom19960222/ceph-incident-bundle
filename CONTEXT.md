@@ -93,11 +93,11 @@ Two Node Inventory entries whose `inventory_name` values have the same portable 
 _Avoid_: Duplicate host, automatically renamed node
 
 **SSH Address (`ssh_address`)**:
-The hostname, IPv4 address, or IPv6 address on the right side of one `[nodes]` entry. Together with the common SSH user, it identifies the OpenSSH destination but never controls the node's evidence directory name.
+The hostname, IPv4 address, or IPv6 address on the right side of one `[nodes]` entry. Together with the fixed root SSH identity, it identifies the OpenSSH destination but never controls the node's evidence directory name.
 _Avoid_: Inventory Name, `user@host`, host-and-port string
 
 **Node Inventory**:
-A declarative file that defines one common SSH user, maps each `inventory_name` to a Target Node `ssh_address`, and may select one Target Node as the Ceph query source. The nodes present in this file are the Collection Scope.
+A declarative file that maps each `inventory_name` to a Target Node `ssh_address` and may select one Target Node as the Ceph query source. Every mapped address uses the fixed root SSH identity. The nodes present in this file are the Collection Scope.
 _Avoid_: Shell inventory, discovered targets
 
 **Inventory Snapshot**:

@@ -147,7 +147,7 @@ def collect_prometheus(
                 f"is malformed: {parse_problem}"
             )
             continue
-        metric_names_by_job.append((job_name, _deduplicate_metric_names(values)))
+        metric_names_by_job.append((job_name, tuple(dict.fromkeys(values))))
 
     metric_filter = re.compile(metrics_filter_regex)
     sequence = 0
@@ -382,11 +382,6 @@ def _promql_string(value: str) -> str:
             else:
                 escaped.append(f"\\U{codepoint:08x}")
     return "".join(escaped)
-
-
-def _deduplicate_metric_names(values: list[str]) -> tuple[str, ...]:
-    """Keep exact metric names once, in their Prometheus response order."""
-    return tuple(dict.fromkeys(values))
 
 
 def _request_error(error: Exception) -> dict[str, str]:

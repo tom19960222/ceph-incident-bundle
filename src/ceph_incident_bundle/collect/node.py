@@ -17,7 +17,6 @@ from .node_archive import ArchiveRejected, admit_archive
 def collect_node(
     node: TargetNode,
     *,
-    ssh_user: str,
     since_seconds: int,
     probe_timeout_seconds: int,
     ssh_connect_timeout_seconds: int,
@@ -42,7 +41,6 @@ def collect_node(
     source_path = Path(remote_collector.__file__)
     argv = _ssh_argv(
         node,
-        ssh_user=ssh_user,
         since_seconds=since_seconds,
         probe_timeout_seconds=probe_timeout_seconds,
         ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
@@ -163,7 +161,6 @@ def collect_node(
 def _ssh_argv(
     node: TargetNode,
     *,
-    ssh_user: str,
     since_seconds: int,
     probe_timeout_seconds: int,
     ssh_connect_timeout_seconds: int,
@@ -174,7 +171,7 @@ def _ssh_argv(
         argv.extend(["-o", f"ConnectTimeout={ssh_connect_timeout_seconds}"])
     argv.extend(
         [
-            f"{ssh_user}@{node.ssh_address}",
+            f"root@{node.ssh_address}",
             "python3",
             "-",
             "--since-seconds",

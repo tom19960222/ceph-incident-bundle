@@ -1,5 +1,3 @@
-from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -15,6 +13,7 @@ import unittest
 from urllib.parse import parse_qs, urlsplit
 
 from ceph_incident_bundle.inventory import draft_inventory
+from prometheus_test_support import loopback_http_server
 
 
 COMMAND = os.environ.get("CEPH_INCIDENT_BUNDLE_COMMAND")
@@ -40,53 +39,18 @@ KUBERNETES_PODS = {
 }
 
 
-class _InstalledPrometheusHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def do_GET(self) -> None:
-        server = self.server
-        assert isinstance(server, _InstalledPrometheusServer)
-        server.requests.append((self.command, self.path))
-        if server.event_log is not None:
-            with server.event_log.open("a", encoding="utf-8") as events:
-                events.write(f"prometheus {urlsplit(self.path).path}\n")
-        path = urlsplit(self.path).path
-        bodies = {
-            "/api/v1/status/buildinfo": b'{"status":"success","data":{"version":"3.0"}}',
-            "/api/v1/targets": b'{"status":"success","data":{"activeTargets":[]}}',
-            "/api/v1/label/job/values": b'{"status":"success","data":["other","node-exporter"]}',
-            "/api/v1/label/__name__/values": b'{"status":"success","data":["node_cpu_seconds_total"]}',
-            "/api/v1/query_range": b'{"status":"success","data":{"resultType":"matrix","result":[]}}',
-        }
-        body = bodies[path]
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format: str, *args: object) -> None:
-        pass
-
-
-class _InstalledPrometheusServer(ThreadingHTTPServer):
-    requests: list[tuple[str, str]]
-    event_log: Path | None
-
-
-@contextmanager
-def _installed_prometheus_server(event_log: Path | None = None):
-    server = _InstalledPrometheusServer(("127.0.0.1", 0), _InstalledPrometheusHandler)
-    server.requests = []
-    server.event_log = event_log
-    thread = threading.Thread(target=server.serve_forever)
-    thread.start()
-    try:
-        host, port = server.server_address
-        yield server, f"http://{host}:{port}"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join()
+def _installed_prometheus_response(
+    request_path: str,
+) -> tuple[int, list[tuple[float, bytes]], int | None, bool]:
+    bodies = {
+        "/api/v1/status/buildinfo": b'{"status":"success","data":{"version":"3.0"}}',
+        "/api/v1/targets": b'{"status":"success","data":{"activeTargets":[]}}',
+        "/api/v1/label/job/values": b'{"status":"success","data":["other","node-exporter"]}',
+        "/api/v1/label/__name__/values": b'{"status":"success","data":["node_cpu_seconds_total"]}',
+        "/api/v1/query_range": b'{"status":"success","data":{"resultType":"matrix","result":[]}}',
+    }
+    body = bodies[urlsplit(request_path).path]
+    return 200, [(0, body)], len(body), False
 
 
 def missing_username_without_a_home() -> str:
@@ -137,7 +101,7 @@ class InstalledCliTests(unittest.TestCase):
         self.assertEqual(console_script_shebang, f"#!{sys.executable}".encode("utf-8"))
 
     def test_ctrl_c_requests_remote_cleanup_and_delivers_no_bundle(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             root = Path(directory)
             fake_bin = root / "bin"
@@ -206,7 +170,7 @@ class InstalledCliTests(unittest.TestCase):
         self.assertEqual(boundary_events, ["ssh-start", "remote-cleanup-request"])
 
     def test_ctrl_c_during_publication_reports_owned_cleanup_residue(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             root = Path(directory)
             fake_bin = root / "bin"
@@ -328,7 +292,6 @@ os.execv(
     def test_default_output_contains_exact_generated_defaults(self) -> None:
         expected = b"""\
 [common]
-ssh_user = root
 probe_timeout = 30m
 ssh_connect_timeout = 15s
 
@@ -451,7 +414,6 @@ request_timeout = 5m
         hostile_timeout = "evil\x1b]2;spoofed\x07"
         inventory = (
             "[common]\n"
-            "ssh_user = root\n"
             f"probe_timeout = {hostile_timeout}\n"
             "[nodes]\n"
             "node-a = node-a.example\n"
@@ -504,6 +466,45 @@ raise SystemExit(99)
         self.assertFalse(process_started)
         self.assertEqual(workspaces, [])
         self.assertEqual(output_entries, [])
+
+    def test_legacy_ssh_user_is_rejected_before_workspace_or_ssh(self) -> None:
+        inventory = (
+            b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        )
+        with TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            (cwd / "inventory.ini").write_bytes(inventory)
+            fake_bin = cwd / "bin"
+            fake_bin.mkdir()
+            process_marker = cwd / "ssh-started"
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(process_marker)!r}).write_text("started", encoding="ascii")
+raise SystemExit(99)
+""",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o755)
+            temporary_root = cwd / "temporary"
+            temporary_root.mkdir()
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            environment["TMPDIR"] = str(temporary_root)
+
+            completed = self.run_cli("collect", cwd=cwd, env=environment)
+
+            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, b"")
+        self.assertIn(b"unknown key 'ssh_user' in [common]", completed.stderr)
+        self.assertTrue(
+            completed.stderr.endswith(b"FAIL: no Incident Bundle delivered\n")
+        )
+        self.assertFalse(process_marker.exists())
+        self.assertEqual(workspaces, [])
 
     def test_collect_unresolvable_inventory_user_rejects_before_activity(
         self,
@@ -584,7 +585,6 @@ raise SystemExit(99)
             inventory = cwd / "inventory.ini"
             inventory.write_text(
                 "[common]\n"
-                "ssh_user = root\n"
                 "probe_timeout = 30m\n"
                 "ssh_connect_timeout = 15s\n"
                 "[nodes]\n"
@@ -659,7 +659,6 @@ raise SystemExit(99)
                 inventory = cwd / "duration-boundary.ini"
                 inventory.write_text(
                     "[common]\n"
-                    "ssh_user = root\n"
                     f"ssh_connect_timeout = {timeout}\n"
                     "[nodes]\n"
                     "node = node.example\n",
@@ -711,7 +710,7 @@ raise SystemExit(99)
             self.assertEqual(workspace_residue, ())
 
     def test_enormous_since_is_rejected_before_workspace_or_ssh(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             cwd = Path(directory)
             inventory_path = cwd / "inventory.ini"
@@ -763,7 +762,7 @@ raise SystemExit(99)
     def test_unrenderable_normalized_since_is_rejected_before_activity(
         self,
     ) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         maximum_parseable_decimal = "9" * 4300
         evidence_window = f"{maximum_parseable_decimal}w"
         with TemporaryDirectory() as directory:
@@ -822,7 +821,6 @@ raise SystemExit(99)
     def test_collect_uses_one_ssh_and_delivers_one_complete_bundle(self) -> None:
         inventory = b"""\
 [common]
-ssh_user = root
 probe_timeout = 30m
 ssh_connect_timeout = 15s
 [nodes]
@@ -954,7 +952,6 @@ node-a = node-a.example.test
     ) -> None:
         inventory = b"""\
 [common]
-ssh_user = root
 probe_timeout = 30m
 ssh_connect_timeout = 15s
 [nodes]
@@ -1094,7 +1091,7 @@ source = node-b
         self.assertNotIn(b"cephadm", completed.stderr)
 
     def test_installed_collect_preserves_prometheus_controls_from_loopback(self) -> None:
-        with _installed_prometheus_server() as (
+        with loopback_http_server(_installed_prometheus_response) as (
             server,
             prometheus_url,
         ), TemporaryDirectory() as directory:
@@ -1104,7 +1101,6 @@ source = node-b
             self._write_fake_ssh(fake_bin / "ssh")
             inventory = (
                 "[common]\n"
-                "ssh_user = root\n"
                 "[nodes]\n"
                 "node-a = node-a.example.test\n"
                 "[prometheus]\n"
@@ -1193,7 +1189,14 @@ source = node-b
         with TemporaryDirectory() as directory:
             cwd = Path(directory)
             event_log = cwd / "events"
-            with _installed_prometheus_server(event_log) as (
+            def record_prometheus_request(_method: str, path: str) -> None:
+                with event_log.open("a", encoding="utf-8") as events:
+                    events.write(f"prometheus {urlsplit(path).path}\n")
+
+            with loopback_http_server(
+                _installed_prometheus_response,
+                on_request=record_prometheus_request,
+            ) as (
                 server,
                 prometheus_url,
             ):
@@ -1203,7 +1206,6 @@ source = node-b
                 self._write_fake_kubectl(fake_bin / "kubectl")
                 (cwd / "inventory.ini").write_text(
                     "[common]\n"
-                    "ssh_user = root\n"
                     "[nodes]\n"
                     "node-a = node-a.example.test\n"
                     "node-b = node-b.example.test\n"
@@ -1274,7 +1276,6 @@ source = node-b
     def test_installed_collect_captures_configured_kubernetes_get_snapshot(self) -> None:
         inventory = b"""\
 [common]
-ssh_user = root
 probe_timeout = 30m
 ssh_connect_timeout = 15s
 [nodes]
@@ -1397,7 +1398,6 @@ operator_namespace = rook-shared
     ) -> None:
         inventory = b"""\
 [common]
-ssh_user = root
 [nodes]
 node-a = node-a.example.test
 node-b = node-b.example.test
@@ -1444,7 +1444,6 @@ node-b = node-b.example.test
     ) -> None:
         inventory = b"""\
 [common]
-ssh_user = root
 [nodes]
 node-a = node-a.example.test
 """
@@ -1494,7 +1493,6 @@ node-a = node-a.example.test
     ) -> None:
         inventory = b"""\
 [common]
-ssh_user = root
 [nodes]
 node-a = node-a.example.test
 """
@@ -1562,7 +1560,6 @@ node-a = node-a.example.test
     ) -> None:
         inventory = b"""\
 [common]
-ssh_user = root
 [nodes]
 node-a = node-a.example.test
 """
@@ -1627,7 +1624,7 @@ node-a = node-a.example.test
         self.assertEqual(len(workspaces), 1)
 
     def test_workstation_cleanup_residue_is_a_truthful_partial_delivery(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             root = Path(directory)
             fake_bin = root / "bin"
@@ -1684,7 +1681,6 @@ node-a = node-a.example.test
     ) -> None:
         inventory = b"""\
 [common]
-ssh_user = root
 [nodes]
 node-a = node-a.example.test
 """
@@ -1750,7 +1746,7 @@ node-a = node-a.example.test
     def test_ssh_diagnostics_are_incrementally_escaped_without_losing_delivery(
         self,
     ) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             cwd = Path(directory)
             fake_bin = cwd / "bin"
@@ -1773,7 +1769,7 @@ node-a = node-a.example.test
     def test_large_ssh_diagnostics_and_nonzero_exit_keep_complete_evidence(
         self,
     ) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             cwd = Path(directory)
             fake_bin = cwd / "bin"
@@ -1809,7 +1805,7 @@ node-a = node-a.example.test
     def test_remote_probe_failure_delivers_an_admitted_partial_bundle_without_diagnostics(
         self,
     ) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             cwd = Path(directory)
             fake_bin = cwd / "bin"
@@ -1871,7 +1867,7 @@ raise SystemExit(7)
         self.assertFalse(any("diagnostic" in member for member in member_names))
 
     def test_journal_failure_delivers_its_complete_archive_as_partial(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             cwd = Path(directory)
             fake_bin = cwd / "bin"
@@ -1930,7 +1926,7 @@ raise SystemExit(7)
     def test_complete_archive_with_selected_file_failure_is_admitted_as_partial(
         self,
     ) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             cwd = Path(directory)
             fake_bin = cwd / "bin"
@@ -1967,7 +1963,7 @@ raise SystemExit(7)
     def test_remote_cleanup_failure_preserves_evidence_and_reports_residue(
         self,
     ) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             root = Path(directory)
             fake_bin = root / "bin"
@@ -2019,7 +2015,7 @@ raise SystemExit(7)
         self.assertFalse(any("/private/" in name for name in names))
 
     def test_connection_failure_delivers_metadata_only_partial_bundle(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             root = Path(directory)
             fake_bin = root / "bin"
@@ -2057,7 +2053,7 @@ raise SystemExit(7)
     def test_corrupt_ssh_stdout_publishes_partial_without_a_node_contribution(
         self,
     ) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             cwd = Path(directory)
             fake_bin = cwd / "bin"
@@ -2091,7 +2087,7 @@ raise SystemExit(7)
     def test_local_admission_failure_is_not_reported_as_archive_rejection(
         self,
     ) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             cwd = Path(directory)
             fake_bin = cwd / "bin"
@@ -2140,7 +2136,7 @@ raise SystemExit(7)
     def test_truncated_genuine_ssh_archive_stays_private_and_delivers_partial(
         self,
     ) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             cwd = Path(directory)
             fake_bin = cwd / "bin"
@@ -2202,7 +2198,7 @@ raise SystemExit(7)
     def test_structurally_hostile_ssh_archive_cannot_escape_private_staging(
         self,
     ) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             cwd = Path(directory)
             fake_bin = cwd / "bin"
@@ -2287,7 +2283,7 @@ raise SystemExit(7)
     def test_hostile_archive_member_controls_are_escaped_on_standard_error(
         self,
     ) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         hostile_root = "evil\x1b]2;spoofed\x07"
         with TemporaryDirectory() as directory:
             cwd = Path(directory)
@@ -2342,7 +2338,7 @@ raise SystemExit(7)
         self.assertEqual(workspaces, [])
 
     def test_publication_failure_has_controlled_installed_cli_nondelivery(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         with TemporaryDirectory() as directory:
             cwd = Path(directory)
             fake_bin = cwd / "bin"

@@ -66,7 +66,7 @@ Every command Probe preserves byte-for-byte standard output and standard error b
 7. **Define all targets explicitly.** As an operator, I want one INI Node Inventory to be the complete Collection Scope.
    - `[common]` and a nonempty `[nodes]` are required.
    - `[nodes]` maps `inventory_name = ssh_address` in preserved order.
-   - The initial and generated common SSH user is exactly `root`; any other value is rejected.
+   - Every validated `ssh_address` is reached as fixed `root@ssh_address`; the Inventory has no SSH-user setting.
    - Ceph, Kubernetes, or Prometheus observations never add SSH targets.
 
 8. **Keep evidence names distinct from connection addresses.** As an evidence reviewer, I want stable node paths even when connection addresses change.
@@ -95,7 +95,7 @@ Every command Probe preserves byte-for-byte standard output and standard error b
     - `collect` rejects that inventory before any collection until the names are unique.
 
 12. **Generate useful explicit defaults.** As an operator, I want the generated file to document every initial capability.
-    - `[common]` contains `ssh_user = root`, `probe_timeout = 30m`, and `ssh_connect_timeout = 15s`.
+    - `[common]` contains `probe_timeout = 30m` and `ssh_connect_timeout = 15s`.
     - `[ceph] source` is the first generated node, in hosts-file order, whose hostname contains `mon`, `cp`, or `cm` case-insensitively. If none matches, emit `# source =` and do not guess.
     - `[kubernetes]` contains `# context =`, `consumer_namespace = rook-ceph-external`, and `operator_namespace = rook-ceph`.
     - `[prometheus]` contains `# url =`, an empty `metrics_filter_regex =`, `query_step = 15s`, and `request_timeout = 5m`.
@@ -174,7 +174,7 @@ Every command Probe preserves byte-for-byte standard output and standard error b
 ### Evidence and Probe model
 
 25. **Use built-in fixed Evidence Probes only.** As an operator, I want an auditable read-only command surface.
-    - Each Probe has a stable lowercase kebab-case name, stable area, and fixed argument vector.
+    - Each Probe has a stable lowercase kebab-case name and fixed argument vector.
     - Execute directly without a shell.
     - No operator-supplied command or plug-in command surface is accepted initially.
 
@@ -334,7 +334,7 @@ Every command Probe preserves byte-for-byte standard output and standard error b
 53. **Remain operationally read-only.** As an operator, I want collection to preserve the state being investigated.
     - Do not change persistent configuration, services, packages, mounts, Ceph desired state, or Kubernetes objects/workloads.
     - Collector-owned temporary writes and unavoidable observation-side audit/log/limited metadata effects are allowed.
-    - Do not implement privilege escalation; every remote action runs as the configured root user.
+    - Do not implement privilege escalation; every remote action runs as the fixed root user.
 
 54. **Preserve Raw Evidence without content policy.** As an evidence reviewer, I want maximum fidelity for internal analysis.
     - Do not redact, mask, scan for secrets, reject credential-like content, semantically validate, or apply special permissions because of content.
@@ -382,7 +382,7 @@ The accepted fixed keys are:
 
 | Section | Keys | Required behavior |
 |---|---|---|
-| `[common]` | `ssh_user`, `probe_timeout`, `ssh_connect_timeout` | Section and `ssh_user = root` are required; omitted timeouts use `30m` and `15s`. |
+| `[common]` | `probe_timeout`, `ssh_connect_timeout` | Section is required; omitted timeouts use `30m` and `15s`. |
 | `[nodes]` | operator-defined Inventory Names | Section must contain at least one entry. |
 | `[ceph]` | `source` | Absent key disables Ceph Cluster Evidence; a present value must be nonempty and reference `[nodes]`. |
 | `[kubernetes]` | `context`, `consumer_namespace`, `operator_namespace` | Absent context disables Rook; namespaces default to the generated defaults. |
