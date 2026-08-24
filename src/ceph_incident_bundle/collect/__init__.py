@@ -15,8 +15,7 @@ from .. import __version__
 from ..inventory import Inventory, InventoryRejected, load_inventory
 from .bundle import (
     BundlePublicationError,
-    OWNERSHIP_MARKER,
-    cleanup_owned_workspace_before_publication,
+    cleanup_owned_workspace,
     publish_bundle,
 )
 from .kubernetes import collect_kubernetes
@@ -69,15 +68,9 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
         )
 
     workspace: Path | None = None
-    workspace_identity: tuple[int, int] | None = None
     publication_cleanup_problem: object | str | None = _PUBLICATION_RESULT_PENDING
     try:
         workspace = Path(tempfile.mkdtemp(prefix="ceph-incident-work."))
-        workspace_facts = workspace.stat(follow_symlinks=False)
-        workspace_identity = workspace_facts.st_dev, workspace_facts.st_ino
-        (workspace / OWNERSHIP_MARKER).write_text(
-            str(workspace.resolve()) + "\n", encoding="utf-8"
-        )
         private_nodes = workspace / "private" / "nodes"
         contributions = workspace / "admitted" / "node-contributions"
         private_nodes.mkdir(parents=True)
@@ -198,9 +191,7 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
         if delivered_outcome is not None:
             retry_cleanup_problem = None
             if workspace is not None:
-                retry_cleanup_problem = _cleanup_owned_workspace(
-                    workspace, workspace_identity
-                )
+                retry_cleanup_problem = cleanup_owned_workspace(workspace)
             try:
                 if interruption_problem is not None:
                     print(_terminal_safe(interruption_problem), file=sys.stderr)
@@ -232,9 +223,7 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
             return 0
         cleanup_problem = None
         if workspace is not None:
-            cleanup_problem = _cleanup_owned_workspace(
-                workspace, workspace_identity
-            )
+            cleanup_problem = cleanup_owned_workspace(workspace)
         problems = ["collection interrupted"]
         if interruption_problem is not None:
             problems.append(interruption_problem)
@@ -248,9 +237,7 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
     except Exception as error:
         cleanup_problem = None
         if workspace is not None:
-            cleanup_problem = _cleanup_owned_workspace(
-                workspace, workspace_identity
-            )
+            cleanup_problem = cleanup_owned_workspace(workspace)
         problems = [f"collection failed: {_terminal_safe(str(error))}"]
         if cleanup_problem:
             problems.append(cleanup_problem)
@@ -308,21 +295,6 @@ def _nondelivery(problems: list[str], *, status: int) -> int:
         print(_terminal_safe(problem), file=sys.stderr)
     print("FAIL: no Incident Bundle delivered", file=sys.stderr)
     return status
-
-
-def _cleanup_owned_workspace(
-    workspace: Path, workspace_identity: tuple[int, int] | None
-) -> str | None:
-    """Clean a workspace only while the top-level flow still owns it.
-
-    Publication deliberately proves ownership again after handoff because its cleanup
-    decisions and failure reporting belong to the publication capability.
-    """
-    if workspace_identity is None:
-        return f"refusing to clean unproven workstation workspace {workspace}"
-    return cleanup_owned_workspace_before_publication(
-        workspace, workspace_identity
-    )
 
 
 def _delivered_bundle_outcome(final_path: Path) -> str | None:

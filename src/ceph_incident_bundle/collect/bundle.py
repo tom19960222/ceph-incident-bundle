@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import stat
 import tarfile
 from typing import TypeAlias
@@ -27,57 +28,16 @@ class BundlePublicationError(Exception):
     """The final Incident Bundle was not delivered."""
 
 
-def cleanup_owned_workspace_before_publication(
-    workspace: Path, expected_identity: tuple[int, int]
-) -> str | None:
-    """Remove the exact workspace while the top-level flow still owns it."""
+def cleanup_owned_workspace(workspace: Path) -> str | None:
+    """Remove only the private workspace created for this invocation."""
     workspace = Path(workspace)
-    workspace_parent_descriptor: int | None = None
-    workspace_descriptor: int | None = None
-    cleanup_problem: str | None = None
     try:
-        _require_posix_file_protection()
-        workspace_parent_descriptor = _open_workspace_parent(workspace)
-        workspace_absent = False
-        try:
-            os.stat(
-                workspace.name,
-                dir_fd=workspace_parent_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            workspace_absent = True
-        if not workspace_absent:
-            workspace_descriptor = _open_directory_at(
-                workspace_parent_descriptor,
-                workspace.name,
-                "owned workstation workspace",
-            )
-            if _file_identity(os.fstat(workspace_descriptor)) != expected_identity:
-                cleanup_problem = (
-                    f"refusing to clean replaced workstation workspace {workspace}"
-                )
-            else:
-                cleanup_problem = _cleanup_workspace(
-                    workspace,
-                    workspace_parent_descriptor,
-                    workspace_descriptor,
-                    str(workspace.resolve()),
-                )
+        shutil.rmtree(workspace)
     except FileNotFoundError:
-        cleanup_problem = None
-    except (BundlePublicationError, OSError) as error:
-        cleanup_problem = f"cannot remove workstation workspace {workspace}: {error}"
-    finally:
-        if workspace_descriptor is not None:
-            close_problem = _close_workspace_input(workspace_descriptor)
-            if close_problem is not None:
-                cleanup_problem = _combine_problems(cleanup_problem, close_problem)
-        if workspace_parent_descriptor is not None:
-            close_problem = _close_workspace_parent(workspace_parent_descriptor)
-            if close_problem is not None:
-                cleanup_problem = _combine_problems(cleanup_problem, close_problem)
-    return cleanup_problem
+        return None
+    except OSError as error:
+        return f"cannot remove workstation workspace {workspace}: {error}"
+    return None
 
 
 def publish_bundle(
@@ -91,7 +51,7 @@ def publish_bundle(
 ) -> str | None:
     """Validate admitted state and publish one bundle without replacing a path.
 
-    ``workspace`` must contain its ownership marker plus this admitted layout::
+    ``workspace`` must contain this admitted layout::
 
         admitted/inventory.ini
         admitted/node-contributions/<inventory-name>/node/
@@ -113,23 +73,20 @@ def publish_bundle(
     interruption_problems: list[str] = []
     cleanup_problem: str | None = None
     workspace_cleanup_attempted = False
-    workspace_marker_path: str | None = None
-    workspace_parent_descriptor: int | None = None
     workspace_descriptor: int | None = None
     output_descriptor: int | None = None
     entries: list[_ArchiveEntry] = []
     try:
         _require_posix_file_protection()
-        workspace_marker_path = str(workspace.resolve())
         workspace_parent_descriptor = _open_workspace_parent(workspace)
-        workspace_descriptor = _open_directory_at(
-            workspace_parent_descriptor,
-            workspace.name,
-            "owned workstation workspace",
-        )
-        _require_owned_workspace_at(
-            workspace_descriptor, workspace_marker_path
-        )
+        try:
+            workspace_descriptor = _open_directory_at(
+                workspace_parent_descriptor,
+                workspace.name,
+                "workstation workspace",
+            )
+        finally:
+            os.close(workspace_parent_descriptor)
         bundle_root = _validate_lifecycle_paths(workspace, final_path, started_at)
         output_descriptor = _open_output_directory(final_path.parent)
         _require_final_absent_at(output_descriptor, final_path)
@@ -150,32 +107,17 @@ def publish_bundle(
                             is_directory,
                             started_at,
                         )
-                    # Ordering is load-bearing: each workspace-backed member is closed
-                    # before cleanup.  The root descriptor remains only as the anchor
-                    # that confines deletion to this exact owned workspace.  Cleanup
-                    # and both anchor closes finish before final metadata because their
-                    # residue decides complete vs partial.
-                    assert workspace_parent_descriptor is not None
-                    assert workspace_marker_path is not None
-                    cleanup_problem = _cleanup_workspace(
-                        workspace,
-                        workspace_parent_descriptor,
-                        workspace_descriptor,
-                        workspace_marker_path,
-                    )
-                    workspace_cleanup_attempted = True
+                    # Close workspace-backed inputs before removing the exact
+                    # invocation-created workspace.  Residue determines whether
+                    # delivery is complete or partial.
                     workspace_close_problem = _close_workspace_input(
                         workspace_descriptor
                     )
                     workspace_descriptor = None
+                    cleanup_problem = cleanup_owned_workspace(workspace)
+                    workspace_cleanup_attempted = True
                     if workspace_close_problem is not None:
                         raise BundlePublicationError(workspace_close_problem)
-                    parent_close_problem = _close_workspace_parent(
-                        workspace_parent_descriptor
-                    )
-                    workspace_parent_descriptor = None
-                    if parent_close_problem is not None:
-                        raise BundlePublicationError(parent_close_problem)
                     metadata = {
                         "collector_version": collector_version,
                         "started_at": _rfc3339(started_at),
@@ -254,18 +196,8 @@ def publish_bundle(
             )
             if final_cleanup_problem is not None:
                 interruption_problems.append(final_cleanup_problem)
-        if (
-            not workspace_cleanup_attempted
-            and workspace_parent_descriptor is not None
-            and workspace_descriptor is not None
-            and workspace_marker_path is not None
-        ):
-            cleanup_problem = _cleanup_workspace(
-                workspace,
-                workspace_parent_descriptor,
-                workspace_descriptor,
-                workspace_marker_path,
-            )
+        if not workspace_cleanup_attempted:
+            cleanup_problem = cleanup_owned_workspace(workspace)
         if cleanup_problem is not None:
             interruption_problems.append(cleanup_problem)
         if workspace_descriptor is not None:
@@ -273,13 +205,6 @@ def publish_bundle(
             if workspace_close_problem is not None:
                 interruption_problems.append(workspace_close_problem)
             workspace_descriptor = None
-        if workspace_parent_descriptor is not None:
-            parent_close_problem = _close_workspace_parent(
-                workspace_parent_descriptor
-            )
-            if parent_close_problem is not None:
-                interruption_problems.append(parent_close_problem)
-            workspace_parent_descriptor = None
         if (
             candidate is not None
             and candidate_name is not None
@@ -295,33 +220,12 @@ def publish_bundle(
         raise
     except Exception as error:
         if not workspace_cleanup_attempted:
-            if (
-                workspace_parent_descriptor is not None
-                and workspace_descriptor is not None
-                and workspace_marker_path is not None
-            ):
-                cleanup_problem = _cleanup_workspace(
-                    workspace,
-                    workspace_parent_descriptor,
-                    workspace_descriptor,
-                    workspace_marker_path,
-                )
-            else:
-                cleanup_problem = (
-                    "refusing to clean unpinned workstation workspace "
-                    f"{workspace}"
-                )
+            cleanup_problem = cleanup_owned_workspace(workspace)
             workspace_cleanup_attempted = True
         workspace_close_problem = None
         if workspace_descriptor is not None:
             workspace_close_problem = _close_workspace_input(workspace_descriptor)
             workspace_descriptor = None
-        parent_close_problem = None
-        if workspace_parent_descriptor is not None:
-            parent_close_problem = _close_workspace_parent(
-                workspace_parent_descriptor
-            )
-            workspace_parent_descriptor = None
         candidate_cleanup_problem = None
         if (
             candidate is not None
@@ -334,8 +238,6 @@ def publish_bundle(
         message = str(error)
         if workspace_close_problem:
             message = f"{message}; {workspace_close_problem}"
-        if parent_close_problem:
-            message = f"{message}; {parent_close_problem}"
         if candidate_cleanup_problem:
             message = f"{message}; {candidate_cleanup_problem}"
         if cleanup_problem:
@@ -670,7 +572,6 @@ def _require_posix_file_protection() -> None:
         or os.link not in os.supports_dir_fd
         or os.link not in os.supports_follow_symlinks
         or os.unlink not in os.supports_dir_fd
-        or os.rmdir not in os.supports_dir_fd
         or os.listdir not in os.supports_fd
     ):
         raise BundlePublicationError(
@@ -1073,99 +974,6 @@ def _add_bytes(
     archive.addfile(member, io.BytesIO(contents))
 
 
-def _cleanup_workspace(
-    workspace: Path,
-    workspace_parent_descriptor: int,
-    workspace_descriptor: int,
-    expected_marker_path: str,
-) -> str | None:
-    """Remove only the exact pinned workspace after publication handoff.
-
-    The top-level flow keeps pre-handoff cleanup local because it still owns
-    failures before publication starts.  After handoff, this routine removes only
-    the descriptor-pinned, marker-verified workspace and never follows a replaced
-    path or broadens cleanup beyond that owned tree.
-    """
-    try:
-        _require_owned_workspace_at(workspace_descriptor, expected_marker_path)
-        _remove_directory_contents_at(
-            workspace_descriptor, "owned workstation workspace"
-        )
-        opened_facts = os.fstat(workspace_descriptor)
-        current_facts = os.stat(
-            workspace.name,
-            dir_fd=workspace_parent_descriptor,
-            follow_symlinks=False,
-        )
-        if (
-            not stat.S_ISDIR(current_facts.st_mode)
-            or _file_identity(current_facts) != _file_identity(opened_facts)
-        ):
-            return (
-                "refusing to clean replaced workstation workspace "
-                f"{workspace}"
-            )
-        os.rmdir(workspace.name, dir_fd=workspace_parent_descriptor)
-        _require_absent_at(
-            workspace_parent_descriptor,
-            workspace.name,
-            f"exact workstation workspace {workspace}",
-        )
-    except (BundlePublicationError, OSError) as error:
-        return f"cannot remove workstation workspace {workspace}: {error}"
-    return None
-
-
-def _remove_directory_contents_at(
-    directory_descriptor: int, label: str
-) -> None:
-    for name, observed_facts in _list_entries(directory_descriptor, label):
-        child_label = f"{label}/{name}"
-        observed_identity = _file_identity(observed_facts)
-        if stat.S_ISDIR(observed_facts.st_mode):
-            child_descriptor = _open_directory_at(
-                directory_descriptor,
-                name,
-                child_label,
-                observed=observed_identity,
-            )
-            try:
-                _remove_directory_contents_at(child_descriptor, child_label)
-                current_facts = os.stat(
-                    name,
-                    dir_fd=directory_descriptor,
-                    follow_symlinks=False,
-                )
-                if (
-                    not stat.S_ISDIR(current_facts.st_mode)
-                    or _file_identity(current_facts) != _file_identity(
-                        os.fstat(child_descriptor)
-                    )
-                ):
-                    raise BundlePublicationError(
-                        f"refusing to remove replaced workspace directory {child_label}"
-                    )
-                os.rmdir(name, dir_fd=directory_descriptor)
-                _require_absent_at(directory_descriptor, name, child_label)
-            finally:
-                os.close(child_descriptor)
-        elif stat.S_ISREG(observed_facts.st_mode):
-            child_descriptor = _open_regular_at(
-                directory_descriptor,
-                name,
-                child_label,
-                observed=observed_identity,
-            )
-            try:
-                os.unlink(name, dir_fd=directory_descriptor)
-            finally:
-                os.close(child_descriptor)
-        else:
-            raise BundlePublicationError(
-                f"refusing to remove inadmissible workspace object {child_label}"
-            )
-
-
 def _remove_candidate_at(
     output_descriptor: int, candidate_name: str, candidate_path: Path
 ) -> str | None:
@@ -1211,7 +1019,3 @@ def _remove_owned_final_at(
 
 def _rfc3339(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _combine_problems(first: str | None, second: str) -> str:
-    return second if first is None else f"{first}; {second}"

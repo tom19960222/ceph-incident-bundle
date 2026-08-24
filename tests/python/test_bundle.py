@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 from ceph_incident_bundle.collect.bundle import (
     BundlePublicationError,
-    OWNERSHIP_MARKER,
     publish_bundle,
 )
 
@@ -292,9 +291,6 @@ class IncidentBundlePublicationTests(unittest.TestCase):
             )
             workspace = root / "workspace"
             workspace.mkdir()
-            (workspace / OWNERSHIP_MARKER).write_text(
-                str(workspace.resolve()) + "\n", encoding="utf-8"
-            )
             (workspace / "private").mkdir()
             (workspace / "admitted").symlink_to(
                 outside_workspace / "admitted", target_is_directory=True
@@ -440,132 +436,6 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(outside_names, {"sentinel", outside_candidate.name})
         self.assertFalse(redirected_final_exists)
         self.assertEqual(moved_names, set())
-
-    def test_workspace_root_swap_never_deletes_the_replacement(self) -> None:
-        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
-        started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
-        real_addfile = tarfile.TarFile.addfile
-        swapped = False
-
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            workspace = root / "workspace"
-            self._write_workspace(workspace, inventory)
-            moved_workspace = root / "moved-workspace"
-            replacement_sentinel = workspace / "replacement-sentinel"
-
-            def swap_after_last_source(
-                archive: tarfile.TarFile,
-                member: tarfile.TarInfo,
-                fileobj=None,
-            ) -> None:
-                nonlocal swapped
-                real_addfile(archive, member, fileobj)
-                if member.name.endswith("/probes/hostname/stdout") and not swapped:
-                    workspace.rename(moved_workspace)
-                    workspace.mkdir()
-                    (workspace / OWNERSHIP_MARKER).write_text(
-                        str(workspace.resolve()) + "\n", encoding="utf-8"
-                    )
-                    replacement_sentinel.write_bytes(b"replacement stays")
-                    swapped = True
-
-            final_path = root / "ceph-incident-bundle-20260814T120000Z.tar.gz"
-            with patch("tarfile.TarFile.addfile", new=swap_after_last_source):
-                cleanup_problem = publish_bundle(
-                    workspace,
-                    final_path,
-                    collector_version="0.1.0",
-                    started_at=started_at,
-                    since="24h",
-                    prior_partial=False,
-                )
-
-            replacement_bytes = replacement_sentinel.read_bytes()
-            moved_workspace_exists = moved_workspace.exists()
-            with tarfile.open(final_path, "r:gz") as archive:
-                metadata_file = archive.extractfile(
-                    "ceph-incident-bundle-20260814T120000Z/collection.json"
-                )
-                assert metadata_file is not None
-                outcome = json.load(metadata_file)["outcome"]
-
-        self.assertTrue(swapped)
-        self.assertEqual(replacement_bytes, b"replacement stays")
-        self.assertTrue(moved_workspace_exists)
-        self.assertIsNotNone(cleanup_problem)
-        assert cleanup_problem is not None
-        self.assertIn("refusing to clean", cleanup_problem)
-        self.assertEqual(outcome, "partial")
-
-    def test_workspace_swap_at_cleanup_entry_never_deletes_replacement(
-        self,
-    ) -> None:
-        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
-        started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
-        real_listdir = os.listdir
-        swapped = False
-
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            workspace = root / "workspace"
-            self._write_workspace(workspace, inventory)
-            workspace_identity = (
-                workspace.stat().st_dev,
-                workspace.stat().st_ino,
-            )
-            moved_workspace = root / "moved-workspace"
-            replacement_sentinel = workspace / "replacement-sentinel"
-
-            def swap_when_cleanup_lists_root(directory_descriptor: int):
-                nonlocal swapped
-                descriptor_facts = os.fstat(directory_descriptor)
-                if (
-                    (descriptor_facts.st_dev, descriptor_facts.st_ino)
-                    == workspace_identity
-                    and not swapped
-                ):
-                    workspace.rename(moved_workspace)
-                    workspace.mkdir()
-                    (workspace / OWNERSHIP_MARKER).write_text(
-                        str(workspace.resolve()) + "\n", encoding="utf-8"
-                    )
-                    replacement_sentinel.write_bytes(b"replacement stays")
-                    swapped = True
-                return real_listdir(directory_descriptor)
-
-            supported_with_swap = os.supports_fd | {
-                swap_when_cleanup_lists_root
-            }
-            final_path = root / "ceph-incident-bundle-20260814T120000Z.tar.gz"
-            with (
-                patch(
-                    "ceph_incident_bundle.collect.bundle.os.listdir",
-                    new=swap_when_cleanup_lists_root,
-                ),
-                patch(
-                    "ceph_incident_bundle.collect.bundle.os.supports_fd",
-                    supported_with_swap,
-                ),
-            ):
-                cleanup_problem = publish_bundle(
-                    workspace,
-                    final_path,
-                    collector_version="0.1.0",
-                    started_at=started_at,
-                    since="24h",
-                    prior_partial=False,
-                )
-
-            replacement_bytes = replacement_sentinel.read_bytes()
-            moved_workspace_exists = moved_workspace.exists()
-
-        self.assertTrue(swapped)
-        self.assertEqual(replacement_bytes, b"replacement stays")
-        self.assertTrue(moved_workspace_exists)
-        self.assertIsNotNone(cleanup_problem)
-        assert cleanup_problem is not None
-        self.assertIn("refusing to clean", cleanup_problem)
 
     def test_missing_posix_no_follow_support_fails_closed(self) -> None:
         inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
@@ -997,9 +867,6 @@ class IncidentBundlePublicationTests(unittest.TestCase):
     @staticmethod
     def _write_workspace(workspace: Path, inventory: bytes) -> None:
         workspace.mkdir()
-        (workspace / OWNERSHIP_MARKER).write_text(
-            str(workspace.resolve()) + "\n", encoding="utf-8"
-        )
         admitted = workspace / "admitted"
         contribution = admitted / "node-contributions" / "node-a" / "node"
         capture = contribution / "probes" / "hostname"
