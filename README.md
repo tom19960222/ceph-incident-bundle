@@ -58,38 +58,23 @@ Inventory 是 INI，不是可執行 shell。`[common]` 與非空的 `[nodes]` �
 固定的 `root@ssh_address` 連線。`[ceph] source` 必須指向一個已列出的 inventory name。
 Kubernetes 沒有明確 `context` 就完全不收；Prometheus 沒有明確 `url` 也完全不連線。
 
-`inventory_name` 會直接成為 bundle 裡 `nodes/<inventory_name>/` 的目錄名稱；
-`ssh_address` 只負責連線。Ceph、Kubernetes 與 Prometheus observation 不會偷偷擴張
-SSH target 清單。
+`inventory_name` 是 bundle 裡辨識該 node evidence 的穩定名稱；`ssh_address` 只負責連線。
+Ceph、Kubernetes 與 Prometheus observation 不會偷偷擴張 SSH target 清單。
 
 ## 收集結果
 
-成功交付時 stdout 只有一行 bundle path 與 `(complete)` 或 `(partial)`。兩種已交付
-結果都是 exit 0；`partial` 表示至少一個實際嘗試的 evidence source、cleanup 或 Probe
-失敗，但已完成的 evidence 仍被保留。Startup rejection 或工作機錯誤導致沒有 bundle
-時，stdout 為空、exit 非 0，stderr 最後一行是：
-
-```text
-FAIL: no Incident Bundle delivered
-```
+成功交付時 stdout 會指出 bundle path 與 `complete` 或 `partial` outcome。兩種已交付結果
+都是 exit 0；`partial` 表示至少一個實際嘗試的 evidence source、cleanup 或 Probe 失敗，
+但已完成的 evidence 仍被保留。Startup rejection 或工作機錯誤導致沒有 bundle 時，
+stdout 為空、exit 非 0，stderr 會提供 diagnosis。
 
 Ctrl-C 不交付 bundle，完成可做的 cleanup 後 exit 130。
 
-Bundle 根目錄固定包含：
-
-```text
-inventory.ini
-collection.json
-nodes/
-ceph/
-kubernetes/
-prometheus/
-```
-
-每個 Probe Capture 分開保存 `stdout`、`stderr` 與 `result.json`。Prometheus Capture
-保存原始 `response` 與 `result.json`。Node Evidence Archive 在任何 extraction 前都會
-完整檢查 member；absolute/traversal path、link、special object、collision 或不完整結構
-會讓整份 node archive fail closed。
+Bundle 保存 Inventory Snapshot、collection context 與各個已 admit source 的 Raw Evidence。
+Probe 的原始 stdout/stderr、Prometheus response 與相應的 collector facts 會保持可區分；
+內部檔名、metadata representation 與 archive member ordering 不是固定 interface。
+Node Evidence Archive 在任何 extraction 前都會完整檢查 member；absolute/traversal path、
+link、special object、collision 或不完整結構會讓整份 node archive fail closed。
 
 ## Raw Evidence 與安全界線
 
@@ -110,8 +95,7 @@ container 或進入 workload。
   fixed `python3` 是否為 CPython 3.10+。
 - 結果是 `partial`：先保留 bundle 與 stderr，再針對被點名的 source 處理；不要把
   `partial` 誤當成沒有交付。
-- Output 已存在：換 output directory 或等待下一個 UTC second；collector 不覆寫既有
-  destination。
+- Output 已存在：換 output directory 或稍後再執行；collector 不覆寫既有 destination。
 
 ## 開發驗證與 rollback
 
