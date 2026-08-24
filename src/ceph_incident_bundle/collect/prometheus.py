@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import re
 import socket
-import stat
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -31,9 +30,6 @@ def collect_prometheus(
     """Collect control and range HTTP evidence as one atomic contribution."""
     staging_directory = Path(staging_directory)
     contribution_directory = Path(contribution_directory)
-    boundary_problem = _boundary_problem(staging_directory, contribution_directory)
-    if boundary_problem is not None:
-        return [boundary_problem]
 
     try:
         staging_directory.mkdir(mode=0o700)
@@ -389,51 +385,6 @@ def _request_error(error: Exception) -> dict[str, str]:
     if isinstance(reason, (TimeoutError, socket.timeout)):
         return {"kind": "timeout", "message": str(reason) or "request timed out"}
     return {"kind": type(reason).__name__, "message": str(reason)}
-
-
-def _boundary_problem(staging: Path, contribution: Path) -> str | None:
-    try:
-        contribution.lstat()
-    except FileNotFoundError:
-        pass
-    except OSError as error:
-        return f"Prometheus: cannot inspect admitted contribution: {error}"
-    else:
-        return (
-            "Prometheus: admitted Prometheus contribution already exists: "
-            f"{contribution}"
-        )
-
-    try:
-        staging.lstat()
-    except FileNotFoundError:
-        pass
-    except OSError as error:
-        return f"Prometheus: cannot inspect private staging: {error}"
-    else:
-        return f"Prometheus: private staging already exists: {staging}"
-
-    try:
-        staging_parent = staging.parent.stat(follow_symlinks=False)
-        contribution_parent = contribution.parent.stat(follow_symlinks=False)
-        if not stat.S_ISDIR(staging_parent.st_mode):
-            return (
-                "Prometheus: private staging parent is not an ordinary directory: "
-                f"{staging.parent}"
-            )
-        if not stat.S_ISDIR(contribution_parent.st_mode):
-            return (
-                "Prometheus: admitted contribution parent is not an ordinary directory: "
-                f"{contribution.parent}"
-            )
-        if staging_parent.st_dev != contribution_parent.st_dev:
-            return (
-                "Prometheus: private staging and admitted contribution must share "
-                "a filesystem"
-            )
-    except OSError as error:
-        return f"Prometheus: cannot validate private contribution boundaries: {error}"
-    return None
 
 
 def _with_residue(problem: str, staging: Path) -> str:

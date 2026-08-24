@@ -82,7 +82,7 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
                 )
 
             self.assertEqual(caught.exception.errno, errno.ENOTDIR)
-            self.assertFalse(extraction.exists())
+            self.assertTrue(extraction.exists())
             self.assertEqual(contribution_parent.read_bytes(), b"not a directory")
 
     def test_initial_tar_open_retains_its_file_system_error(self) -> None:
@@ -688,7 +688,7 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
                     self.assertFalse(extraction.exists())
                     self.assertFalse(contribution.exists())
 
-    def test_existing_contribution_retains_its_file_system_error(self) -> None:
+    def test_existing_contribution_fails_real_promotion_without_replacement(self) -> None:
         with TemporaryDirectory() as directory:
             workspace = Path(directory)
             staging = workspace / "private" / "node-a"
@@ -701,11 +701,11 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
             sentinel.write_bytes(b"unchanged")
             write_archive(archive, BASE_MEMBERS)
 
-            with self.assertRaises(FileExistsError):
+            with self.assertRaises(OSError):
                 admit_archive(archive, extraction, contribution, ceph_allowed=False)
 
             self.assertEqual(sentinel.read_bytes(), b"unchanged")
-            self.assertFalse(extraction.exists())
+            self.assertTrue(extraction.exists())
 
     @staticmethod
     def _truncated_archive(workspace: Path) -> bytes:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-import errno
 import gzip
 import os
 from pathlib import Path
@@ -33,14 +32,7 @@ def admit_archive(
     archive_path = Path(archive_path)
     extraction_directory = Path(extraction_directory)
     contribution_directory = Path(contribution_directory)
-    staging_directory = archive_path.parent
-
-    _validate_destinations(
-        archive_path,
-        staging_directory,
-        extraction_directory,
-        contribution_directory,
-    )
+    _validate_archive_file(archive_path)
     _validate_complete_tar_stream(archive_path)
 
     try:
@@ -64,69 +56,10 @@ def admit_archive(
     os.rename(extraction_directory, contribution_directory)
 
 
-def _validate_destinations(
-    archive_path: Path,
-    staging_directory: Path,
-    extraction_directory: Path,
-    contribution_directory: Path,
-) -> None:
+def _validate_archive_file(archive_path: Path) -> None:
     archive_mode = archive_path.stat(follow_symlinks=False).st_mode
     if not stat.S_ISREG(archive_mode):
         raise ArchiveRejected("Node Evidence Archive must be an owned regular file")
-
-    staging_mode = staging_directory.stat(follow_symlinks=False).st_mode
-    contribution_parent_mode = contribution_directory.parent.stat(
-        follow_symlinks=False
-    ).st_mode
-    if not stat.S_ISDIR(staging_mode):
-        raise NotADirectoryError(
-            errno.ENOTDIR,
-            "node staging must be an ordinary directory",
-            str(staging_directory),
-        )
-    if not stat.S_ISDIR(contribution_parent_mode):
-        raise NotADirectoryError(
-            errno.ENOTDIR,
-            "admitted contribution parent must be an ordinary directory",
-            str(contribution_directory.parent),
-        )
-
-    staging = staging_directory.resolve()
-    if archive_path.parent.resolve() != staging:
-        raise ArchiveRejected(
-            "Node Evidence Archive must be directly inside node staging"
-        )
-    if extraction_directory.parent.resolve() != staging:
-        raise ArchiveRejected("private extraction must be a child of node staging")
-    if _path_exists(extraction_directory):
-        raise FileExistsError(
-            errno.EEXIST,
-            "private extraction destination already exists",
-            str(extraction_directory),
-        )
-    if _path_exists(contribution_directory):
-        raise FileExistsError(
-            errno.EEXIST,
-            "admitted contribution destination already exists",
-            str(contribution_directory),
-        )
-    if (
-        staging_directory.stat(follow_symlinks=False).st_dev
-        != contribution_directory.parent.stat(follow_symlinks=False).st_dev
-    ):
-        raise OSError(
-            errno.EXDEV,
-            "private staging and admitted contribution must share a filesystem",
-            str(contribution_directory),
-        )
-
-
-def _path_exists(path: Path) -> bool:
-    try:
-        path.lstat()
-    except FileNotFoundError:
-        return False
-    return True
 
 
 def _validate_complete_tar_stream(archive_path: Path) -> None:

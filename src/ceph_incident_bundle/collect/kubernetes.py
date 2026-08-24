@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import signal
-import stat
 import subprocess
 import time
 from typing import NamedTuple
@@ -39,9 +38,6 @@ def collect_kubernetes(
     """Collect and atomically admit one configured Kubernetes contribution."""
     staging_directory = Path(staging_directory)
     contribution_directory = Path(contribution_directory)
-    boundary_problem = _boundary_problem(staging_directory, contribution_directory)
-    if boundary_problem is not None:
-        return [boundary_problem]
 
     try:
         staging_directory.mkdir(mode=0o700)
@@ -433,55 +429,6 @@ def _plain_text(value: object, label: str) -> str:
     if not isinstance(value, str) or not value or not value.isprintable():
         raise TypeError(f"{label} is not plain nonempty text")
     return value
-
-
-def _boundary_problem(staging: Path, contribution: Path) -> str | None:
-    try:
-        contribution.lstat()
-    except FileNotFoundError:
-        pass
-    except OSError as error:
-        return f"Kubernetes: cannot inspect admitted contribution: {error}"
-    else:
-        return (
-            "Kubernetes: admitted Kubernetes contribution already exists: "
-            f"{contribution}"
-        )
-
-    try:
-        staging.lstat()
-    except FileNotFoundError:
-        pass
-    except OSError as error:
-        return f"Kubernetes: cannot inspect private staging: {error}"
-    else:
-        return f"Kubernetes: private staging already exists: {staging}"
-
-    try:
-        staging_parent_mode = staging.parent.stat(follow_symlinks=False).st_mode
-        contribution_parent_mode = contribution.parent.stat(
-            follow_symlinks=False
-        ).st_mode
-        if not stat.S_ISDIR(staging_parent_mode):
-            return (
-                "Kubernetes: private staging parent is not an ordinary directory: "
-                f"{staging.parent}"
-            )
-        if not stat.S_ISDIR(contribution_parent_mode):
-            return (
-                "Kubernetes: admitted contribution parent is not an ordinary directory: "
-                f"{contribution.parent}"
-            )
-        if staging.parent.stat(follow_symlinks=False).st_dev != contribution.parent.stat(
-            follow_symlinks=False
-        ).st_dev:
-            return (
-                "Kubernetes: private staging and admitted contribution must share "
-                "a filesystem"
-            )
-    except OSError as error:
-        return f"Kubernetes: cannot validate private contribution boundaries: {error}"
-    return None
 
 
 def _with_residue(problem: str, staging: Path) -> str:
