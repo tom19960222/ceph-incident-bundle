@@ -51,8 +51,8 @@ def publish_bundle(
         admitted/inventory.ini
         admitted/node-contributions/<inventory-name>/node/
         admitted/node-contributions/<inventory-name>/ceph/  # optional
-        admitted/kubernetes/
-        admitted/prometheus/
+        admitted/kubernetes/                              # optional
+        admitted/prometheus/                              # optional
 
     The caller owns the workspace until this function is called.  At that handoff,
     publication assumes responsibility for workspace cleanup and exact residue
@@ -302,30 +302,12 @@ def _validated_entries(
                 admitted_descriptor, "node-contributions", "node contributions"
             )
             evidence_descriptors.append(contributions_descriptor)
-            kubernetes_descriptor = _open_directory_at(
-                admitted_descriptor, "kubernetes", "Kubernetes contribution"
-            )
-            evidence_descriptors.append(kubernetes_descriptor)
-            prometheus_descriptor = _open_directory_at(
-                admitted_descriptor, "prometheus", "Prometheus contribution"
-            )
-            evidence_descriptors.append(prometheus_descriptor)
             entries.extend(
                 [
                     (bundle_root, None, True),
                     (f"{bundle_root}/inventory.ini", inventory_source, False),
                     (f"{bundle_root}/nodes", None, True),
                     (f"{bundle_root}/ceph", None, True),
-                    (
-                        f"{bundle_root}/kubernetes",
-                        _source_path(("admitted", "kubernetes")),
-                        True,
-                    ),
-                    (
-                        f"{bundle_root}/prometheus",
-                        _source_path(("admitted", "prometheus")),
-                        True,
-                    ),
                 ]
             )
             _append_node_contributions(
@@ -334,20 +316,38 @@ def _validated_entries(
                 ("admitted", "node-contributions"),
                 bundle_root,
             )
-            _append_children_at(
-                entries,
-                kubernetes_descriptor,
-                ("admitted", "kubernetes"),
-                f"{bundle_root}/kubernetes",
-                "Kubernetes contribution",
-            )
-            _append_children_at(
-                entries,
-                prometheus_descriptor,
-                ("admitted", "prometheus"),
-                f"{bundle_root}/prometheus",
-                "Prometheus contribution",
-            )
+            for name, label in (
+                ("kubernetes", "Kubernetes contribution"),
+                ("prometheus", "Prometheus contribution"),
+            ):
+                try:
+                    os.stat(
+                        name,
+                        dir_fd=admitted_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    raise BundlePublicationError(
+                        f"cannot inspect {label}: {error}"
+                    ) from error
+                descriptor = _open_directory_at(
+                    admitted_descriptor,
+                    name,
+                    label,
+                )
+                evidence_descriptors.append(descriptor)
+                components = ("admitted", name)
+                destination = f"{bundle_root}/{name}"
+                entries.append((destination, _source_path(components), True))
+                _append_children_at(
+                    entries,
+                    descriptor,
+                    components,
+                    destination,
+                    label,
+                )
         finally:
             for descriptor in reversed(evidence_descriptors):
                 os.close(descriptor)

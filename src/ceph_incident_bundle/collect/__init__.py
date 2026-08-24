@@ -116,8 +116,6 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
                     "Kubernetes: unexpected collection failure: "
                     f"{_terminal_safe(str(error))}"
                 )
-        if not kubernetes_contribution.exists():
-            kubernetes_contribution.mkdir()
         prometheus_contribution = workspace / "admitted" / "prometheus"
         if inventory.prometheus_url is not None:
             try:
@@ -137,9 +135,6 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
                     "Prometheus: unexpected collection failure: "
                     f"{_terminal_safe(str(error))}"
                 )
-        if not prometheus_contribution.exists():
-            prometheus_contribution.mkdir()
-
         try:
             for problem in problems:
                 print(_terminal_safe(problem), file=sys.stderr)

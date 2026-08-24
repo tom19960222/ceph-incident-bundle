@@ -76,17 +76,6 @@ def collect_prometheus(
         if name == "job-values":
             values, parse_problem = _control_values(document)
             if parse_problem is not None:
-                try:
-                    _mark_invalid_control(capture, parse_problem)
-                except OSError as error:
-                    return [
-                        *problems,
-                        _with_residue(
-                            f"Prometheus: cannot preserve job-values parse result: "
-                            f"{error}",
-                            staging_directory,
-                        ),
-                    ]
                 problems.append(
                     f"Prometheus job-values control response is malformed: "
                     f"{parse_problem}"
@@ -127,17 +116,6 @@ def collect_prometheus(
             continue
         values, parse_problem = _control_values(document)
         if parse_problem is not None:
-            try:
-                _mark_invalid_control(capture, parse_problem)
-            except OSError as error:
-                return [
-                    *problems,
-                    _with_residue(
-                        f"Prometheus: cannot preserve metric-names parse result "
-                        f"for job {job_name!r}: {error}",
-                        staging_directory,
-                    ),
-                ]
             problems.append(
                 f"Prometheus metric-names control response for job {job_name!r} "
                 f"is malformed: {parse_problem}"
@@ -332,17 +310,6 @@ def _control_values(document: object | None) -> tuple[list[str], str | None]:
     except (KeyError, TypeError) as error:
         return [], str(error)
     return values, None
-
-
-def _mark_invalid_control(capture: Path, problem: str) -> None:
-    result_path = capture / "result.json"
-    result = json.loads(result_path.read_text(encoding="utf-8"))
-    result["finished_at"] = _utc_now()
-    result["outcome"] = "failed"
-    result["error"] = {"kind": "invalid_response", "message": problem}
-    result_path.write_text(
-        json.dumps(result, sort_keys=True) + "\n", encoding="utf-8"
-    )
 
 
 def _request_url(base: str, endpoint: str, query: str | None = None) -> str:

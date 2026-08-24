@@ -360,7 +360,7 @@ class TopLevelCollectionTests(unittest.TestCase):
 
         self.assertEqual(status, 0)
         prometheus_operation.assert_not_called()
-        self.assertEqual(prometheus_members, [f"{root_name}/prometheus"])
+        self.assertEqual(prometheus_members, [])
         self.assertTrue(stdout.getvalue().endswith(" (complete)\n"))
         self.assertEqual(stderr.getvalue(), "")
 
@@ -470,7 +470,7 @@ class TopLevelCollectionTests(unittest.TestCase):
 
         self.assertEqual(status, 0)
         self.assertEqual(outcome, "partial")
-        self.assertEqual(prometheus_members, [f"{root_name}/prometheus"])
+        self.assertEqual(prometheus_members, [])
         self.assertEqual(private_members, [])
         self.assertTrue(stdout.getvalue().endswith(" (partial)\n"))
         self.assertIn(
@@ -508,7 +508,7 @@ class TopLevelCollectionTests(unittest.TestCase):
 
         self.assertEqual(status, 0)
         kubernetes_operation.assert_not_called()
-        self.assertEqual(kubernetes_members, [f"{root_name}/kubernetes"])
+        self.assertEqual(kubernetes_members, [])
         self.assertTrue(stdout.getvalue().endswith(" (complete)\n"))
         self.assertEqual(stderr.getvalue(), "")
 
@@ -611,7 +611,7 @@ class TopLevelCollectionTests(unittest.TestCase):
 
         self.assertEqual(status, 0)
         self.assertEqual(outcome, "partial")
-        self.assertEqual(kubernetes_members, [f"{root_name}/kubernetes"])
+        self.assertEqual(kubernetes_members, [])
         self.assertEqual(private_members, [])
         self.assertTrue(stdout.getvalue().endswith(" (partial)\n"))
         self.assertIn(
