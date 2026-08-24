@@ -10,10 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from ceph_incident_bundle.collect import run
-from ceph_incident_bundle.collect.bundle import (
-    BundlePublicationError,
-    publish_bundle as publish_incident_bundle,
-)
+from ceph_incident_bundle.collect.bundle import BundlePublicationError
 from ceph_incident_bundle.collect.node import collect_node
 from ceph_incident_bundle.inventory import TargetNode
 
@@ -123,119 +120,44 @@ class TopLevelCollectionTests(unittest.TestCase):
             stderr.getvalue().endswith("FAIL: no Incident Bundle delivered\n")
         )
 
-    def test_interrupt_at_publication_return_recovers_partial_delivery_truth(
-        self,
-    ) -> None:
+    def test_late_candidate_cleanup_residue_preserves_delivered_bundle(self) -> None:
+        real_unlink = os.unlink
+
+        def refuse_candidate_unlink(path, *args, **kwargs) -> None:
+            if ".candidate." in os.fspath(path):
+                raise OSError("injected retained candidate")
+            real_unlink(path, *args, **kwargs)
+
+        supported_dir_fd = os.supports_dir_fd | {refuse_candidate_unlink}
         with TemporaryDirectory() as directory:
             root = Path(directory)
             inventory = root / "inventory.ini"
             inventory.write_bytes(INVENTORY)
-            temporary_root = root / "temporary"
-            temporary_root.mkdir()
-            workspace = temporary_root / "ceph-incident-work.fixed"
-            workspace.mkdir()
-            workspace_path: Path | None = None
-
-            def lock_workspace_parent(*args, **kwargs) -> list[str]:
-                nonlocal workspace_path
-                workspace_path = Path(kwargs["staging_directory"]).parents[2]
-                temporary_root.chmod(0o500)
-                return []
-
-            def publish_then_interrupt(*args, **kwargs) -> str | None:
-                publish_incident_bundle(*args, **kwargs)
-                raise KeyboardInterrupt
-
             stdout = io.StringIO()
             stderr = io.StringIO()
-            try:
-                with (
-                    patch(
-                        "ceph_incident_bundle.collect.tempfile.mkdtemp",
-                        return_value=str(workspace),
-                    ),
-                    patch(
-                        "ceph_incident_bundle.collect.collect_node",
-                        side_effect=lock_workspace_parent,
-                    ),
-                    patch(
-                        "ceph_incident_bundle.collect.publish_bundle",
-                        side_effect=publish_then_interrupt,
-                    ),
-                    redirect_stdout(stdout),
-                    redirect_stderr(stderr),
-                ):
-                    status = run(inventory, "24h", root)
-            finally:
-                temporary_root.chmod(0o700)
+            with (
+                patch("ceph_incident_bundle.collect.collect_node", return_value=[]),
+                patch(
+                    "ceph_incident_bundle.collect.bundle.os.unlink",
+                    new=refuse_candidate_unlink,
+                ),
+                patch(
+                    "ceph_incident_bundle.collect.bundle.os.supports_dir_fd",
+                    supported_dir_fd,
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = run(inventory, "24h", root)
 
             bundles = list(root.glob("ceph-incident-bundle-*.tar.gz"))
-            workspaces = list(temporary_root.glob("ceph-incident-work.*"))
-
-        assert workspace_path is not None
-        self.assertEqual(status, 0)
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertEqual(len(bundles), 1)
-        self.assertEqual(len(workspaces), 1)
-        self.assertIn("(partial)", stderr.getvalue())
-        self.assertIn(str(workspace_path), stderr.getvalue())
-        self.assertIn("cannot remove workstation workspace", stderr.getvalue())
-        self.assertNotIn("FAIL: no Incident Bundle delivered", stderr.getvalue())
-
-    def test_interrupt_after_publication_is_reported_as_delivered(self) -> None:
-        class InterruptingResultStream(io.StringIO):
-            def __init__(self, unreadable_metadata) -> None:
-                super().__init__()
-                self.unreadable_metadata = unreadable_metadata
-
-            def write(self, value: str) -> int:
-                self.unreadable_metadata.start()
-                raise KeyboardInterrupt
-
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            inventory = root / "inventory.ini"
-            inventory.write_bytes(INVENTORY)
-            stderr = io.StringIO()
-
-            def publish_with_restrictive_umask(*args, **kwargs) -> str | None:
-                previous_umask = os.umask(0o777)
-                try:
-                    return publish_incident_bundle(*args, **kwargs)
-                finally:
-                    os.umask(previous_umask)
-
-            unreadable_metadata = patch(
-                "ceph_incident_bundle.collect.tarfile.open",
-                side_effect=PermissionError("injected unreadable delivered bundle"),
-            )
-            try:
-                with (
-                    patch(
-                        "ceph_incident_bundle.collect.collect_node", return_value=[]
-                    ),
-                    patch(
-                        "ceph_incident_bundle.collect.publish_bundle",
-                        side_effect=publish_with_restrictive_umask,
-                    ),
-                    redirect_stdout(InterruptingResultStream(unreadable_metadata)),
-                    redirect_stderr(stderr),
-                ):
-                    status = run(inventory, "24h", root)
-            finally:
-                unreadable_metadata.stop()
-
-            bundles = list(root.glob("ceph-incident-bundle-*.tar.gz"))
-            bundle_mode = bundles[0].stat().st_mode & 0o777
+            candidates = list(root.glob(".*.candidate.*"))
 
         self.assertEqual(status, 0)
         self.assertEqual(len(bundles), 1)
-        self.assertEqual(bundle_mode, 0)
-        self.assertIn("Incident Bundle delivered at", stderr.getvalue())
-        self.assertIn("(partial)", stderr.getvalue())
-        self.assertIn("result was interrupted", stderr.getvalue())
-        self.assertNotIn("cannot remove workstation workspace", stderr.getvalue())
-        self.assertNotIn("FAIL: no Incident Bundle delivered", stderr.getvalue())
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(stdout.getvalue(), f"{bundles[0].resolve()} (partial)\n")
+        self.assertIn(str(candidates[0]), stderr.getvalue())
 
     def test_node_process_group_exit_race_preserves_interrupt(self) -> None:
         process = Mock(pid=54321)

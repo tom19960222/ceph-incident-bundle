@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum, auto
 import io
 import json
 import os
@@ -21,6 +23,28 @@ _ArchiveEntry: TypeAlias = tuple[str, _SourcePath | None, bool]
 
 class BundlePublicationError(Exception):
     """The final Incident Bundle was not delivered."""
+
+
+class PublicationState(Enum):
+    DELIVERED = auto()
+    INTERRUPTED = auto()
+    DELIVERED_INTERRUPTED = auto()
+
+
+@dataclass(frozen=True)
+class PublicationResult:
+    """The explicit outcome of publication and invocation-owned cleanup."""
+
+    state: PublicationState
+    residue: tuple[str, ...] = ()
+
+    @property
+    def delivered(self) -> bool:
+        return self.state is not PublicationState.INTERRUPTED
+
+    @property
+    def interrupted(self) -> bool:
+        return self.state is not PublicationState.DELIVERED
 
 
 def cleanup_owned_workspace(workspace: Path) -> str | None:
@@ -43,7 +67,7 @@ def publish_bundle(
     started_at: datetime,
     since: str,
     prior_partial: bool,
-) -> str | None:
+) -> PublicationResult:
     """Validate admitted state and publish one bundle without replacing a path.
 
     ``workspace`` must contain this admitted layout::
@@ -56,16 +80,15 @@ def publish_bundle(
 
     The caller owns the workspace until this function is called.  At that handoff,
     publication assumes responsibility for workspace cleanup and exact residue
-    reporting on every return or raised publication error.  Interrupt cleanup
-    problems are attached as the standard exception cause so the top-level owner
-    can report them after this function has closed all publication inputs.
+    reporting on every return or raised publication error.  The result states
+    whether publication completed or was interrupted and reports owned residue.
     """
     workspace = Path(workspace)
     final_path = Path(final_path)
     candidate: Path | None = None
     candidate_name: str | None = None
     published = False
-    interruption_problems: list[str] = []
+    residue: list[str] = []
     cleanup_problem: str | None = None
     workspace_cleanup_attempted = False
     workspace_descriptor: int | None = None
@@ -163,38 +186,23 @@ def publish_bundle(
             follow_symlinks=False,
         )
         published = True
-        try:
-            os.unlink(candidate_name, dir_fd=output_descriptor)
-        except OSError as cleanup_error:
-            try:
-                os.unlink(final_path.name, dir_fd=output_descriptor)
-            except OSError as rollback_error:
-                raise BundlePublicationError(
-                    f"cannot remove private candidate {candidate}: {cleanup_error}; "
-                    f"cannot roll back final destination {final_path}: {rollback_error}"
-                ) from cleanup_error
-            raise BundlePublicationError(
-                f"cannot remove private candidate {candidate}: {cleanup_error}; "
-                "final publication was rolled back"
-            ) from cleanup_error
-        return cleanup_problem
+        candidate_cleanup_problem = _remove_candidate_at(
+            output_descriptor, candidate_name, candidate
+        )
+        if candidate_cleanup_problem is not None:
+            residue.append(candidate_cleanup_problem)
+        if cleanup_problem is not None:
+            residue.append(cleanup_problem)
+        return PublicationResult(PublicationState.DELIVERED, tuple(residue))
     except KeyboardInterrupt:
-        if published and output_descriptor is not None:
-            final_cleanup_problem = _remove_published_final_at(
-                output_descriptor,
-                final_path.name,
-                final_path,
-            )
-            if final_cleanup_problem is not None:
-                interruption_problems.append(final_cleanup_problem)
         if not workspace_cleanup_attempted:
             cleanup_problem = cleanup_owned_workspace(workspace)
         if cleanup_problem is not None:
-            interruption_problems.append(cleanup_problem)
+            residue.append(cleanup_problem)
         if workspace_descriptor is not None:
             workspace_close_problem = _close_workspace_input(workspace_descriptor)
             if workspace_close_problem is not None:
-                interruption_problems.append(workspace_close_problem)
+                residue.append(workspace_close_problem)
             workspace_descriptor = None
         if (
             candidate is not None
@@ -205,10 +213,13 @@ def publish_bundle(
                 output_descriptor, candidate_name, candidate
             )
             if candidate_cleanup_problem is not None:
-                interruption_problems.append(candidate_cleanup_problem)
-        if interruption_problems:
-            raise KeyboardInterrupt from OSError("; ".join(interruption_problems))
-        raise
+                residue.append(candidate_cleanup_problem)
+        state = (
+            PublicationState.DELIVERED_INTERRUPTED
+            if published
+            else PublicationState.INTERRUPTED
+        )
+        return PublicationResult(state, tuple(residue))
     except Exception as error:
         if not workspace_cleanup_attempted:
             cleanup_problem = cleanup_owned_workspace(workspace)
@@ -829,20 +840,6 @@ def _remove_candidate_at(
             "cannot remove private Incident Bundle candidate "
             f"{candidate_path}: {error}"
         )
-    return None
-
-
-def _remove_published_final_at(
-    output_descriptor: int,
-    final_name: str,
-    final_path: Path,
-) -> str | None:
-    try:
-        os.unlink(final_name, dir_fd=output_descriptor)
-    except FileNotFoundError:
-        return None
-    except OSError as error:
-        return f"cannot remove interrupted final destination {final_path}: {error}"
     return None
 
 

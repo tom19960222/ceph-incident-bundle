@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import json
 from pathlib import Path
 import re
 import stat
 import sys
-import tarfile
 import tempfile
 
 from .. import __version__
@@ -21,9 +19,6 @@ from .bundle import (
 from .kubernetes import collect_kubernetes
 from .node import collect_node
 from .prometheus import collect_prometheus
-
-
-_PUBLICATION_RESULT_PENDING = object()
 
 
 _EVIDENCE_WINDOW = re.compile(r"([1-9][0-9]*)([mhdw])\Z", re.ASCII)
@@ -68,7 +63,6 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
         )
 
     workspace: Path | None = None
-    publication_cleanup_problem: object | str | None = _PUBLICATION_RESULT_PENDING
     try:
         workspace = Path(tempfile.mkdtemp(prefix="ceph-incident-work."))
         private_nodes = workspace / "private" / "nodes"
@@ -143,7 +137,7 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
             # diagnostic stream itself is no longer writable.
             pass
 
-        publication_cleanup_problem = publish_bundle(
+        publication = publish_bundle(
             workspace,
             final_path,
             collector_version=__version__,
@@ -151,15 +145,23 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
             since=since,
             prior_partial=bool(problems),
         )
-        if publication_cleanup_problem is not None:
-            assert isinstance(publication_cleanup_problem, str)
-            problems.append(publication_cleanup_problem)
+        if not publication.delivered:
+            return _nondelivery(
+                ["collection interrupted", *publication.residue], status=130
+            )
+        for cleanup_problem in publication.residue:
+            problems.append(cleanup_problem)
             try:
-                print(_terminal_safe(publication_cleanup_problem), file=sys.stderr)
+                print(_terminal_safe(cleanup_problem), file=sys.stderr)
             except Exception:
                 # Returned problems still determine the bundle outcome when the
                 # diagnostic stream itself is no longer writable.
                 pass
+        if publication.interrupted:
+            print(
+                "collection interrupted after Incident Bundle publication",
+                file=sys.stderr,
+            )
         outcome = "partial" if problems else "complete"
         try:
             print(f"{final_path} ({outcome})")
@@ -173,55 +175,11 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
                 file=sys.stderr,
             )
         return 0
-    except KeyboardInterrupt as interruption:
-        # Capability cleanup stays separate from ordinary returned problems.  A
-        # standard chained OSError carries only concrete interruption-cleanup
-        # residue; no mutable status object or new exception category is needed.
-        interruption_problem = (
-            str(interruption.__cause__)
-            if isinstance(interruption.__cause__, OSError)
-            else None
-        )
-        delivered_outcome = _delivered_bundle_outcome(final_path)
-        if delivered_outcome is not None:
-            retry_cleanup_problem = None
-            if workspace is not None:
-                retry_cleanup_problem = cleanup_owned_workspace(workspace)
-            try:
-                if interruption_problem is not None:
-                    print(_terminal_safe(interruption_problem), file=sys.stderr)
-                if isinstance(publication_cleanup_problem, str):
-                    print(
-                        _terminal_safe(publication_cleanup_problem), file=sys.stderr
-                    )
-                if retry_cleanup_problem is not None:
-                    print(_terminal_safe(retry_cleanup_problem), file=sys.stderr)
-                elif (
-                    publication_cleanup_problem is _PUBLICATION_RESULT_PENDING
-                    and delivered_outcome == "partial"
-                    and not problems
-                    and workspace is not None
-                ):
-                    print(
-                        "workstation cleanup was partial during publication for "
-                        f"{workspace}",
-                        file=sys.stderr,
-                    )
-                print(
-                    f"Incident Bundle delivered at {final_path} "
-                    f"({delivered_outcome}), but "
-                    "the final standard-output result was interrupted",
-                    file=sys.stderr,
-                )
-            except Exception:
-                pass
-            return 0
+    except KeyboardInterrupt:
         cleanup_problem = None
         if workspace is not None:
             cleanup_problem = cleanup_owned_workspace(workspace)
         problems = ["collection interrupted"]
-        if interruption_problem is not None:
-            problems.append(interruption_problem)
         if cleanup_problem:
             problems.append(cleanup_problem)
         return _nondelivery(problems, status=130)
@@ -290,27 +248,6 @@ def _nondelivery(problems: list[str], *, status: int) -> int:
         print(_terminal_safe(problem), file=sys.stderr)
     print("FAIL: no Incident Bundle delivered", file=sys.stderr)
     return status
-
-
-def _delivered_bundle_outcome(final_path: Path) -> str | None:
-    """Return the final bundle outcome, conservatively partial if unreadable."""
-    try:
-        final_facts = final_path.stat(follow_symlinks=False)
-    except OSError:
-        return None
-    if not stat.S_ISREG(final_facts.st_mode):
-        return None
-    bundle_root = final_path.name.removesuffix(".tar.gz")
-    try:
-        with tarfile.open(final_path, "r:gz") as archive:
-            metadata_file = archive.extractfile(f"{bundle_root}/collection.json")
-            if metadata_file is None:
-                return None
-            with metadata_file:
-                outcome = json.load(metadata_file).get("outcome")
-    except (OSError, tarfile.TarError, UnicodeDecodeError, json.JSONDecodeError):
-        return "partial"
-    return outcome if outcome in {"complete", "partial"} else "partial"
 
 
 def _terminal_safe(value: str) -> str:
