@@ -10,6 +10,8 @@ from pathlib import PurePosixPath
 import shutil
 import stat
 import tarfile
+import tempfile
+from typing import BinaryIO
 import unicodedata
 import zlib
 
@@ -33,15 +35,18 @@ def admit_archive(
     extraction_directory = Path(extraction_directory)
     contribution_directory = Path(contribution_directory)
     _validate_archive_file(archive_path)
-    _validate_complete_tar_stream(archive_path)
 
     try:
-        with tarfile.open(archive_path, "r:gz") as archive:
-            members = archive.getmembers()
-            _validate_members(archive, members, ceph_allowed=ceph_allowed)
-            first_eof_offset = _first_tar_eof_offset(members)
-            _validate_trailing_tar_padding(archive_path, first_eof_offset)
-            _extract_members(archive, members, extraction_directory)
+        with tempfile.TemporaryFile() as tar_stream:
+            for chunk in _one_gzip_member_chunks(archive_path):
+                tar_stream.write(chunk)
+            tar_stream.seek(0)
+            with tarfile.open(fileobj=tar_stream, mode="r:") as archive:
+                members = archive.getmembers()
+                first_eof_offset = _first_tar_eof_offset(archive)
+                _validate_members(archive, members, ceph_allowed=ceph_allowed)
+                _validate_tar_end(tar_stream, first_eof_offset)
+                _extract_members(archive, members, extraction_directory)
     except ArchiveRejected:
         raise
     except (EOFError, tarfile.TarError) as error:
@@ -60,17 +65,6 @@ def _validate_archive_file(archive_path: Path) -> None:
     archive_mode = archive_path.stat(follow_symlinks=False).st_mode
     if not stat.S_ISREG(archive_mode):
         raise ArchiveRejected("Node Evidence Archive must be an owned regular file")
-
-
-def _validate_complete_tar_stream(archive_path: Path) -> None:
-    """Require exactly one complete gzip member and terminal tar zero blocks."""
-    total = 0
-    tail = b""
-    for chunk in _one_gzip_member_chunks(archive_path):
-        total += len(chunk)
-        tail = (tail + chunk)[-1024:]
-    if total < 1024 or total % 512 != 0 or tail != b"\0" * 1024:
-        raise ArchiveRejected("Node Evidence Archive is truncated")
 
 
 def _one_gzip_member_chunks(archive_path: Path) -> Iterator[bytes]:
@@ -117,59 +111,29 @@ def _one_gzip_member_chunks(archive_path: Path) -> Iterator[bytes]:
         raise ArchiveRejected(f"invalid compressed archive: {error}") from error
 
 
-def _first_tar_eof_offset(members: list[tarfile.TarInfo]) -> int:
-    """Derive the first tar EOF position, failing closed on runtime drift.
-
-    CPython 3.10's ``tarfile`` exposes ``TarInfo.offset_data`` but does not
-    document it as public API.  The product is explicitly CPython-only, so this
-    compatibility boundary checks the attribute's type, range, and tar-block
-    alignment before use.  Admission has already excluded sparse members; adding
-    the documented payload ``size`` rounded to a 512-byte block therefore finds
-    the next possible header.  The greatest such position is where the first pair
-    of tar EOF blocks must start.  A changed or malformed CPython representation
-    is rejected rather than guessed or partially re-parsed here.
-    """
-    member_end = 0
-    for member in members:
-        offset_data = getattr(member, "offset_data", None)
-        if (
-            type(offset_data) is not int
-            or offset_data < 512
-            or offset_data % 512 != 0
-        ):
-            raise ArchiveRejected(
-                f"invalid archive member data offset: {member.name}"
-            )
-        size = getattr(member, "size", None)
-        if type(size) is not int or size < 0:
-            raise ArchiveRejected(f"invalid archive member size: {member.name}")
-        payload_size = size if member.isreg() else 0
-        payload_blocks, remainder = divmod(payload_size, 512)
-        if remainder:
-            payload_blocks += 1
-        candidate_end = offset_data + payload_blocks * 512
-        member_end = max(member_end, candidate_end)
+def _first_tar_eof_offset(archive: tarfile.TarFile) -> int:
+    """Read CPython's next-header offset, failing closed on runtime drift."""
+    member_end = getattr(archive, "offset", None)
+    if type(member_end) is not int or member_end < 0 or member_end % 512 != 0:
+        raise ArchiveRejected("invalid archive end offset")
     return member_end
 
 
-def _validate_trailing_tar_padding(archive_path: Path, member_end: int) -> None:
+def _validate_tar_end(tar_stream: BinaryIO, member_end: int) -> None:
     """Reject a second tar stream or any other data after the first tar EOF."""
-    padding_bytes = 0
-    uncompressed_offset = 0
-    for chunk in _one_gzip_member_chunks(archive_path):
-        next_offset = uncompressed_offset + len(chunk)
-        if next_offset > member_end:
-            padding = chunk[max(0, member_end - uncompressed_offset) :]
-            padding_bytes += len(padding)
-            if padding.strip(b"\0"):
-                raise ArchiveRejected(
-                    "Node Evidence Archive has data after its first tar stream"
-                )
-        uncompressed_offset = next_offset
-    if uncompressed_offset < member_end:
+    stream_end = tar_stream.seek(0, os.SEEK_END)
+    if stream_end < member_end:
         raise ArchiveRejected("Node Evidence Archive member data is incomplete")
-    if padding_bytes < 1024:
+    if stream_end % 512 != 0:
+        raise ArchiveRejected("Node Evidence Archive tar stream is not aligned")
+    if stream_end - member_end < 1024:
         raise ArchiveRejected("Node Evidence Archive is missing its tar EOF blocks")
+    tar_stream.seek(member_end)
+    while padding := tar_stream.read(_STREAM_CHUNK_BYTES):
+        if padding.strip(b"\0"):
+            raise ArchiveRejected(
+                "Node Evidence Archive has data after its first tar stream"
+            )
 
 
 def _validate_members(
