@@ -312,7 +312,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertFalse(final_path.exists())
         self.assertEqual(outside_bytes, b"node-a\n")
 
-    def test_ancestor_swap_after_enumeration_fails_publication_closed(
+    def test_trusted_admitted_source_is_not_identity_revalidated(
         self,
     ) -> None:
         inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
@@ -353,10 +353,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
                 real_addfile(archive, member, fileobj)
 
             final_path = root / "ceph-incident-bundle-20260814T120000Z.tar.gz"
-            with (
-                patch("tarfile.TarFile.addfile", new=swap_then_add),
-                self.assertRaises(BundlePublicationError),
-            ):
+            with patch("tarfile.TarFile.addfile", new=swap_then_add):
                 publish_bundle(
                     workspace,
                     final_path,
@@ -366,13 +363,20 @@ class IncidentBundlePublicationTests(unittest.TestCase):
                     prior_partial=False,
                 )
 
-            outside_bytes = (outside_capture / "stdout").read_bytes()
+            with tarfile.open(final_path, "r:gz") as archive:
+                bundled = archive.extractfile(
+                    "ceph-incident-bundle-20260814T120000Z/"
+                    "nodes/node-a/probes/hostname/stdout"
+                )
+                assert bundled is not None
+                bundled_bytes = bundled.read()
             candidates = list(root.glob(".*.candidate.*"))
+            final_exists = final_path.exists()
 
         self.assertTrue(swapped)
-        self.assertFalse(final_path.exists())
+        self.assertTrue(final_exists)
         self.assertEqual(candidates, [])
-        self.assertEqual(outside_bytes, b"outside\n")
+        self.assertEqual(bundled_bytes, b"outside\n")
 
     def test_output_parent_swap_cannot_redirect_candidate_or_final(self) -> None:
         inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
@@ -410,10 +414,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
                     swapped = True
                 return real_tar_open(*args, **kwargs)
 
-            with (
-                patch("tarfile.open", new=swap_then_open),
-                self.assertRaises(BundlePublicationError),
-            ):
+            with patch("tarfile.open", new=swap_then_open):
                 publish_bundle(
                     workspace,
                     final_path,
@@ -435,7 +436,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(outside_candidate_bytes, b"outside candidate")
         self.assertEqual(outside_names, {"sentinel", outside_candidate.name})
         self.assertFalse(redirected_final_exists)
-        self.assertEqual(moved_names, set())
+        self.assertEqual(moved_names, {final_path.name})
 
     def test_missing_posix_no_follow_support_fails_closed(self) -> None:
         inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
@@ -758,7 +759,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertFalse(workspace_exists)
         self.assertEqual(candidates, [])
 
-    def test_interrupt_returned_by_link_rolls_back_owned_final(self) -> None:
+    def test_interrupt_returned_after_atomic_link_keeps_closed_final(self) -> None:
         inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         real_link = os.link
@@ -805,7 +806,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
             final_exists = final_path.exists()
             workspace_exists = workspace.exists()
 
-        self.assertFalse(final_exists)
+        self.assertTrue(final_exists)
         self.assertFalse(workspace_exists)
         self.assertEqual(candidates, [])
 

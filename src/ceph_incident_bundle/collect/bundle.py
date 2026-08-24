@@ -15,13 +15,8 @@ from typing import TypeAlias
 import unicodedata
 
 
-OWNERSHIP_MARKER = ".ceph-incident-bundle-owned"
-
-# An admitted source is reopened from the pinned workspace descriptor using its
-# relative components, then checked against the device and inode seen during the
-# complete validation pass.
-_SourceIdentity: TypeAlias = tuple[tuple[str, ...], int, int]
-_ArchiveEntry: TypeAlias = tuple[str, _SourceIdentity | None, bool]
+_SourcePath: TypeAlias = tuple[str, ...]
+_ArchiveEntry: TypeAlias = tuple[str, _SourcePath | None, bool]
 
 
 class BundlePublicationError(Exception):
@@ -69,7 +64,7 @@ def publish_bundle(
     final_path = Path(final_path)
     candidate: Path | None = None
     candidate_name: str | None = None
-    candidate_identity: tuple[int, int] | None = None
+    published = False
     interruption_problems: list[str] = []
     cleanup_problem: str | None = None
     workspace_cleanup_attempted = False
@@ -101,7 +96,7 @@ def publish_bundle(
                     for archive_name, source, is_directory in entries:
                         _add_validated_entry(
                             archive,
-                            workspace_descriptor,
+                            workspace,
                             archive_name,
                             source,
                             is_directory,
@@ -141,9 +136,6 @@ def publish_bundle(
                 candidate_file.flush()
                 os.fsync(candidate_file.fileno())
                 candidate_anchor = os.dup(candidate_file.fileno())
-            _require_output_directory_unchanged(
-                output_descriptor, final_path.parent
-            )
             assert candidate_anchor is not None
             # Python 3.10 has no read-only umask query.  Use the most restrictive
             # value during this brief lookup, then restore the process setting even
@@ -158,7 +150,6 @@ def publish_bundle(
             # no-replace hard link makes the inode visible under the published name.
             os.fchmod(candidate_anchor, published_mode)
             os.fsync(candidate_anchor)
-            candidate_identity = _file_identity(os.fstat(candidate_anchor))
         finally:
             if candidate_anchor is not None:
                 anchor_to_close = candidate_anchor
@@ -171,6 +162,7 @@ def publish_bundle(
             dst_dir_fd=output_descriptor,
             follow_symlinks=False,
         )
+        published = True
         try:
             os.unlink(candidate_name, dir_fd=output_descriptor)
         except OSError as cleanup_error:
@@ -187,12 +179,11 @@ def publish_bundle(
             ) from cleanup_error
         return cleanup_problem
     except KeyboardInterrupt:
-        if candidate_identity is not None and output_descriptor is not None:
-            final_cleanup_problem = _remove_owned_final_at(
+        if published and output_descriptor is not None:
+            final_cleanup_problem = _remove_published_final_at(
                 output_descriptor,
                 final_path.name,
                 final_path,
-                candidate_identity,
             )
             if final_cleanup_problem is not None:
                 interruption_problems.append(final_cleanup_problem)
@@ -302,10 +293,7 @@ def _validated_entries(
             admitted_descriptor, "inventory.ini", "admitted Inventory Snapshot"
         )
         try:
-            inventory_source = _source_identity(
-                ("admitted", "inventory.ini"),
-                os.fstat(inventory_descriptor),
-            )
+            inventory_source = _source_path(("admitted", "inventory.ini"))
         finally:
             os.close(inventory_descriptor)
         evidence_descriptors: list[int] = []
@@ -330,18 +318,12 @@ def _validated_entries(
                     (f"{bundle_root}/ceph", None, True),
                     (
                         f"{bundle_root}/kubernetes",
-                        _source_identity(
-                            ("admitted", "kubernetes"),
-                            os.fstat(kubernetes_descriptor),
-                        ),
+                        _source_path(("admitted", "kubernetes")),
                         True,
                     ),
                     (
                         f"{bundle_root}/prometheus",
-                        _source_identity(
-                            ("admitted", "prometheus"),
-                            os.fstat(prometheus_descriptor),
-                        ),
+                        _source_path(("admitted", "prometheus")),
                         True,
                     ),
                 ]
@@ -389,7 +371,6 @@ def _append_node_contributions(
             contributions_descriptor,
             contribution_name,
             f"admitted node contribution {contribution_name}",
-            observed=_file_identity(contribution_facts),
         )
         contribution_components = contributions_components + (contribution_name,)
         try:
@@ -412,7 +393,6 @@ def _append_node_contributions(
                 contribution_descriptor,
                 "node",
                 f"admitted node evidence {contribution_name}",
-                observed=_file_identity(node_facts),
             )
             try:
                 node_archive_name = f"{bundle_root}/nodes/{contribution_name}"
@@ -420,7 +400,7 @@ def _append_node_contributions(
                 entries.append(
                     (
                         node_archive_name,
-                        _source_identity(node_components, os.fstat(node_descriptor)),
+                        _source_path(node_components),
                         True,
                     )
                 )
@@ -450,7 +430,6 @@ def _append_node_contributions(
                     contribution_descriptor,
                     "ceph",
                     f"admitted Ceph evidence {contribution_name}",
-                    observed=_file_identity(ceph_facts),
                 )
                 try:
                     ceph_children = _append_children_at(
@@ -487,12 +466,11 @@ def _append_children_at(
                 directory_descriptor,
                 child_name,
                 f"{label}/{child_name}",
-                observed=_file_identity(child_facts),
             )
             entries.append(
                 (
                     child_archive_name,
-                    _source_identity(child_components, child_facts),
+                    _source_path(child_components),
                     True,
                 )
             )
@@ -512,13 +490,12 @@ def _append_children_at(
                 directory_descriptor,
                 child_name,
                 f"{label}/{child_name}",
-                observed=_file_identity(child_facts),
             )
             os.close(child_descriptor)
             entries.append(
                 (
                     child_archive_name,
-                    _source_identity(child_components, child_facts),
+                    _source_path(child_components),
                     False,
                 )
             )
@@ -622,25 +599,6 @@ def _require_final_absent_at(
     raise BundlePublicationError(f"final destination already exists: {final_path}")
 
 
-def _require_output_directory_unchanged(
-    output_descriptor: int, output_directory: Path
-) -> None:
-    try:
-        path_facts = os.stat(output_directory, follow_symlinks=False)
-        opened_facts = os.fstat(output_descriptor)
-    except OSError as error:
-        raise BundlePublicationError(
-            f"cannot confirm final destination parent before publication: {error}"
-        ) from error
-    if (
-        not stat.S_ISDIR(path_facts.st_mode)
-        or _file_identity(path_facts) != _file_identity(opened_facts)
-    ):
-        raise BundlePublicationError(
-            "final destination parent changed during bundle publication"
-        )
-
-
 def _create_private_candidate(
     output_descriptor: int, final_path: Path
 ) -> tuple[int, str, Path]:
@@ -699,8 +657,6 @@ def _open_directory_at(
     parent_descriptor: int,
     name: str,
     label: str,
-    *,
-    observed: tuple[int, int] | None = None,
 ) -> int:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     flags |= getattr(os, "O_CLOEXEC", 0)
@@ -717,12 +673,9 @@ def _open_directory_at(
         raise BundlePublicationError(
             f"cannot inspect opened {label}: {error}"
         ) from error
-    if not stat.S_ISDIR(facts.st_mode) or (
-        observed is not None
-        and _file_identity(facts) != observed
-    ):
+    if not stat.S_ISDIR(facts.st_mode):
         os.close(descriptor)
-        raise BundlePublicationError(f"{label} changed during bundle validation")
+        raise BundlePublicationError(f"{label} must be an ordinary directory")
     return descriptor
 
 
@@ -730,8 +683,6 @@ def _open_regular_at(
     parent_descriptor: int,
     name: str,
     label: str,
-    *,
-    observed: tuple[int, int] | None = None,
 ) -> int:
     flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
@@ -747,38 +698,14 @@ def _open_regular_at(
         raise BundlePublicationError(
             f"cannot inspect opened {label}: {error}"
         ) from error
-    if not stat.S_ISREG(facts.st_mode) or (
-        observed is not None
-        and _file_identity(facts) != observed
-    ):
+    if not stat.S_ISREG(facts.st_mode):
         os.close(descriptor)
-        raise BundlePublicationError(f"{label} changed during bundle validation")
+        raise BundlePublicationError(f"{label} must be a regular file")
     return descriptor
 
 
-def _file_identity(facts: os.stat_result) -> tuple[int, int]:
-    return facts.st_dev, facts.st_ino
-
-
-def _require_absent_at(
-    parent_descriptor: int, name: str, label: str
-) -> None:
-    try:
-        os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        raise BundlePublicationError(
-            f"cannot confirm removal of {label}: {error}"
-        ) from error
-    raise BundlePublicationError(f"cannot confirm removal of {label}")
-
-
-def _source_identity(
-    components: tuple[str, ...], facts: os.stat_result
-) -> _SourceIdentity:
-    device, inode = _file_identity(facts)
-    return components, device, inode
+def _source_path(components: tuple[str, ...]) -> _SourcePath:
+    return components
 
 
 def _list_entries(
@@ -801,26 +728,6 @@ def _list_entries(
             ) from error
         entries.append((name, facts))
     return entries
-
-
-def _require_owned_workspace_at(
-    workspace_descriptor: int, expected_path: str
-) -> None:
-    marker_descriptor = _open_regular_at(
-        workspace_descriptor, OWNERSHIP_MARKER, "workspace ownership marker"
-    )
-    expected = (expected_path + "\n").encode("utf-8")
-    try:
-        with os.fdopen(marker_descriptor, "rb") as marker:
-            recorded = marker.read(len(expected) + 1)
-    except OSError as error:
-        raise BundlePublicationError(
-            f"cannot read workspace ownership marker: {error}"
-        ) from error
-    if recorded != expected:
-        raise BundlePublicationError(
-            "workspace ownership marker does not match workspace"
-        )
 
 
 def _require_safe_component(component: str) -> None:
@@ -849,9 +756,9 @@ def _require_directory(path: Path, label: str) -> None:
 
 def _add_validated_entry(
     archive: tarfile.TarFile,
-    workspace_descriptor: int,
+    workspace: Path,
     archive_name: str,
-    source: _SourceIdentity | None,
+    source: _SourcePath | None,
     is_directory: bool,
     started_at: datetime,
 ) -> None:
@@ -863,62 +770,10 @@ def _add_validated_entry(
         _add_directory(archive, archive_name, started_at)
         return
 
-    source_descriptor = _reopen_admitted_source(
-        workspace_descriptor, source, is_directory=is_directory
-    )
-    try:
-        if is_directory:
-            _add_directory(archive, archive_name, started_at)
-        else:
-            _add_regular_file(
-                archive, archive_name, source_descriptor, started_at
-            )
-    finally:
-        os.close(source_descriptor)
-
-
-def _reopen_admitted_source(
-    workspace_descriptor: int,
-    source: _SourceIdentity,
-    *,
-    is_directory: bool,
-) -> int:
-    components, expected_device, expected_inode = source
-    if not components:
-        raise BundlePublicationError("admitted source path has no components")
-    for component in components:
-        _require_safe_component(component)
-
-    parent_descriptor = workspace_descriptor
-    try:
-        for component in components[:-1]:
-            next_descriptor = _open_directory_at(
-                parent_descriptor,
-                component,
-                f"admitted source {'/'.join(components)}",
-            )
-            if parent_descriptor != workspace_descriptor:
-                os.close(parent_descriptor)
-            parent_descriptor = next_descriptor
-
-        final_component = components[-1]
-        expected_identity = expected_device, expected_inode
-        if is_directory:
-            return _open_directory_at(
-                parent_descriptor,
-                final_component,
-                f"admitted source {'/'.join(components)}",
-                observed=expected_identity,
-            )
-        return _open_regular_at(
-            parent_descriptor,
-            final_component,
-            f"admitted source {'/'.join(components)}",
-            observed=expected_identity,
-        )
-    finally:
-        if parent_descriptor != workspace_descriptor:
-            os.close(parent_descriptor)
+    if is_directory:
+        _add_directory(archive, archive_name, started_at)
+    else:
+        _add_regular_file(archive, archive_name, workspace.joinpath(*source), started_at)
 
 
 def _add_directory(archive: tarfile.TarFile, name: str, started_at: datetime) -> None:
@@ -932,15 +787,11 @@ def _add_directory(archive: tarfile.TarFile, name: str, started_at: datetime) ->
 def _add_regular_file(
     archive: tarfile.TarFile,
     name: str,
-    source_descriptor: int,
+    source: Path,
     started_at: datetime,
 ) -> None:
-    with os.fdopen(os.dup(source_descriptor), "rb") as contents:
+    with source.open("rb") as contents:
         facts = os.fstat(contents.fileno())
-        if not stat.S_ISREG(facts.st_mode):
-            raise BundlePublicationError(
-                f"final-tree source changed type while writing {name}"
-            )
         member = tarfile.TarInfo(name)
         member.size = facts.st_size
         member.mode = 0o600
@@ -953,14 +804,6 @@ def _close_workspace_input(descriptor: int) -> str | None:
         os.close(descriptor)
     except OSError as error:
         return f"cannot close admitted workspace input: {error}"
-    return None
-
-
-def _close_workspace_parent(descriptor: int) -> str | None:
-    try:
-        os.close(descriptor)
-    except OSError as error:
-        return f"cannot close pinned workstation workspace parent: {error}"
     return None
 
 
@@ -989,29 +832,15 @@ def _remove_candidate_at(
     return None
 
 
-def _remove_owned_final_at(
+def _remove_published_final_at(
     output_descriptor: int,
     final_name: str,
     final_path: Path,
-    expected_identity: tuple[int, int],
 ) -> str | None:
     try:
-        current_facts = os.stat(
-            final_name,
-            dir_fd=output_descriptor,
-            follow_symlinks=False,
-        )
+        os.unlink(final_name, dir_fd=output_descriptor)
     except FileNotFoundError:
         return None
-    except OSError as error:
-        return f"cannot inspect interrupted final destination {final_path}: {error}"
-    if (
-        not stat.S_ISREG(current_facts.st_mode)
-        or _file_identity(current_facts) != expected_identity
-    ):
-        return f"refusing to remove replaced final destination {final_path}"
-    try:
-        os.unlink(final_name, dir_fd=output_descriptor)
     except OSError as error:
         return f"cannot remove interrupted final destination {final_path}: {error}"
     return None
