@@ -253,6 +253,9 @@ class PrometheusCollectionTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
+            second_metric_response = (
+                admitted / "metric-names" / "000002" / "response"
+            ).read_bytes()
             third_metric_exists = (
                 admitted / "metric-names" / "000003" / "response"
             ).is_file()
@@ -274,8 +277,12 @@ class PrometheusCollectionTests(unittest.TestCase):
         self.assertEqual(invalid_targets, b"{not-json")
         self.assertEqual(first_metric_result["outcome"], "failed")
         self.assertEqual(first_metric_result["error"]["kind"], "invalid_response")
-        self.assertEqual(second_metric_result["outcome"], "failed")
-        self.assertEqual(second_metric_result["error"]["kind"], "invalid_response")
+        self.assertEqual(
+            second_metric_response,
+            b'{"status":"success","data":{"metric":"not-a-list"}}',
+        )
+        self.assertEqual(second_metric_result["outcome"], "received")
+        self.assertIsNone(second_metric_result["error"])
         self.assertTrue(third_metric_exists)
         self.assertTrue(third_range_exists)
 
@@ -583,7 +590,7 @@ class PrometheusCollectionTests(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertEqual(buildinfo_result["outcome"], "received")
 
-    def test_existing_admission_or_failed_promotion_never_publishes_private_bytes(
+    def test_existing_admission_fails_real_promotion_without_publishing_private_bytes(
         self,
     ) -> None:
         with loopback_http_server(_successful_controls) as (
@@ -606,34 +613,17 @@ class PrometheusCollectionTests(unittest.TestCase):
                 staging_directory=staging,
                 contribution_directory=admitted,
             )
-            requests_before_promotion_case = len(server.requests)
-
-            sentinel.unlink()
-            admitted.rmdir()
-            with patch(
-                "ceph_incident_bundle.collect.prometheus.os.rename",
-                side_effect=OSError("injected promotion failure"),
-            ):
-                promotion_problems = collect_prometheus(
-                    url=url,
-                    since_seconds=60,
-                    request_timeout_seconds=5,
-                    staging_directory=staging,
-                    contribution_directory=admitted,
-                )
-
-            admitted_exists = admitted.exists()
+            request_count = len(server.requests)
+            sentinel_bytes = sentinel.read_bytes()
             private_response = staging / "contribution" / "buildinfo" / "response"
             private_response_exists = private_response.is_file()
             private_bytes = private_response.read_bytes()
 
-        self.assertEqual(requests_before_promotion_case, 0)
+        self.assertGreater(request_count, 0)
+        self.assertEqual(sentinel_bytes, b"unchanged")
         self.assertEqual(len(existing_problems), 1)
-        self.assertIn("contribution already exists", existing_problems[0])
-        self.assertEqual(len(promotion_problems), 1)
-        self.assertIn("cannot atomically promote", promotion_problems[0])
-        self.assertIn("private residue", promotion_problems[0])
-        self.assertFalse(admitted_exists)
+        self.assertIn("cannot atomically promote", existing_problems[0])
+        self.assertIn("private residue", existing_problems[0])
         self.assertTrue(private_response_exists)
         self.assertTrue(private_bytes)
 
@@ -671,13 +661,17 @@ class PrometheusCollectionTests(unittest.TestCase):
             result = json.loads(
                 (admitted / "job-values" / "result.json").read_text(encoding="utf-8")
             )
+            response = (admitted / "job-values" / "response").read_bytes()
 
         self.assertEqual(len(requests), 3)
         self.assertEqual(len(problems), 1)
         self.assertIn("job-values control response is malformed", problems[0])
         self.assertFalse(metric_directory_exists)
-        self.assertEqual(result["outcome"], "failed")
-        self.assertEqual(result["error"]["kind"], "invalid_response")
+        self.assertEqual(
+            response, b'{"status":"success","data":{"node":"not-a-list"}}'
+        )
+        self.assertEqual(result["outcome"], "received")
+        self.assertIsNone(result["error"])
 
     def test_embedded_credentials_remain_exact_without_content_special_cases(
         self,

@@ -705,10 +705,11 @@ collect_kubernetes(
             staging_exists = staging.exists()
 
         self.assertEqual(sentinel_bytes, b"unchanged")
-        self.assertEqual(recorded_argv, [])
-        self.assertFalse(staging_exists)
+        self.assertTrue(recorded_argv)
+        self.assertTrue(staging_exists)
         self.assertEqual(len(problems), 1)
-        self.assertIn("admitted Kubernetes contribution already exists", problems[0])
+        self.assertIn("cannot atomically promote complete contribution", problems[0])
+        self.assertIn(f"private residue: {staging}", problems[0])
 
     def test_failed_atomic_promotion_keeps_private_state_out_of_admitted(self) -> None:
         with TemporaryDirectory() as directory:
@@ -776,7 +777,7 @@ collect_kubernetes(
         self.assertIn("cannot preserve consumer-pods-wide Probe", problems[0])
         self.assertIn(f"private residue: {staging}", problems[0])
 
-    def test_missing_private_parent_fails_before_kubectl_or_admission(self) -> None:
+    def test_missing_private_parent_reports_real_staging_failure(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             fake_bin = root / "bin"
@@ -801,7 +802,7 @@ collect_kubernetes(
         self.assertFalse(admitted_exists)
         self.assertEqual(recorded_argv, [])
         self.assertEqual(len(problems), 1)
-        self.assertIn("cannot validate private contribution boundaries", problems[0])
+        self.assertIn("cannot create private staging", problems[0])
 
     def test_missing_kubectl_records_each_failed_start_and_promotes_captures(self) -> None:
         with TemporaryDirectory() as directory:

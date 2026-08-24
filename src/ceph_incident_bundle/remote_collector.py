@@ -6,10 +6,8 @@ import argparse
 from datetime import datetime, timedelta, timezone
 import errno
 import json
-import math
 import os
 from pathlib import Path
-import re
 import shutil
 import signal
 import stat
@@ -638,7 +636,7 @@ def _run_probe(probe: Probe, capture: Path, timeout_seconds: int) -> bool:
     ).open("xb") as stderr_file:
         try:
             process = subprocess.Popen(
-                list(probe.argv),
+                probe.argv,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
                 stderr=stderr_file,
@@ -687,7 +685,7 @@ def _run_probe(probe: Probe, capture: Path, timeout_seconds: int) -> bool:
 
     finished_at = _utc_now()
     result = {
-        "argv": list(probe.argv),
+        "argv": probe.argv,
         "started_at": started_at,
         "finished_at": finished_at,
         "outcome": outcome,
@@ -711,6 +709,26 @@ def _run_probe(probe: Probe, capture: Path, timeout_seconds: int) -> bool:
     return succeeded
 
 
+def _capture_probe(
+    probe: Probe,
+    probes_directory: Path,
+    timeout_seconds: int,
+) -> bool:
+    """Attempt one Probe without letting capture I/O stop later evidence."""
+    try:
+        return _run_probe(
+            probe,
+            probes_directory / probe.name,
+            timeout_seconds,
+        )
+    except OSError as capture_error:
+        print(
+            f"cannot preserve {probe.name} Probe Capture: {capture_error}",
+            file=sys.stderr,
+        )
+        return False
+
+
 def _run_ceph_probes(probes_directory: Path, timeout_seconds: int) -> bool:
     """Run the fixed direct-Ceph catalog and confirmed crash details."""
     succeeded = True
@@ -718,7 +736,7 @@ def _run_ceph_probes(probes_directory: Path, timeout_seconds: int) -> bool:
     crash_list_capture = probes_directory / "crash-ls-json"
 
     for probe in CEPH_PROBE_CATALOG:
-        probe_succeeded = _run_ceph_probe(
+        probe_succeeded = _capture_probe(
             probe,
             probes_directory,
             timeout_seconds,
@@ -752,7 +770,7 @@ def _run_ceph_probes(probes_directory: Path, timeout_seconds: int) -> bool:
             name=f"crash-info-{sequence:06d}",
             argv=("ceph", "crash", "info", crash_id),
         )
-        probe_succeeded = _run_ceph_probe(
+        probe_succeeded = _capture_probe(
             probe,
             probes_directory,
             timeout_seconds,
@@ -760,27 +778,6 @@ def _run_ceph_probes(probes_directory: Path, timeout_seconds: int) -> bool:
         succeeded = probe_succeeded and succeeded
 
     return succeeded
-
-
-def _run_ceph_probe(
-    probe: Probe,
-    probes_directory: Path,
-    timeout_seconds: int,
-) -> bool:
-    """Attempt one Ceph Probe without letting capture I/O stop the catalog."""
-    try:
-        return _run_probe(
-            probe,
-            probes_directory / probe.name,
-            timeout_seconds,
-        )
-    except OSError as capture_error:
-        print(
-            f"cannot preserve {probe.name} Probe Capture: {capture_error}",
-            file=sys.stderr,
-        )
-        return False
-
 
 def _stream_archive(evidence_root: Path) -> None:
     with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as archive:
@@ -792,10 +789,8 @@ def _stream_archive(evidence_root: Path) -> None:
 
 def _parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    parser.add_argument("--since-seconds", type=_canonical_seconds, required=True)
-    parser.add_argument(
-        "--probe-timeout-seconds", type=_canonical_seconds, required=True
-    )
+    parser.add_argument("--since-seconds", type=int, required=True)
+    parser.add_argument("--probe-timeout-seconds", type=int, required=True)
     parser.add_argument("--collect-ceph", action="store_true")
     raw_arguments = sys.argv[1:]
     if (
@@ -804,27 +799,7 @@ def _parse_arguments() -> argparse.Namespace:
         or raw_arguments.count("--collect-ceph") > 1
     ):
         parser.error("each fixed Remote Node Collector switch may appear only once")
-    arguments = parser.parse_args()
-    if arguments.since_seconds <= 0:
-        parser.error("since seconds must be positive")
-    if not _fits_process_wait_timeout(arguments.probe_timeout_seconds):
-        parser.error("probe timeout exceeds the supported range")
-    return arguments
-
-
-def _canonical_seconds(value: str) -> int:
-    if re.fullmatch(r"0|[1-9][0-9]*", value, re.ASCII) is None:
-        raise argparse.ArgumentTypeError(
-            "control values must use canonical ASCII decimal seconds"
-        )
-    return int(value)
-
-
-def _fits_process_wait_timeout(seconds: int) -> bool:
-    try:
-        return math.isfinite(float(seconds))
-    except OverflowError:
-        return False
+    return parser.parse_args()
 
 
 def main() -> int:
@@ -846,18 +821,11 @@ def main() -> int:
             (workspace / "ceph" / "probes").mkdir(parents=True)
 
         for probe in NODE_PROBE_CATALOG:
-            try:
-                probe_succeeded = _run_probe(
-                    probe,
-                    node / "probes" / probe.name,
-                    arguments.probe_timeout_seconds,
-                )
-            except OSError as capture_error:
-                print(
-                    f"cannot preserve {probe.name} Probe Capture: {capture_error}",
-                    file=sys.stderr,
-                )
-                probe_succeeded = False
+            probe_succeeded = _capture_probe(
+                probe,
+                node / "probes",
+                arguments.probe_timeout_seconds,
+            )
             succeeded = succeeded and probe_succeeded
         if arguments.collect_ceph:
             succeeded = _run_ceph_probes(
@@ -879,19 +847,11 @@ def main() -> int:
                 "--output=short-iso-precise",
             ),
         )
-        try:
-            journal_succeeded = _run_probe(
-                journal_probe,
-                node / "probes" / journal_probe.name,
-                arguments.probe_timeout_seconds,
-            )
-        except OSError as capture_error:
-            print(
-                "cannot preserve journal-system Probe Capture: "
-                f"{capture_error}",
-                file=sys.stderr,
-            )
-            journal_succeeded = False
+        journal_succeeded = _capture_probe(
+            journal_probe,
+            node / "probes",
+            arguments.probe_timeout_seconds,
+        )
         succeeded = succeeded and journal_succeeded
         succeeded = _copy_log_files(
             files,

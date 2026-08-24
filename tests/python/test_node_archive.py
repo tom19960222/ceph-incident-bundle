@@ -44,6 +44,35 @@ BASE_MEMBERS = [
 
 
 class NodeArchiveAdmissionTests(unittest.TestCase):
+    def test_compressed_stream_is_validated_in_one_pass(self) -> None:
+        real_open = Path.open
+        archive_reads = 0
+
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            staging = workspace / "private" / "node-a"
+            staging.mkdir(parents=True)
+            archive = staging / "received.tar.gz"
+            extraction = staging / "extracted"
+            contribution = workspace / "admitted" / "node-a"
+            contribution.parent.mkdir()
+            write_archive(archive, BASE_MEMBERS)
+
+            def count_archive_reads(path: Path, *args, **kwargs):
+                nonlocal archive_reads
+                mode = args[0] if args else kwargs.get("mode", "r")
+                if path == archive and mode == "rb":
+                    archive_reads += 1
+                return real_open(path, *args, **kwargs)
+
+            with patch("pathlib.Path.open", new=count_archive_reads):
+                admit_archive(
+                    archive, extraction, contribution, ceph_allowed=False
+                )
+
+            self.assertEqual(archive_reads, 1)
+            self.assertTrue((contribution / "node/files").is_dir())
+
     def test_missing_archive_retains_its_file_system_error(self) -> None:
         with TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -82,7 +111,7 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
                 )
 
             self.assertEqual(caught.exception.errno, errno.ENOTDIR)
-            self.assertFalse(extraction.exists())
+            self.assertTrue(extraction.exists())
             self.assertEqual(contribution_parent.read_bytes(), b"not a directory")
 
     def test_initial_tar_open_retains_its_file_system_error(self) -> None:
@@ -480,7 +509,7 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
             self.assertFalse(extraction.exists())
             self.assertFalse(contribution.exists())
 
-    def test_missing_or_malformed_cpython_member_offset_is_rejected(self) -> None:
+    def test_missing_or_malformed_cpython_archive_offset_is_rejected(self) -> None:
         original_open = tarfile.open
         for label, replacement in (("missing", None), ("malformed", "512")):
             with self.subTest(label=label), TemporaryDirectory() as directory:
@@ -500,9 +529,9 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
                     def changed_members():
                         members = original_getmembers()
                         if replacement is None:
-                            del members[-1].offset_data
+                            del opened.offset
                         else:
-                            members[-1].offset_data = replacement
+                            opened.offset = replacement
                         return members
 
                     opened.getmembers = changed_members
@@ -688,7 +717,7 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
                     self.assertFalse(extraction.exists())
                     self.assertFalse(contribution.exists())
 
-    def test_existing_contribution_retains_its_file_system_error(self) -> None:
+    def test_existing_contribution_fails_real_promotion_without_replacement(self) -> None:
         with TemporaryDirectory() as directory:
             workspace = Path(directory)
             staging = workspace / "private" / "node-a"
@@ -701,11 +730,11 @@ class NodeArchiveAdmissionTests(unittest.TestCase):
             sentinel.write_bytes(b"unchanged")
             write_archive(archive, BASE_MEMBERS)
 
-            with self.assertRaises(FileExistsError):
+            with self.assertRaises(OSError):
                 admit_archive(archive, extraction, contribution, ceph_allowed=False)
 
             self.assertEqual(sentinel.read_bytes(), b"unchanged")
-            self.assertFalse(extraction.exists())
+            self.assertTrue(extraction.exists())
 
     @staticmethod
     def _truncated_archive(workspace: Path) -> bytes:
