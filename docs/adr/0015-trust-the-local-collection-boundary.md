@@ -1,0 +1,3 @@
+# Trust the local collection boundary
+
+The Collection Workstation OS, invoking user, inventory author, and configured workspace and output parents are trusted, while SSH results, Node Evidence Archives, and Kubernetes and Prometheus responses remain untrusted. V1 therefore preserves structural archive admission, command-injection defenses, best-effort evidence retention, invocation-owned cleanup, and no-overwrite publication, but does not defend against a malicious local user replacing directories during collection, absurdly large human-authored integers, unavailable terminal streams after publication, or every theoretical syscall race; expanding that boundary requires an explicit requirement and risk budget.

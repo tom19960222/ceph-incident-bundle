@@ -33,7 +33,7 @@ A collection run that leaves persistent configuration, services, packages, mount
 _Avoid_: Zero-write collection, non-invasive collection
 
 **Collection Workstation**:
-The operator-controlled machine that starts collection, coordinates Target Nodes, and owns the resulting Incident Bundle.
+The trusted, operator-controlled machine that starts collection, coordinates Target Nodes, and owns the resulting Incident Bundle. Its OS, invoking user, inventory author, and configured workspace and output parents are inside the local trust boundary.
 _Avoid_: Collector node, control node
 
 **Target Node**:

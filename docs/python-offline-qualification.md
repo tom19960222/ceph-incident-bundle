@@ -1,5 +1,8 @@
 # Offline CPython 3.10 qualification record
 
+> **Historical evidence:** Do not read this document or treat its qualified snapshot as a current
+> requirement unless investigating the historical qualification.
+
 ## Verdict
 
 **PASS — evidence-only qualification.** The exact post-#101 head completed the fully offline installed-product suite under actual CPython 3.10. No production code, production test seam, or architecture changed for this qualification.

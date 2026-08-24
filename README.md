@@ -115,8 +115,15 @@ container 或進入 workload。
 
 ## 開發驗證與 rollback
 
-離線驗證會 build wheel、安裝到隔離環境，再從 installed console command 跑完整 Python
-suite。請明確選預先準備好的 CPython 3.10.x：
+日常修改先用目前的 Python 直接跑 component test suite；installed CLI 與 wheel surface
+留給 `make validate`：
+
+```bash
+make test
+```
+
+Pre-merge 或 release validation 會從 clean source build wheel、安裝到隔離環境，再從
+installed console command 跑完整 Python suite。請明確選預先準備好的 CPython 3.10.x：
 
 ```bash
 make validate PYTHON=/absolute/path/to/cpython3.10

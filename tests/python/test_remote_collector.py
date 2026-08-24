@@ -268,12 +268,15 @@ class _Entry:
 class _Scanner:
     def __init__(self, scanner):
         self._scanner = scanner
+        self._iterator = iter(scanner)
     def __enter__(self):
         return self
     def __exit__(self, *args):
         return self._scanner.__exit__(*args)
     def __iter__(self):
-        return (_Entry(entry) for entry in self._scanner)
+        return self
+    def __next__(self):
+        return _Entry(next(self._iterator))
 
 def scandir(path):
     scanner = _original_scandir(path)
@@ -409,12 +412,15 @@ class _Entry:
 class _Scanner:
     def __init__(self, scanner):
         self._scanner = scanner
+        self._iterator = iter(scanner)
     def __enter__(self):
         return self
     def __exit__(self, *args):
         return self._scanner.__exit__(*args)
     def __iter__(self):
-        return (_Entry(entry) for entry in self._scanner)
+        return self
+    def __next__(self):
+        return _Entry(next(self._iterator))
 
 def scandir(path):
     return _Scanner(_original_scandir(path))
