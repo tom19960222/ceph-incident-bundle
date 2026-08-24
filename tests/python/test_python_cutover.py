@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import configparser
-import hashlib
 import os
 from pathlib import Path
 import re
@@ -41,89 +40,6 @@ EXPECTED_METADATA_MEMBERS = {
 
 
 class PythonOnlyRepositorySurfaceTests(unittest.TestCase):
-    def test_deleted_shell_scenarios_have_an_exact_auditable_disposition(self) -> None:
-        record = (ROOT / "docs" / "python-cutover-coverage.md").read_text(
-            encoding="utf-8"
-        )
-        expected = {
-            *(f"R{number}" for number in range(1, 8)),
-            *(f"C{number}" for number in range(1, 24)),
-            *(f"CA{number}" for number in range(1, 6)),
-            *(f"N{number}" for number in range(1, 14)),
-            *(f"V{number}" for number in range(1, 21)),
-            *(f"K{number}" for number in range(1, 11)),
-            *(f"P{number}" for number in range(1, 19)),
-            "P6a",
-            *(f"B{number}" for number in range(1, 12)),
-            *(f"O{number}" for number in range(1, 38)),
-        }
-        dispositions: dict[str, str] = {}
-        duplicates: list[str] = []
-        for line in record.splitlines():
-            if not line.startswith("|"):
-                continue
-            columns = line.split("|")
-            scenario_ids = re.findall(
-                r"\b(?:CA|R|C|N|V|K|P|B|O)\d+[a-z]?\b", columns[1]
-            )
-            disposition = columns[2].strip()
-            for scenario_id in scenario_ids:
-                if scenario_id in dispositions:
-                    duplicates.append(scenario_id)
-                dispositions[scenario_id] = disposition
-        live_tests = re.findall(
-            r"`(test_[a-z_]+)\.[A-Za-z_]+\.(test_[a-z0-9_]+)`",
-            record,
-        )
-
-        self.assertEqual(set(dispositions), expected)
-        self.assertEqual(duplicates, [])
-        self.assertEqual(len(dispositions), 145)
-        self.assertEqual(
-            sum(value == "Shell-only" for value in dispositions.values()), 11
-        )
-        self.assertEqual(
-            sum(
-                value in {"Covered", "Obsolete"}
-                for value in dispositions.values()
-            ),
-            134,
-        )
-        expected_fingerprints: dict[str, str] = {}
-        for line in (ROOT / "docs" / "python-cutover-coverage.sha256").read_text(
-            encoding="utf-8"
-        ).splitlines():
-            if not line or line.startswith("#"):
-                continue
-            digest, scenario_id = line.split()
-            expected_fingerprints[scenario_id] = digest
-        actual_fingerprints: dict[str, str] = {}
-        for line in record.splitlines():
-            if not line.startswith("|"):
-                continue
-            columns = line.split("|")
-            scenario_ids = re.findall(
-                r"\b(?:CA|R|C|N|V|K|P|B|O)\d+[a-z]?\b", columns[1]
-            )
-            for scenario_id in scenario_ids:
-                mapped_clause = (
-                    f"{scenario_id}|{columns[2].strip()}|{columns[3].strip()}"
-                )
-                actual_fingerprints[scenario_id] = hashlib.sha256(
-                    mapped_clause.encode("utf-8")
-                ).hexdigest()
-        self.assertEqual(expected_fingerprints, actual_fingerprints)
-        self.assertEqual(len(expected_fingerprints), 145)
-        self.assertGreater(len(live_tests), 0)
-        missing_live_tests = []
-        for module, method in live_tests:
-            test_source = ROOT / "tests" / "python" / f"{module}.py"
-            if not test_source.is_file() or f"def {method}(" not in test_source.read_text(
-                encoding="utf-8"
-            ):
-                missing_live_tests.append(f"{module}.{method}")
-        self.assertEqual(missing_live_tests, [])
-
     def test_historical_product_and_qualification_paths_are_absent(self) -> None:
         removed_paths = (
             "run",

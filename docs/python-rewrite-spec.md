@@ -1,5 +1,9 @@
 # Rewrite the incident evidence collector in Python
 
+> **Historical record:** Do not read this document or treat it as a current requirement unless
+> investigating the Python rewrite. Current behavior is documented by `README.md`, `CONTEXT.md`,
+> active ADRs, the safety contract, and current tests.
+
 ## Problem Statement
 
 During a Ceph incident, an operator needs to preserve as much evidence as possible from an explicitly selected set of servers and, when configured, from a Ceph cluster, an external-Rook Kubernetes cluster, and Prometheus. One unavailable command, unreadable file, unreachable node, or failed optional request must not discard evidence that was collected successfully whenever final publication remains possible; the first-version terminal-publication trade-off is the explicit exception and never deletes original source evidence.

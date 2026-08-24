@@ -1,5 +1,8 @@
 # Live single-Target-Node acceptance record
 
+> **Historical evidence:** Do not read this document or treat its qualified snapshot as a current
+> requirement unless investigating the historical qualification.
+
 ## Verdict
 
 **PASS — evidence-only, operationally read-only acceptance.** The exact post-#102

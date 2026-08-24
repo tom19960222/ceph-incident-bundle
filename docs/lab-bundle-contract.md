@@ -1,5 +1,8 @@
 # Python V1 Real-Lab Bundle Contract 與 Stable-State Schema
 
+> **Opt-in only:** Read this document only when executing or changing an explicitly authorized
+> real-lab acceptance workflow. It is not a default requirement for product changes.
+
 Issues #85 and #115 define the current Python-only contract. A live acceptance harness inspects
 the installed collector's published bundle as untrusted input and compares pre/post stable state;
 there is no product verifier, product manifest requirement, legacy differential runner or live-lab
@@ -59,7 +62,7 @@ ledger, fixed schemas, configured-source coverage, pre/post stable-state project
 Live evidence bodies are time-dependent; acceptance validates their raw preservation and
 structure, not equality with evidence captured at a different moment.
 
-Current reviewed anchors are `docs/python-offline-qualification.md` (#102),
+Historical acceptance anchors are `docs/python-offline-qualification.md` (#102),
 `docs/python-single-node-acceptance.md` (#103), and `docs/python-full-live-acceptance.md` (#104).
 Their raw manifests and bundles remain owner-only local evidence; this document does not replace
 their exact hashes or verdicts.

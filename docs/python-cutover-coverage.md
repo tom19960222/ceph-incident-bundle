@@ -1,5 +1,8 @@
 # Python cutover coverage record
 
+> **Historical record:** Do not read this document or treat its scenario ledger as a current
+> requirement unless investigating the Python cutover.
+
 This is a non-runnable deletion audit for the shell qualification suite removed at the Python
 cutover. It is not operator guidance and none of the historical paths, commands, flags, layouts,
 or exit conventions below are supported interfaces. Current usage is in `README.md`; rollback is

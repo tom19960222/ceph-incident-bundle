@@ -1,12 +1,15 @@
 # Real-Lab Validation Runbook
 
+> **Opt-in only:** Read this document only when executing or changing an explicitly authorized
+> real-lab acceptance workflow. It is not a default requirement for product changes.
+
 ## Current Status
 
 Issues #85 and #115 define a Python-only product. There is no product command or Make target for
 live-lab execution. A real-lab run is an agent-managed acceptance action that requires explicit
 user opt-in, an active TOML Lab Profile, pinned identities and an owner-only evidence root.
 
-Current reviewed qualification records are:
+Historical reviewed qualification records are:
 
 - `docs/python-offline-qualification.md` — #102, CPython 3.10 clean-source wheel/install gate.
 - `docs/python-single-node-acceptance.md` — #103, one pinned Target Node.
