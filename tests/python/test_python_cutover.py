@@ -145,6 +145,59 @@ class PythonOnlyRepositorySurfaceTests(unittest.TestCase):
 
         self.assertEqual(present, [])
 
+    def test_redundant_development_and_superseded_requirement_paths_are_absent(
+        self,
+    ) -> None:
+        removed_paths = (
+            ".devcontainer",
+            ".dockerignore",
+            "Dockerfile.dev",
+            "compose.yaml",
+            "docs/development.md",
+            "docs/rewrite-requirements.md",
+            "tools/bootstrap-debian-docker.sh",
+            "tools/dev-entrypoint.sh",
+            "tools/dev-profile.sh",
+        )
+
+        present = [path for path in removed_paths if (ROOT / path).exists()]
+
+        self.assertEqual(present, [])
+
+    def test_final_repository_surface_has_no_embedded_agent_skills(self) -> None:
+        required_guidance = (
+            "AGENTS.md",
+            "CONTEXT.md",
+            "docs/adr",
+            "docs/agents/domain.md",
+            "docs/agents/issue-tracker.md",
+            "docs/agents/triage-labels.md",
+            "docs/read-only-safety.md",
+            "docs/lab-validation-runbook.md",
+            "docs/lab-bundle-contract.md",
+        )
+        project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        example_inventory = (ROOT / "inventory" / "example.ini").read_text(
+            encoding="utf-8"
+        )
+
+        embedded_skill_files = (
+            [
+                str(path.relative_to(ROOT))
+                for path in (ROOT / ".agents" / "skills").rglob("*")
+                if path.is_file()
+            ]
+            if (ROOT / ".agents" / "skills").exists()
+            else []
+        )
+        self.assertEqual(embedded_skill_files, [])
+        self.assertFalse((ROOT / "skills-lock.json").exists())
+        self.assertEqual(
+            [path for path in required_guidance if not (ROOT / path).exists()], []
+        )
+        self.assertIn("dependencies = []", project)
+        self.assertNotIn("ssh_user", example_inventory)
+
     def test_active_product_files_describe_only_the_python_interface(self) -> None:
         active_files = (
             ROOT / "README.md",
@@ -248,9 +301,13 @@ class InstalledWheelSurfaceTests(unittest.TestCase):
                     for name in members
                     if name.startswith("ceph_incident_bundle-")
                 }
+                metadata = archive.read(
+                    next(name for name in members if name.endswith(".dist-info/METADATA"))
+                ).decode("utf-8")
 
             self.assertEqual(product_members, EXPECTED_PRODUCT_MEMBERS)
             self.assertEqual(metadata_members, EXPECTED_METADATA_MEMBERS)
+            self.assertNotIn("\nRequires-Dist:", metadata)
 
             environment = temporary / "installed"
             subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
@@ -289,6 +346,13 @@ class InstalledWheelSurfaceTests(unittest.TestCase):
 
 
 def _build_wheel(wheelhouse: Path) -> Path:
+    existing_wheel = os.environ.get("CEPH_INCIDENT_BUNDLE_WHEEL")
+    if existing_wheel:
+        wheel = Path(existing_wheel)
+        if not wheel.is_file():
+            raise AssertionError(f"expected built wheel, found {wheel}")
+        return wheel
+
     wheelhouse.mkdir(parents=True, exist_ok=True)
     source = wheelhouse / "_source"
     shutil.copytree(

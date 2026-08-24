@@ -17,7 +17,7 @@ from ceph_incident_bundle.collect.bundle import (
 
 class IncidentBundlePublicationTests(unittest.TestCase):
     def test_admitted_state_is_published_with_the_exact_bundle_surface(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -76,7 +76,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertTrue(all(member.isdir() or member.isreg() for member in members))
 
     def test_published_mode_respects_restrictive_process_umask(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         previous_umask = os.umask(0o027)
         try:
@@ -106,7 +106,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(observed_umask, 0o027)
 
     def test_existing_final_destination_is_never_replaced(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -132,7 +132,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(candidates, [])
 
     def test_candidate_cleanup_failure_rolls_back_the_published_name(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         real_unlink = os.unlink
         candidate_failure_seen = False
@@ -185,7 +185,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertIn("final publication was rolled back", str(caught.exception))
 
     def test_prepublication_candidate_residue_is_reported_with_its_exact_path(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         real_unlink = os.unlink
 
@@ -236,7 +236,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertIn("cannot remove private Incident Bundle candidate", str(caught.exception))
 
     def test_links_fifos_and_ambiguous_components_never_enter_a_bundle(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         for hostile_type in ("symlink", "fifo", "backslash"):
             with self.subTest(hostile_type=hostile_type), TemporaryDirectory() as directory:
@@ -274,7 +274,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
                 self.assertEqual(list(root.glob(".*.candidate.*")), [])
 
     def test_symlinked_admitted_root_never_enters_a_bundle(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -319,7 +319,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
     def test_ancestor_swap_after_enumeration_fails_publication_closed(
         self,
     ) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         real_addfile = tarfile.TarFile.addfile
         swapped = False
@@ -379,7 +379,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(outside_bytes, b"outside\n")
 
     def test_output_parent_swap_cannot_redirect_candidate_or_final(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         real_tar_open = tarfile.open
         swapped = False
@@ -442,7 +442,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(moved_names, set())
 
     def test_workspace_root_swap_never_deletes_the_replacement(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         real_addfile = tarfile.TarFile.addfile
         swapped = False
@@ -501,7 +501,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
     def test_workspace_swap_at_cleanup_entry_never_deletes_replacement(
         self,
     ) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         real_listdir = os.listdir
         swapped = False
@@ -568,7 +568,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertIn("refusing to clean", cleanup_problem)
 
     def test_missing_posix_no_follow_support_fails_closed(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -595,7 +595,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(candidates, [])
 
     def test_prior_problem_is_recorded_as_partial_without_changing_delivery_status(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -622,7 +622,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(outcome, "partial")
 
     def test_output_directory_handle_close_does_not_undo_delivery(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         real_close = os.close
         close_failure_seen = False
@@ -673,7 +673,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(outcome, "complete")
 
     def test_output_directory_close_interrupt_does_not_undo_delivery(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         real_close = os.close
         interrupted = False
@@ -715,7 +715,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertTrue(final_exists)
 
     def test_archive_construction_failure_removes_owned_incomplete_work(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -753,7 +753,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(outside_bytes, b"unchanged")
 
     def test_archive_close_failure_removes_owned_incomplete_work(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         real_close = tarfile.TarFile.close
         close_failure_seen = False
@@ -793,7 +793,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(candidates, [])
 
     def test_atomic_publication_failure_removes_private_candidate(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
 
         def fail_link(*args, **kwargs) -> None:
@@ -839,7 +839,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(candidates, [])
 
     def test_interrupt_after_final_link_rolls_back_owned_final(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         real_unlink = os.unlink
         interrupted = False
@@ -889,7 +889,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(candidates, [])
 
     def test_interrupt_returned_by_link_rolls_back_owned_final(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         real_link = os.link
 
@@ -940,7 +940,7 @@ class IncidentBundlePublicationTests(unittest.TestCase):
         self.assertEqual(candidates, [])
 
     def test_interrupted_candidate_cleanup_reports_exact_residue(self) -> None:
-        inventory = b"[common]\nssh_user = root\n[nodes]\nnode-a = node-a.example\n"
+        inventory = b"[common]\n[nodes]\nnode-a = node-a.example\n"
         started_at = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
         real_unlink = os.unlink
 

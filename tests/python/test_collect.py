@@ -20,14 +20,12 @@ from ceph_incident_bundle.inventory import TargetNode
 
 INVENTORY = b"""\
 [common]
-ssh_user = root
 [nodes]
 node-a = node-a.example.test
 """
 
 MULTI_NODE_INVENTORY = b"""\
 [common]
-ssh_user = root
 [nodes]
 node-a = node-a.example.test
 node-b = node-b.example.test
@@ -37,7 +35,6 @@ source = node-a
 
 KUBERNETES_INVENTORY = b"""\
 [common]
-ssh_user = root
 probe_timeout = 7m
 [nodes]
 node-a = node-a.example.test
@@ -49,7 +46,6 @@ operator_namespace = rook-operator
 
 PROMETHEUS_INVENTORY = b"""\
 [common]
-ssh_user = root
 [nodes]
 node-a = node-a.example.test
 [kubernetes]
@@ -63,6 +59,33 @@ request_timeout = 7s
 
 
 class TopLevelCollectionTests(unittest.TestCase):
+    def test_node_collection_always_targets_root_at_the_validated_address(
+        self,
+    ) -> None:
+        process = Mock()
+        process.wait.return_value = 255
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            staging = root / "private" / "node-a"
+            staging.parent.mkdir(parents=True)
+            contribution = root / "admitted" / "node-a"
+            contribution.parent.mkdir(parents=True)
+            with patch(
+                "ceph_incident_bundle.collect.node.subprocess.Popen",
+                return_value=process,
+            ) as popen:
+                collect_node(
+                    TargetNode("node-a", "node-a.example.test"),
+                    since_seconds=3600,
+                    probe_timeout_seconds=60,
+                    ssh_connect_timeout_seconds=10,
+                    ceph_allowed=False,
+                    staging_directory=staging,
+                    contribution_directory=contribution,
+                )
+
+        self.assertIn("root@node-a.example.test", popen.call_args.args[0])
+
     def test_interrupt_at_publication_entry_keeps_top_level_cleanup_ownership(
         self,
     ) -> None:
@@ -237,7 +260,6 @@ class TopLevelCollectionTests(unittest.TestCase):
             ):
                 collect_node(
                     TargetNode("node-a", "node-a.example.test"),
-                    ssh_user="root",
                     since_seconds=3600,
                     probe_timeout_seconds=60,
                     ssh_connect_timeout_seconds=10,
@@ -293,7 +315,6 @@ class TopLevelCollectionTests(unittest.TestCase):
             ):
                 collect_node(
                     TargetNode("node-a", "node-a.example.test"),
-                    ssh_user="root",
                     since_seconds=3600,
                     probe_timeout_seconds=60,
                     ssh_connect_timeout_seconds=10,

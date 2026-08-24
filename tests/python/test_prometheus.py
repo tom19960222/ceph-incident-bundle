@@ -1,9 +1,5 @@
-from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
-import socket
-import threading
 import time
 from tempfile import TemporaryDirectory
 from typing import Callable
@@ -12,43 +8,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from ceph_incident_bundle.collect.prometheus import collect_prometheus
-
-
-class _PrometheusHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def do_GET(self) -> None:
-        server = self.server
-        assert isinstance(server, _PrometheusServer)
-        server.requests.append((self.command, self.path))
-        status, chunks, declared_length, disconnect = server.response_for(self.path)
-        self.send_response(status)
-        if declared_length is not None:
-            self.send_header("Content-Length", str(declared_length))
-        self.end_headers()
-        try:
-            for delay, chunk in chunks:
-                time.sleep(delay)
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        if disconnect:
-            try:
-                self.connection.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            self.connection.close()
-
-    def log_message(self, format: str, *args: object) -> None:
-        pass
-
-
-class _PrometheusServer(ThreadingHTTPServer):
-    requests: list[tuple[str, str]]
-    response_for: Callable[
-        [str], tuple[int, list[tuple[float, bytes]], int | None, bool]
-    ]
+from prometheus_test_support import loopback_http_server
 
 
 def _successful_controls(
@@ -82,32 +42,15 @@ def _successful_controls(
     return 200, [(0, body)], len(body), False
 
 
-@contextmanager
-def _loopback_prometheus(
-    response_for: Callable[
-        [str], tuple[int, list[tuple[float, bytes]], int | None, bool]
-    ] = _successful_controls,
-):
-    server = _PrometheusServer(("127.0.0.1", 0), _PrometheusHandler)
-    server.requests = []
-    server.response_for = response_for
-    thread = threading.Thread(target=server.serve_forever)
-    thread.start()
-    try:
-        host, port = server.server_address
-        yield server, f"http://{host}:{port}"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join()
-
-
 class PrometheusCollectionTests(unittest.TestCase):
     def test_fixed_controls_and_per_job_discovery_are_raw_ordered_and_path_safe(
         self,
     ) -> None:
         hostile_job = 'NoDe/../../bad"\\\n\r\t\x00\b\f\v\u0085name'
-        with _loopback_prometheus() as (server, url), TemporaryDirectory() as directory:
+        with loopback_http_server(_successful_controls) as (
+            server,
+            url,
+        ), TemporaryDirectory() as directory:
             root = Path(directory)
             staging = root / "private" / "prometheus"
             staging.parent.mkdir()
@@ -276,7 +219,7 @@ class PrometheusCollectionTests(unittest.TestCase):
                 body = b'{"status":"success","data":["metric_ok"]}'
             return 200, [(0, body)], len(body), False
 
-        with _loopback_prometheus(mixed_responses) as (
+        with loopback_http_server(mixed_responses) as (
             server,
             url,
         ), TemporaryDirectory() as directory:
@@ -390,7 +333,7 @@ class PrometheusCollectionTests(unittest.TestCase):
             body = b'{"status":"success","data":{}}'
             return 200, [(0, body)], len(body), False
 
-        with _loopback_prometheus(range_responses) as (
+        with loopback_http_server(range_responses) as (
             server,
             url,
         ), TemporaryDirectory() as directory:
@@ -515,7 +458,7 @@ class PrometheusCollectionTests(unittest.TestCase):
             body = b'{"status":"success","data":[]}'
             return 200, [(0, body)], len(body), False
 
-        with _loopback_prometheus(timed_responses) as (
+        with loopback_http_server(timed_responses) as (
             server,
             url,
         ), TemporaryDirectory() as directory:
@@ -571,7 +514,7 @@ class PrometheusCollectionTests(unittest.TestCase):
             body = b'{"status":"success","data":[]}'
             return 200, [(0, body)], len(body), False
 
-        with _loopback_prometheus(interrupted_responses) as (
+        with loopback_http_server(interrupted_responses) as (
             server,
             url,
         ), TemporaryDirectory() as directory:
@@ -615,7 +558,7 @@ class PrometheusCollectionTests(unittest.TestCase):
             delay = 1.1 if path == "/api/v1/status/buildinfo" else 0
             return 200, [(delay, body)], len(body), False
 
-        with _loopback_prometheus(delayed_response) as (
+        with loopback_http_server(delayed_response) as (
             _,
             url,
         ), TemporaryDirectory() as directory:
@@ -643,7 +586,10 @@ class PrometheusCollectionTests(unittest.TestCase):
     def test_existing_admission_or_failed_promotion_never_publishes_private_bytes(
         self,
     ) -> None:
-        with _loopback_prometheus() as (server, url), TemporaryDirectory() as directory:
+        with loopback_http_server(_successful_controls) as (
+            server,
+            url,
+        ), TemporaryDirectory() as directory:
             root = Path(directory)
             staging = root / "private" / "prometheus"
             staging.parent.mkdir()
@@ -702,7 +648,7 @@ class PrometheusCollectionTests(unittest.TestCase):
                 body = b'{"status":"success","data":{}}'
             return 200, [(0, body)], len(body), False
 
-        with _loopback_prometheus(malformed_jobs) as (
+        with loopback_http_server(malformed_jobs) as (
             server,
             url,
         ), TemporaryDirectory() as directory:
@@ -736,7 +682,10 @@ class PrometheusCollectionTests(unittest.TestCase):
     def test_embedded_credentials_remain_exact_without_content_special_cases(
         self,
     ) -> None:
-        with _loopback_prometheus() as (server, url), TemporaryDirectory() as directory:
+        with loopback_http_server(_successful_controls) as (
+            server,
+            url,
+        ), TemporaryDirectory() as directory:
             root = Path(directory)
             staging = root / "private" / "prometheus"
             staging.parent.mkdir()
@@ -777,7 +726,10 @@ class PrometheusCollectionTests(unittest.TestCase):
                 raise OSError("injected response write failure")
             return original_open(path, *args, **kwargs)
 
-        with _loopback_prometheus() as (_, url), TemporaryDirectory() as directory:
+        with loopback_http_server(_successful_controls) as (
+            _,
+            url,
+        ), TemporaryDirectory() as directory:
             root = Path(directory)
             staging = root / "private" / "prometheus"
             staging.parent.mkdir()

@@ -90,7 +90,6 @@ def run(inventory_path: Path, since: str, output_directory: Path) -> int:
                 problems.extend(
                     collect_node(
                         node,
-                        ssh_user=inventory.ssh_user,
                         since_seconds=since_seconds,
                         probe_timeout_seconds=inventory.probe_timeout_seconds,
                         ssh_connect_timeout_seconds=inventory.ssh_connect_timeout_seconds,

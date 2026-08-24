@@ -95,7 +95,6 @@ not-an-ip ignored.example.com
 """
         expected = b"""\
 [common]
-ssh_user = root
 probe_timeout = 30m
 ssh_connect_timeout = 15s
 
@@ -228,7 +227,6 @@ class LoadInventoryTests(unittest.TestCase):
     def test_zoned_ipv6_ssh_address_is_rejected(self) -> None:
         inventory_bytes = b"""\
 [common]
-ssh_user = root
 [nodes]
 node = fe80::1%eth0
 """
@@ -271,7 +269,6 @@ node = fe80::1%eth0
     def test_inventory_path_expands_literal_tilde_with_controlled_home(self) -> None:
         inventory_bytes = b"""\
 [common]
-ssh_user = root
 [nodes]
 node = node.example.test
 """
@@ -292,7 +289,6 @@ node = node.example.test
         hostname = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 61)) + "."
         inventory_bytes = (
             "[common]\n"
-            "ssh_user = root\n"
             "[nodes]\n"
             f"node = {hostname}\n"
         ).encode("utf-8")
@@ -311,7 +307,6 @@ node = node.example.test
         hostname = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 62)) + "."
         inventory_bytes = (
             "[common]\n"
-            "ssh_user = root\n"
             "[nodes]\n"
             f"node = {hostname}\n"
         ).encode("utf-8")
@@ -327,7 +322,6 @@ node = node.example.test
     def test_valid_inventory_is_immutable_ordered_and_keeps_exact_bytes(self) -> None:
         inventory_bytes = b"""\
 [common]
-ssh_user = root
 
 [nodes]
 mon-a = mon-a.example.com
@@ -359,7 +353,6 @@ metrics_filter_regex = ^node_.+%$
                 TargetNode("node-v6", "2001:db8::20"),
             ),
         )
-        self.assertEqual(inventory.ssh_user, "root")
         self.assertEqual(inventory.probe_timeout_seconds, 1800)
         self.assertEqual(inventory.ssh_connect_timeout_seconds, 15)
         self.assertEqual(inventory.ceph_source, "mon-a")
@@ -373,8 +366,25 @@ metrics_filter_regex = ^node_.+%$
         self.assertEqual(inventory.metrics_filter_regex, "^node_.+%$")
         self.assertEqual(inventory.query_step, "15s")
         self.assertEqual(inventory.request_timeout_seconds, 300)
-        with self.assertRaises(AttributeError):
-            inventory.ssh_user = "other"  # type: ignore[misc]
+
+    def test_legacy_ssh_user_is_rejected_as_an_unknown_common_key(self) -> None:
+        inventory_bytes = b"""\
+[common]
+ssh_user = root
+[nodes]
+node = node.example.test
+"""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.ini"
+            path.write_bytes(inventory_bytes)
+
+            with self.assertRaises(InventoryRejected) as caught:
+                load_inventory(path)
+
+        self.assertEqual(
+            caught.exception.problems,
+            ("line 2: unknown key 'ssh_user' in [common]",),
+        )
 
     def test_invalid_inventory_reports_all_practical_problems_together(self) -> None:
         inventory_bytes = b"""\
@@ -383,7 +393,6 @@ ssh_user = admin
 probe_timeout = 10s
 ssh_connect_timeout = later
 surprise = yes
-ssh_user = root
 
 [nodes]
 bad/name = user@host
@@ -403,7 +412,6 @@ request_timeout = -1s
 key = value
 
 [common]
-ssh_user = root
 """
         with TemporaryDirectory() as directory:
             path = Path(directory) / "inventory.ini"
@@ -415,9 +423,8 @@ ssh_user = root
         message = str(caught.exception)
         for expected in (
             "duplicate section [common]",
-            "duplicate key 'ssh_user' in [common]",
+            "unknown key 'ssh_user' in [common]",
             "unknown key 'surprise' in [common]",
-            "ssh_user must be exactly 'root'",
             "invalid probe_timeout '10s'",
             "invalid ssh_connect_timeout 'later'",
             "invalid Inventory Name 'bad/name'",
@@ -435,7 +442,6 @@ ssh_user = root
     def test_duplicate_and_unicode_portable_name_collisions_are_all_rejected(self) -> None:
         inventory_bytes = """\
 [common]
-ssh_user = root
 [nodes]
 same = host-a.example
 same = host-b.example
@@ -462,7 +468,6 @@ é = host-d.example
     def test_present_optional_empty_values_are_rejected(self) -> None:
         inventory_bytes = b"""\
 [common]
-ssh_user = root
 [nodes]
 node = node.example
 [ceph]
@@ -497,7 +502,6 @@ url =
     def test_valid_duration_overrides_are_converted_to_seconds(self) -> None:
         inventory_bytes = b"""\
 [common]
-ssh_user = root
 probe_timeout = 0
 ssh_connect_timeout = 2m
 [nodes]
@@ -521,7 +525,6 @@ request_timeout = 0
         enormous = "9" * 5000
         inventory_bytes = (
             "[common]\n"
-            "ssh_user = admin\n"
             f"probe_timeout = {enormous}m\n"
             "[nodes]\n"
             "node = node.example\n"
@@ -533,7 +536,6 @@ request_timeout = 0
             with self.assertRaises(InventoryRejected) as caught:
                 load_inventory(path)
 
-        self.assertIn("ssh_user must be exactly 'root'", caught.exception.problems)
         self.assertTrue(
             any(
                 problem.startswith("invalid probe_timeout")
@@ -545,7 +547,6 @@ request_timeout = 0
         maximum_parseable_decimal = "9" * 4300
         inventory_bytes = (
             "[common]\n"
-            "ssh_user = admin\n"
             f"ssh_connect_timeout = {maximum_parseable_decimal}m\n"
             "[nodes]\n"
             "node = node.example\n"
@@ -557,7 +558,6 @@ request_timeout = 0
             with self.assertRaises(InventoryRejected) as caught:
                 load_inventory(path)
 
-        self.assertIn("ssh_user must be exactly 'root'", caught.exception.problems)
         self.assertTrue(
             any(
                 problem.startswith("invalid ssh_connect_timeout")
@@ -572,7 +572,6 @@ request_timeout = 0
                 path = Path(directory) / "inventory.ini"
                 path.write_text(
                     "[common]\n"
-                    "ssh_user = root\n"
                     f"ssh_connect_timeout = {value}\n"
                     "[nodes]\n"
                     "node = node.example\n",
@@ -588,7 +587,6 @@ request_timeout = 0
     def test_ssh_connect_timeout_must_fit_openssh_signed_int(self) -> None:
         inventory_bytes = b"""\
 [common]
-ssh_user = admin
 ssh_connect_timeout = 2147483648s
 [nodes]
 node = node.example
@@ -600,7 +598,6 @@ node = node.example
             with self.assertRaises(InventoryRejected) as caught:
                 load_inventory(path)
 
-        self.assertIn("ssh_user must be exactly 'root'", caught.exception.problems)
         self.assertIn(
             "invalid ssh_connect_timeout '2147483648s'",
             caught.exception.problems,
@@ -610,7 +607,6 @@ node = node.example
         maximum_parseable_decimal = "9" * 4300
         inventory_bytes = (
             "[common]\n"
-            "ssh_user = root\n"
             f"probe_timeout = {maximum_parseable_decimal}m\n"
             "[nodes]\n"
             "node = node.example\n"
@@ -638,7 +634,6 @@ node = node.example
         query_step = f"{maximum_parseable_decimal}w"
         inventory_bytes = (
             "[common]\n"
-            "ssh_user = root\n"
             "[nodes]\n"
             "node = node.example\n"
             "[prometheus]\n"
@@ -655,7 +650,6 @@ node = node.example
     def test_invalid_query_step_grammar_is_rejected(self) -> None:
         inventory_bytes = b"""\
 [common]
-ssh_user = root
 [nodes]
 node = node.example
 [prometheus]
@@ -674,7 +668,6 @@ query_step = 0
         float_overflowing_decimal = "9" * 1000
         inventory_bytes = (
             "[common]\n"
-            "ssh_user = root\n"
             f"probe_timeout = {float_overflowing_decimal}m\n"
             "[nodes]\n"
             "node = node.example\n"
@@ -697,7 +690,6 @@ query_step = 0
         first_unrepresentable_timeout = int(threading.TIMEOUT_MAX) + 1
         inventory_bytes = (
             "[common]\n"
-            "ssh_user = admin\n"
             "[nodes]\n"
             "node = node.example\n"
             "[prometheus]\n"
@@ -710,7 +702,6 @@ query_step = 0
             with self.assertRaises(InventoryRejected) as caught:
                 load_inventory(path)
 
-        self.assertIn("ssh_user must be exactly 'root'", caught.exception.problems)
         self.assertTrue(
             any(
                 problem.startswith("invalid request_timeout")
@@ -722,7 +713,6 @@ query_step = 0
         maximum_timeout = int(threading.TIMEOUT_MAX)
         inventory_bytes = (
             "[common]\n"
-            "ssh_user = root\n"
             "[nodes]\n"
             "node = node.example\n"
             "[prometheus]\n"
@@ -740,7 +730,7 @@ query_step = 0
         with TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "inventory.ini"
-            path.write_text("[common]\nssh_user = admin\n", encoding="utf-8")
+            path.write_text("[common]\nlegacy = value\n", encoding="utf-8")
             with patch("subprocess.Popen") as popen, patch(
                 "urllib.request.urlopen"
             ) as urlopen:

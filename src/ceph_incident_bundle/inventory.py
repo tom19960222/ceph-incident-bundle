@@ -16,7 +16,7 @@ _INVENTORY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z", re.ASCII)
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\Z", re.ASCII)
 _SECTIONS = {"common", "nodes", "ceph", "kubernetes", "prometheus"}
 _FIXED_KEYS = {
-    "common": {"ssh_user", "probe_timeout", "ssh_connect_timeout"},
+    "common": {"probe_timeout", "ssh_connect_timeout"},
     "ceph": {"source"},
     "kubernetes": {"context", "consumer_namespace", "operator_namespace"},
     "prometheus": {"url", "metrics_filter_regex", "query_step", "request_timeout"},
@@ -46,7 +46,6 @@ class TargetNode:
 class Inventory:
     snapshot: bytes
     nodes: tuple[TargetNode, ...]
-    ssh_user: str
     probe_timeout_seconds: int
     ssh_connect_timeout_seconds: int
     ceph_source: str | None
@@ -138,7 +137,6 @@ def draft_inventory(hosts_path: Path) -> tuple[bytes, tuple[str, ...]]:
 
     lines = [
         "[common]",
-        "ssh_user = root",
         "probe_timeout = 30m",
         "ssh_connect_timeout = 15s",
         "",
@@ -197,15 +195,9 @@ def load_inventory(inventory_path: Path) -> Inventory:
     common = values.get("common", {})
     if "common" not in sections:
         problems.append("missing required section [common]")
-    ssh_user = common.get("ssh_user", "")
-    if "ssh_user" not in common:
-        problems.append("[common] is missing required key 'ssh_user'")
-    elif ssh_user != "root":
-        problems.append("ssh_user must be exactly 'root'")
-
     probe_timeout = common.get("probe_timeout", "30m")
     probe_timeout_seconds = _duration_seconds(
-        "probe_timeout", probe_timeout, "mhdw", allow_zero=True, problems=problems
+        "probe_timeout", probe_timeout, "mhdw", problems=problems
     )
     if probe_timeout_seconds and not _fits_process_wait_timeout(
         probe_timeout_seconds
@@ -216,7 +208,6 @@ def load_inventory(inventory_path: Path) -> Inventory:
         "ssh_connect_timeout",
         ssh_connect_timeout,
         "smhdw",
-        allow_zero=True,
         problems=problems,
     )
     if ssh_connect_timeout_seconds > _OPENSSH_CONNECT_TIMEOUT_MAX_SECONDS:
@@ -285,7 +276,6 @@ def load_inventory(inventory_path: Path) -> Inventory:
         "request_timeout",
         request_timeout,
         "smhdw",
-        allow_zero=True,
         problems=problems,
     )
     if request_timeout_seconds and not _fits_url_request_timeout(
@@ -298,7 +288,6 @@ def load_inventory(inventory_path: Path) -> Inventory:
     return Inventory(
         snapshot=snapshot,
         nodes=tuple(nodes),
-        ssh_user=ssh_user,
         probe_timeout_seconds=probe_timeout_seconds,
         ssh_connect_timeout_seconds=ssh_connect_timeout_seconds,
         ceph_source=ceph_source,
@@ -358,10 +347,9 @@ def _duration_seconds(
     value: str,
     units: str,
     *,
-    allow_zero: bool,
     problems: list[str],
 ) -> int:
-    if allow_zero and value == "0":
+    if value == "0":
         return 0
     match = re.fullmatch(r"([1-9][0-9]*)([a-z])", value, re.ASCII)
     if match is None or match.group(2) not in units:

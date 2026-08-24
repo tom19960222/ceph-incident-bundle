@@ -67,6 +67,7 @@ def main() -> int:
         test_environment.pop("PYTHONPATH", None)
         test_environment["PYTHONDONTWRITEBYTECODE"] = "1"
         test_environment["CEPH_INCIDENT_BUNDLE_COMMAND"] = str(command)
+        test_environment["CEPH_INCIDENT_BUNDLE_WHEEL"] = str(wheels[0])
         _run(
             str(installed_python),
             "-m",
